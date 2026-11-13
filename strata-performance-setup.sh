@@ -25,7 +25,7 @@ fi
 
 TARGET_USER="${SUDO_USER:-${USER:-$(id -un)}}"
 TARGET_HOME="$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6 || eval echo "~$TARGET_USER")"
-STRATA_BIN="" STRATA_VERSION=""
+STRATA_BIN="" STRATA_VERSION="" STRATA_RUNNING_PRESET="" STRATA_RUNNING_URL=""
 DISTRO_FAMILY="unknown" DISTRO_ID="unknown" OS_PRETTY="" KERNEL_VER="" AUR_HELPER=""
 HAS_NVIDIA=false HAS_NVIDIA_POWERD=false HAS_AMD=false HAS_INTEL_GPU=false HAS_INTEL_ARC=false
 GPU_SUMMARY="" GPU_RAW="" CPU_SUMMARY="" RAM_GB=0 RAM_DETAILS="" NVIDIA_VRAM_MB=0 TOTAL_VRAM_MB=0
@@ -315,6 +315,35 @@ refresh_strata_bin() {
     fi
   else
     STRATA_VERSION=""
+  fi
+}
+
+refresh_strata_running() {
+  STRATA_RUNNING_PRESET=""
+  STRATA_RUNNING_URL=""
+  [[ -n "$STRATA_BIN" ]] || return 0
+  local st_json parsed=""
+  st_json="$(run_as_user "$STRATA_BIN launch --status --output json 2>/dev/null" || true)"
+  if [[ -n "$st_json" ]] && command -v python3 >/dev/null 2>&1; then
+    parsed="$(python3 -c '
+import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line.startswith("{"):
+        continue
+    try:
+        d = json.loads(line)
+    except Exception:
+        continue
+    running = d.get("running") or []
+    if running and isinstance(running[0], dict):
+        r = running[0]
+        print((r.get("name") or "") + "|" + (r.get("url") or ""))
+    break
+' <<< "$st_json" 2>/dev/null || true)"
+    if [[ -n "$parsed" ]]; then
+      IFS='|' read -r STRATA_RUNNING_PRESET STRATA_RUNNING_URL <<< "$parsed"
+    fi
   fi
 }
 
@@ -1769,6 +1798,51 @@ pad_ansi_col() {
   fi
 }
 
+format_strata_serving_line() {
+  [[ -n "$STRATA_RUNNING_PRESET" ]] || return 0
+  local model="" live_str="0.0 tok/s (idle)" avg_str="—"
+  if [[ -n "$STRATA_RUNNING_URL" ]] && command -v curl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+    local m_json
+    m_json="$(curl -fsS --max-time 0.3 "${STRATA_RUNNING_URL}/metrics" 2>/dev/null || true)"
+    if [[ -n "$m_json" ]]; then
+      local parsed=""
+      parsed="$(python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(0)
+model = (d.get("engine") or {}).get("model") or ""
+live = d.get("live") or {}
+state = live.get("state") or "idle"
+ltok = live.get("tok_s")
+if ltok is not None and isinstance(ltok, (int, float)):
+    live_s = f"{ltok:.1f} tok/s ({state})"
+else:
+    live_s = f"0.0 tok/s ({state})"
+tot = d.get("totals") or {}
+out_tok = tot.get("output_tokens") or 0
+dec_ms = tot.get("decode_ms") or 0
+reqs = tot.get("requests") or 0
+if out_tok > 0 and dec_ms > 0:
+    avg_s = f"{out_tok / (dec_ms / 1000.0):.1f} tok/s ({reqs} reqs, {out_tok} tok)"
+else:
+    avg_s = "0.0 tok/s (no reqs)"
+print(f"{model}|{live_s}|{avg_s}")
+' <<< "$m_json" 2>/dev/null || true)"
+      if [[ -n "$parsed" ]]; then
+        IFS='|' read -r model live_str avg_str <<< "$parsed"
+      fi
+    fi
+  fi
+  local preset_disp="$STRATA_RUNNING_PRESET"
+  [[ -n "$model" ]] && preset_disp+=" ($model)"
+  printf "%bStrata Serving:%b %s %b|%b Live: %b%s%b %b|%b Avg: %b%s%b" \
+    "${C_BOLD}" "${C_RESET}" "$preset_disp" \
+    "${C_DIM}" "${C_RESET}" "${C_CYAN}" "$live_str" "${C_RESET}" \
+    "${C_DIM}" "${C_RESET}" "${C_GREEN}" "$avg_str" "${C_RESET}"
+}
+
 print_stats_and_info_grid() {
   local inplace="${1:-false}" eol=""
   [[ "$inplace" == true ]] && eol=$'\033[K'
@@ -1807,6 +1881,12 @@ print_stats_and_info_grid() {
       ((total_lines++))
     done
   fi
+  local serving_line=""
+  serving_line="$(format_strata_serving_line || true)"
+  if [[ -n "$serving_line" ]]; then
+    out+=$'\n'"${eol}"$'\n'"${serving_line}${eol}"
+    ((total_lines += 2))
+  fi
   LIVE_STATS_COUNT="$total_lines"
   printf "%s\n" "$out"
 }
@@ -1818,6 +1898,7 @@ print_header() {
   echo -e "${C_BOLD}${C_CYAN}   Strata Host Performance Optimizer & Setup Wizard${C_RESET}"
   echo -e "${C_BOLD}${C_CYAN}======================================================================${C_RESET}"
   load_strata_update_state
+  refresh_strata_running
   build_sys_info_lines
   print_stats_and_info_grid false
   POST_HEADER_LINES=1
