@@ -1454,6 +1454,13 @@ print_live_stats() {
   local gpu_pct="" vram_pct="" vram_used_gib="" vram_tot_gib=""
   local pwr_w="" pwr_lim_w="" pwr_pct="" pwr_label="Power"
 
+  local rapl_file="/sys/class/powercap/intel-rapl:0/energy_uj" rapl_can_read=false
+  if [[ -r "$rapl_file" ]]; then
+    rapl_can_read=true
+  elif [[ -e "$rapl_file" ]] && sudo -n true >/dev/null 2>&1; then
+    rapl_can_read=true
+  fi
+
   # CPU usage (/proc/stat delta; 150ms sample only on first call)
   if [[ -r /proc/stat ]]; then
     local u1 n1 s1 i1 w1 q1 sq1 st1 idle_now tot_now
@@ -1461,6 +1468,14 @@ print_live_stats() {
       read -r _ u1 n1 s1 i1 w1 q1 sq1 st1 _ < /proc/stat
       PREV_CPU_IDLE=$((i1 + w1))
       PREV_CPU_TOTAL=$((u1 + n1 + s1 + PREV_CPU_IDLE + q1 + sq1 + st1))
+      if [[ "$rapl_can_read" == true ]]; then
+        if [[ -r "$rapl_file" ]]; then
+          PREV_RAPL_UJ="$(cat "$rapl_file" 2>/dev/null || true)"
+        else
+          PREV_RAPL_UJ="$(sudo -n cat "$rapl_file" 2>/dev/null || true)"
+        fi
+        PREV_RAPL_US="$(date +%s%6N 2>/dev/null || true)"
+      fi
       sleep 0.15
     fi
     read -r _ u1 n1 s1 i1 w1 q1 sq1 st1 _ < /proc/stat
@@ -1597,9 +1612,13 @@ print_live_stats() {
   fi
 
   # CPU package power (intel-rapl, when readable)
-  if [[ -r /sys/class/powercap/intel-rapl:0/energy_uj ]]; then
+  if [[ "$rapl_can_read" == true ]]; then
     local rapl_now us_now
-    rapl_now="$(cat /sys/class/powercap/intel-rapl:0/energy_uj 2>/dev/null || true)"
+    if [[ -r "$rapl_file" ]]; then
+      rapl_now="$(cat "$rapl_file" 2>/dev/null || true)"
+    else
+      rapl_now="$(sudo -n cat "$rapl_file" 2>/dev/null || true)"
+    fi
     us_now="$(date +%s%6N 2>/dev/null || true)"
     if [[ "$rapl_now" =~ ^[0-9]+$ && "$us_now" =~ ^[0-9]+$ ]]; then
       if [[ -n "$PREV_RAPL_UJ" && -n "$PREV_RAPL_US" ]]; then
