@@ -54,7 +54,7 @@ The wizard supports systemd-based Linux distributions across three package famil
 | **Fedora-based** | Fedora, Nobara, RHEL, CentOS, Rocky Linux, AlmaLinux (and `ID_LIKE=fedora` / `rhel`) | `dnf` |
 | **Debian-based** | Debian, Ubuntu, Pop!\_OS, Linux Mint, KDE neon (and `ID_LIKE=debian` / `ubuntu`) | `apt-get` |
 
-> **Bootloaders:** Kernel command-line parameters (used when BIOS locks runtime PCIe ASPM writes or for `gpu-unlock`) are automatically configured for **Limine** (`/etc/default/limine`), **GRUB** (`/etc/default/grub`), or **systemd-boot** (`/etc/kernel/cmdline`).
+> **Bootloaders:** Kernel command-line parameters (used when BIOS locks runtime PCIe ASPM writes or for `gpu-unlock`) are automatically configured for **Limine** (`/etc/default/limine`), **GRUB** (`/etc/default/grub` via `grub-mkconfig` or `grub2-mkconfig`), or **systemd-boot** (`/etc/kernel/cmdline`).
 
 ---
 
@@ -95,6 +95,18 @@ The script probes your system at startup and enables hardware-specific steps onl
 
 ---
 
+## Live Dashboard & Strata Monitoring
+
+The header continuously refreshes every **1 second** without interrupting your input:
+
+- **Live System Usage (left):** Color-coded bars for CPU usage + temperature, RAM usage, per-GPU utilization + temperature and VRAM (supports single and multi-GPU NVIDIA/AMD setups), and horizontal `Power:` (`GPU`, `CPU`, and `Sys` watts).
+  - *Tip:* On systems without a PSU or battery hwmon sensor, run with `sudo` (`sudo ~/strata-performance-setup.sh`) so the script can read root-only `intel-rapl` energy counters for `CPU` and `Sys` power.
+- **System Information (right):** OS, kernel, CPU model/threads, RAM capacity/speed/timings, GPU model(s), total VRAM, and NVIDIA power limits.
+- **Strata Block:** Installed Strata version, active serving preset and model, live `tok/s`, and session average `tok/s` (request and token totals).
+- **Active Update Polling:** Checks for Strata updates in the background every **60 seconds**, displays an `[UPDATE AVAILABLE]` banner on every screen when a new version is found, and lets you press `u` to stop `strata.service`, run `strata update --yes`, restart `strata.service`, and notify you once the model is `[LIVE]` again.
+
+---
+
 ## Using the Wizard
 
 Once launched, the main index lists every optimization applicable to your machine along with its live `[APPLIED]` / `[NOT APPLIED]` status:
@@ -102,8 +114,10 @@ Once launched, the main index lists every optimization applicable to your machin
 - Press `w` (or `Enter`) to walk through the **guided wizard** step by step
 - Press `a` to **apply all recommended optimizations** for your hardware in one action (with confirmation; excludes Strata setup and minimal-gain/higher-idle-power options like CPU Performance and PCIe ASPM)
 - Press `x` to **revert all recommended optimizations** in one action (with confirmation)
+- Press `u` (when shown) to **install a pending Strata update** and restart `strata.service`
+- Press `r` on the index to **reboot** the system (the wizard also prompts automatically whenever a kernel-parameter change requires a reboot)
 - Enter a **step number** to jump directly to a specific optimization
-- Inside any step, press `a` to **apply/update**, `r` to **revert**, `n` / `b` to move next/back, or `i` to return to the index
+- Inside any step, press `a` to **apply** (when not yet applied, or to open the Strata Manager menu), `r` to **revert** (when applied), `n` / `b` to move next/back, or `i` to return to the index
 
 ---
 
