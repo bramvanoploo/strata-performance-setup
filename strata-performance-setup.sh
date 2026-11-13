@@ -1490,14 +1490,31 @@ render_bar() {
   (( pct > 100 )) && pct=100
   local filled=$(( pct * width / 100 ))
   local empty=$(( width - filled ))
-  local color="$C_GREEN"
-  if (( pct >= 85 )); then color="$C_RED"
-  elif (( pct >= 60 )); then color="$C_YELLOW"
-  fi
   local bar_fill="" bar_empty="" i
-  for ((i=0; i<filled; i++)); do bar_fill+="█"; done
+  if [[ -t 1 ]]; then
+    local -a logo_colors=(
+      $'\033[1;96m'
+      $'\033[0;96m'
+      $'\033[0;36m'
+      $'\033[1;34m'
+      $'\033[0;35m'
+    )
+    local n_colors="${#logo_colors[@]}" last_c="" c_idx c
+    for ((i=0; i<filled; i++)); do
+      c_idx=$(( i * n_colors / width ))
+      (( c_idx >= n_colors )) && c_idx=$(( n_colors - 1 ))
+      c="${logo_colors[$c_idx]}"
+      if [[ "$c" != "$last_c" ]]; then
+        bar_fill+="$c"
+        last_c="$c"
+      fi
+      bar_fill+="█"
+    done
+  else
+    for ((i=0; i<filled; i++)); do bar_fill+="█"; done
+  fi
   for ((i=0; i<empty; i++)); do bar_empty+="░"; done
-  printf "%b%s%b%s%b" "$color" "$bar_fill" "$C_DIM" "$bar_empty" "$C_RESET"
+  printf "%s%b%s%b" "$bar_fill" "$C_DIM" "$bar_empty" "$C_RESET"
 }
 
 format_temp() {
@@ -1903,16 +1920,21 @@ print_stats_and_info_grid() {
 print_header() {
   clear 2>/dev/null || true
   print_logo
-  echo -e "${C_BOLD}${C_CYAN}======================================================================${C_RESET}"
-  echo -e "${C_BOLD}${C_CYAN}   Strata Host Performance Optimizer & Setup Wizard${C_RESET}"
-  echo -e "${C_BOLD}${C_CYAN}======================================================================${C_RESET}"
+  local _rule_w=120 _hdr_eq="" _hdr_rule=""
+  [[ -t 1 ]] && _rule_w="$(tput cols 2>/dev/null || echo 120)"
+  (( _rule_w > 135 )) && _rule_w=135
+  printf -v _hdr_eq "%*s" "$_rule_w" ""
+  _hdr_eq="${_hdr_eq// /=}"
+  local _title="Strata Host Performance Optimizer & Setup Wizard"
+  local _title_pad=$(( (_rule_w - ${#_title}) / 2 ))
+  (( _title_pad < 0 )) && _title_pad=0
+  echo -e "${C_BOLD}${C_CYAN}${_hdr_eq}${C_RESET}"
+  printf "${C_BOLD}${C_CYAN}%*s%s${C_RESET}\n" "$_title_pad" "" "$_title"
+  echo -e "${C_BOLD}${C_CYAN}${_hdr_eq}${C_RESET}"
   load_strata_update_state
   refresh_strata_running
   build_sys_info_lines
   print_stats_and_info_grid false
-  local _rule_w=120 _hdr_rule=""
-  [[ -t 1 ]] && _rule_w="$(tput cols 2>/dev/null || echo 120)"
-  (( _rule_w > 135 )) && _rule_w=135
   printf -v _hdr_rule "%*s" "$_rule_w" ""
   echo -e "${C_DIM}${_hdr_rule// /─}${C_RESET}"
   POST_HEADER_LINES=2
