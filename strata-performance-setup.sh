@@ -1446,6 +1446,14 @@ render_bar() {
   printf "%b%s%b%s%b" "$color" "$bar_fill" "$C_DIM" "$bar_empty" "$C_RESET"
 }
 
+format_temp() {
+  local t="$1" color="$C_GREEN"
+  if (( t >= 85 )); then color="$C_RED"
+  elif (( t >= 70 )); then color="$C_YELLOW"
+  fi
+  printf "%b%d°C%b" "$color" "$t" "$C_RESET"
+}
+
 print_live_stats() {
   local inplace="${1:-false}" eol=""
   [[ "$inplace" == true ]] && eol=$'\033[K'
@@ -1506,20 +1514,21 @@ print_live_stats() {
     fi
   fi
 
-  local gpu_pcts=() vram_pcts=() vram_useds=() vram_tots=() pwr_ws=() pwr_lim_ws=() pwr_pcts=()
-  local total_gpu_pwr_w=""
+  local gpu_pcts=() vram_pcts=() vram_useds=() vram_tots=() pwr_ws=() pwr_lim_ws=() pwr_pcts=() gpu_temps=()
+  local total_gpu_pwr_w="" cpu_temp=""
 
-  # GPU, VRAM, and Power usage (supports multiple NVIDIA and/or AMD GPUs)
+  # GPU, VRAM, Power, and Temp (supports multiple NVIDIA and/or AMD GPUs)
   if [[ "$HAS_NVIDIA" == true ]] && command -v nvidia-smi >/dev/null 2>&1; then
     local nv_lines nv_line
-    nv_lines="$(nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,power.draw,power.limit --format=csv,noheader,nounits 2>/dev/null || true)"
+    nv_lines="$(nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,power.draw,power.limit,temperature.gpu --format=csv,noheader,nounits 2>/dev/null || true)"
     while IFS= read -r nv_line; do
       [[ -n "$nv_line" ]] || continue
-      local g_u m_u m_t p_d p_l
-      local g_pct="" v_pct="" v_used="" v_tot="" pw="" plw="" ppct=""
-      IFS=',' read -r g_u m_u m_t p_d p_l <<< "$nv_line"
-      g_u="${g_u// /}"; m_u="${m_u// /}"; m_t="${m_t// /}"; p_d="${p_d// /}"; p_l="${p_l// /}"
+      local g_u m_u m_t p_d p_l g_t
+      local g_pct="" v_pct="" v_used="" v_tot="" pw="" plw="" ppct="" gtmp=""
+      IFS=',' read -r g_u m_u m_t p_d p_l g_t <<< "$nv_line"
+      g_u="${g_u// /}"; m_u="${m_u// /}"; m_t="${m_t// /}"; p_d="${p_d// /}"; p_l="${p_l// /}"; g_t="${g_t// /}"
       [[ "$g_u" =~ ^[0-9]+(\.[0-9]+)?$ ]] && g_pct="$(awk "BEGIN {printf \"%.0f\", $g_u}")"
+      [[ "$g_t" =~ ^[0-9]+(\.[0-9]+)?$ ]] && gtmp="$(awk "BEGIN {printf \"%.0f\", $g_t}")"
       if [[ "$m_u" =~ ^[0-9]+(\.[0-9]+)?$ && "$m_t" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk "BEGIN {exit !($m_t > 0)}"; then
         read -r v_pct v_used v_tot <<< "$(awk "BEGIN {printf \"%.0f %.1f %.1f\", ($m_u/$m_t)*100, $m_u/1024, $m_t/1024}")"
       fi
@@ -1538,13 +1547,14 @@ print_live_stats() {
       pwr_ws+=("$pw")
       pwr_lim_ws+=("$plw")
       pwr_pcts+=("$ppct")
+      gpu_temps+=("$gtmp")
     done <<< "$nv_lines"
   fi
   if [[ "$HAS_AMD" == true ]]; then
     local card_dir
     for card_dir in /sys/class/drm/card*/device; do
       [[ -r "$card_dir/gpu_busy_percent" ]] || continue
-      local g_pct="" v_pct="" v_used="" v_tot="" pw="" plw="" ppct=""
+      local g_pct="" v_pct="" v_used="" v_tot="" pw="" plw="" ppct="" gtmp=""
       g_pct="$(cat "$card_dir/gpu_busy_percent" 2>/dev/null || true)"
       if [[ -r "$card_dir/mem_info_vram_used" && -r "$card_dir/mem_info_vram_total" ]]; then
         local vu vt
@@ -1556,7 +1566,12 @@ print_live_stats() {
       fi
       local hwmon_dir
       for hwmon_dir in "$card_dir"/hwmon/hwmon*; do
-        if [[ -r "$hwmon_dir/power1_average" ]]; then
+        if [[ -z "$gtmp" && -r "$hwmon_dir/temp1_input" ]]; then
+          local mc
+          mc="$(cat "$hwmon_dir/temp1_input" 2>/dev/null || echo 0)"
+          [[ "$mc" =~ ^[0-9]+$ ]] && (( mc > 0 )) && gtmp=$((mc / 1000))
+        fi
+        if [[ -z "$pw" && -r "$hwmon_dir/power1_average" ]]; then
           local pa pc
           pa="$(cat "$hwmon_dir/power1_average" 2>/dev/null || echo 0)"
           pw=$((pa / 1000000))
@@ -1568,7 +1583,6 @@ print_live_stats() {
               ppct=$((pa * 100 / pc))
             fi
           fi
-          break
         fi
       done
       gpu_pcts+=("$g_pct")
@@ -1578,28 +1592,49 @@ print_live_stats() {
       pwr_ws+=("$pw")
       pwr_lim_ws+=("$plw")
       pwr_pcts+=("$ppct")
+      gpu_temps+=("$gtmp")
     done
   fi
 
   local sys_pwr_w="" cpu_pwr_w=""
-  # Total system power (smart PSU / ACPI power meter / battery discharge)
+  # Total system power & CPU temperature (hwmon)
   local hm_dir hm_name
   for hm_dir in /sys/class/hwmon/hwmon*; do
     [[ -r "$hm_dir/name" ]] || continue
     hm_name="$(cat "$hm_dir/name" 2>/dev/null || true)"
     case "$hm_name" in
+      coretemp|k10temp|zenpower)
+        if [[ -z "$cpu_temp" && -r "$hm_dir/temp1_input" ]]; then
+          local mc
+          mc="$(cat "$hm_dir/temp1_input" 2>/dev/null || echo 0)"
+          [[ "$mc" =~ ^[0-9]+$ ]] && (( mc > 0 )) && cpu_temp=$((mc / 1000))
+        fi
+        ;;
       corsair-psu|acpi_power_meter|power_meter)
-        local pf="" uw=0
-        for pf in "$hm_dir"/power1_input "$hm_dir"/power1_average; do
-          if [[ -r "$pf" ]]; then
-            uw="$(cat "$pf" 2>/dev/null || echo 0)"
-            (( uw > 0 )) && { sys_pwr_w=$((uw / 1000000)); break; }
-          fi
-        done
-        [[ -n "$sys_pwr_w" ]] && break
+        if [[ -z "$sys_pwr_w" ]]; then
+          local pf="" uw=0
+          for pf in "$hm_dir"/power1_input "$hm_dir"/power1_average; do
+            if [[ -r "$pf" ]]; then
+              uw="$(cat "$pf" 2>/dev/null || echo 0)"
+              (( uw > 0 )) && { sys_pwr_w=$((uw / 1000000)); break; }
+            fi
+          done
+        fi
         ;;
     esac
   done
+  if [[ -z "$cpu_temp" ]]; then
+    local tz_dir tz_type
+    for tz_dir in /sys/class/thermal/thermal_zone*; do
+      [[ -r "$tz_dir/type" && -r "$tz_dir/temp" ]] || continue
+      tz_type="$(cat "$tz_dir/type" 2>/dev/null || true)"
+      if [[ "$tz_type" == "x86_pkg_temp" || "$tz_type" == "cpu"* ]]; then
+        local mc
+        mc="$(cat "$tz_dir/temp" 2>/dev/null || echo 0)"
+        [[ "$mc" =~ ^[0-9]+$ ]] && (( mc > 0 )) && { cpu_temp=$((mc / 1000)); break; }
+      fi
+    done
+  fi
   if [[ -z "$sys_pwr_w" ]]; then
     local bat_p
     for bat_p in /sys/class/power_supply/BAT*/power_now; do
@@ -1633,7 +1668,9 @@ print_live_stats() {
   local out="" lines=1
   out+="$(printf "%bLive System Usage:%b%s\n" "${C_BOLD}" "${C_RESET}" "$eol")"
   if [[ -n "$cpu_pct" ]]; then
-    out+=$'\n'"$(printf "  %-8s [%s] %3d%%%s" "CPU:" "$(render_bar "$cpu_pct")" "$cpu_pct" "$eol")"
+    local cpu_t_str=""
+    [[ -n "$cpu_temp" ]] && cpu_t_str=" ($(format_temp "$cpu_temp"))"
+    out+=$'\n'"$(printf "  %-8s [%s] %3d%%%s%s" "CPU:" "$(render_bar "$cpu_pct")" "$cpu_pct" "$cpu_t_str" "$eol")"
     ((lines++))
   fi
   if [[ -n "$ram_pct" ]]; then
@@ -1641,13 +1678,16 @@ print_live_stats() {
     ((lines++))
   fi
   local gpu_count="${#gpu_pcts[@]}" gi=0
+  local pwr_parts=()
   for ((gi=0; gi<gpu_count; gi++)); do
-    local g_lbl="GPU:" v_lbl="VRAM:" p_lbl="GPU Pwr:"
+    local g_lbl="GPU:" v_lbl="VRAM:" p_lbl="GPU"
     if (( gpu_count > 1 )); then
-      g_lbl="GPU${gi}:" v_lbl="VRAM${gi}:" p_lbl="Pwr${gi}:"
+      g_lbl="GPU${gi}:" v_lbl="VRAM${gi}:" p_lbl="GPU${gi}"
     fi
     if [[ -n "${gpu_pcts[$gi]}" ]]; then
-      out+=$'\n'"$(printf "  %-8s [%s] %3d%%%s" "$g_lbl" "$(render_bar "${gpu_pcts[$gi]}")" "${gpu_pcts[$gi]}" "$eol")"
+      local gpu_t_str=""
+      [[ -n "${gpu_temps[$gi]}" ]] && gpu_t_str=" ($(format_temp "${gpu_temps[$gi]}"))"
+      out+=$'\n'"$(printf "  %-8s [%s] %3d%%%s%s" "$g_lbl" "$(render_bar "${gpu_pcts[$gi]}")" "${gpu_pcts[$gi]}" "$gpu_t_str" "$eol")"
       ((lines++))
     fi
     if [[ -n "${vram_pcts[$gi]}" ]]; then
@@ -1656,22 +1696,25 @@ print_live_stats() {
     fi
     if [[ -n "${pwr_ws[$gi]}" ]]; then
       if [[ -n "${pwr_pcts[$gi]}" && -n "${pwr_lim_ws[$gi]}" ]]; then
-        out+=$'\n'"$(printf "  %-8s [%s] %3d%% (%s / %s W)%s" "$p_lbl" "$(render_bar "${pwr_pcts[$gi]}")" "${pwr_pcts[$gi]}" "${pwr_ws[$gi]}" "${pwr_lim_ws[$gi]}" "$eol")"
+        pwr_parts+=("${p_lbl} ${pwr_ws[$gi]}/${pwr_lim_ws[$gi]}W (${pwr_pcts[$gi]}%)")
       else
-        out+=$'\n'"$(printf "  %-8s %s W%s" "$p_lbl" "${pwr_ws[$gi]}" "$eol")"
+        pwr_parts+=("${p_lbl} ${pwr_ws[$gi]}W")
       fi
-      ((lines++))
     fi
   done
-  if [[ -n "$cpu_pwr_w" ]]; then
-    out+=$'\n'"$(printf "  %-8s %s W%s" "CPU Pwr:" "$cpu_pwr_w" "$eol")"
-    ((lines++))
-  fi
+  [[ -n "$cpu_pwr_w" ]] && pwr_parts+=("CPU ${cpu_pwr_w}W")
   if [[ -n "$sys_pwr_w" ]]; then
-    out+=$'\n'"$(printf "  %-8s %s W%s" "Sys Pwr:" "$sys_pwr_w" "$eol")"
-    ((lines++))
+    pwr_parts+=("Sys ${sys_pwr_w}W")
   elif [[ -n "$cpu_pwr_w" && -n "$total_gpu_pwr_w" ]]; then
-    out+=$'\n'"$(printf "  %-8s ~%s W%s" "Sys Pwr:" "$((cpu_pwr_w + total_gpu_pwr_w))" "$eol")"
+    pwr_parts+=("Sys ~$((cpu_pwr_w + total_gpu_pwr_w))W")
+  fi
+  if (( ${#pwr_parts[@]} > 0 )); then
+    local pwr_line="" pi=0
+    for ((pi=0; pi<${#pwr_parts[@]}; pi++)); do
+      (( pi > 0 )) && pwr_line+=" | "
+      pwr_line+="${pwr_parts[$pi]}"
+    done
+    out+=$'\n'"$(printf "  %-8s %s%s" "Power:" "$pwr_line" "$eol")"
     ((lines++))
   fi
   LIVE_STATS_COUNT="$lines"
