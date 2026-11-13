@@ -1354,6 +1354,17 @@ perform_strata_update() {
     fi
   fi
 }
+format_strata_hw_warnings() {
+  if (( RAM_GB > 0 && RAM_GB < 32 )); then
+    echo -e "${C_YELLOW}[WARNING] System RAM is ${RAM_GB} GiB (< 32 GiB). Larger Strata models may not fit or may swap.${C_RESET}"
+  fi
+  if [[ "$HAS_NVIDIA" == false && "$HAS_AMD" == false && "$HAS_INTEL_ARC" == false ]]; then
+    echo -e "${C_YELLOW}[WARNING] No dedicated NVIDIA, AMD Radeon, or Intel Arc GPU detected (${GPU_SUMMARY}). Strata models may not run.${C_RESET}"
+  elif [[ "$HAS_NVIDIA" == true && "$NVIDIA_VRAM_MB" -gt 0 && "$NVIDIA_VRAM_MB" -lt 6144 ]]; then
+    echo -e "${C_YELLOW}[WARNING] NVIDIA GPU VRAM is $((NVIDIA_VRAM_MB / 1024)) GiB (< 6 GiB). Larger Strata models may not fit in VRAM.${C_RESET}"
+  fi
+}
+
 status_strata_manager() { [[ -n "$STRATA_BIN" ]] && strata_service_installed; }
 explain_strata_manager() {
   cat <<'EOF'
@@ -1361,6 +1372,12 @@ Impact:
   Installs Strata (Niko1221/Strata), checks for updates ('strata update'),
   runs 'strata launch', and installs/uninstalls strata.service using a saved preset.
 EOF
+  local hw_warns=""
+  hw_warns="$(format_strata_hw_warnings)"
+  if [[ -n "$hw_warns" ]]; then
+    echo ""
+    printf "%s\n" "$hw_warns"
+  fi
 }
 list_strata_presets() {
   local preset_dir="$TARGET_HOME/.config/strata/launch-presets" cli_out f
@@ -1496,31 +1513,14 @@ render_bar() {
   (( pct > 100 )) && pct=100
   local filled=$(( pct * width / 100 ))
   local empty=$(( width - filled ))
-  local bar_fill="" bar_empty="" i
-  if [[ -t 1 ]]; then
-    local -a logo_colors=(
-      $'\033[1;96m'
-      $'\033[0;96m'
-      $'\033[0;36m'
-      $'\033[1;34m'
-      $'\033[0;35m'
-    )
-    local n_colors="${#logo_colors[@]}" last_c="" c_idx c
-    for ((i=0; i<filled; i++)); do
-      c_idx=$(( i * n_colors / width ))
-      (( c_idx >= n_colors )) && c_idx=$(( n_colors - 1 ))
-      c="${logo_colors[$c_idx]}"
-      if [[ "$c" != "$last_c" ]]; then
-        bar_fill+="$c"
-        last_c="$c"
-      fi
-      bar_fill+="█"
-    done
-  else
-    for ((i=0; i<filled; i++)); do bar_fill+="█"; done
+  local color="$C_GREEN"
+  if (( pct >= 85 )); then color="$C_RED"
+  elif (( pct >= 60 )); then color="$C_YELLOW"
   fi
+  local bar_fill="" bar_empty="" i
+  for ((i=0; i<filled; i++)); do bar_fill+="█"; done
   for ((i=0; i<empty; i++)); do bar_empty+="░"; done
-  printf "%s%b%s%b" "$bar_fill" "$C_DIM" "$bar_empty" "$C_RESET"
+  printf "%b%s%b%s%b" "$color" "$bar_fill" "$C_DIM" "$bar_empty" "$C_RESET"
 }
 
 format_temp() {
@@ -2066,27 +2066,27 @@ read_choice_with_live_stats() {
   local -n _out_var="$1"
   local lines_up="$2"
   local footer_lines="${3:-0}"
-  local term_lines can_live=false
-  if [[ -t 1 && -t 0 ]]; then
-    term_lines="$(tput lines 2>/dev/null || echo 40)"
-    (( lines_up > 0 && lines_up + 1 <= term_lines )) && can_live=true
-  fi
-
-  if [[ "$can_live" == false ]]; then
+  local term_lines=40 can_live=false
+  if [[ ! -t 1 || ! -t 0 ]]; then
     read -r -p "Choice: " _out_var || exit 0
     return 0
   fi
 
-  local tmp_file sampler_pid=""
-  tmp_file="$(mktemp /tmp/strata-stats.XXXXXX 2>/dev/null || echo "")"
-  if [[ -n "$tmp_file" ]]; then
-    (
-      while true; do
-        sleep 1
-        print_stats_and_info_grid true > "${tmp_file}.tmp" 2>/dev/null && mv -f "${tmp_file}.tmp" "$tmp_file" 2>/dev/null || true
-      done
-    ) &
-    sampler_pid=$!
+  term_lines="$(tput lines 2>/dev/null || echo 40)"
+  (( lines_up > 0 && lines_up + 1 <= term_lines )) && can_live=true
+
+  local tmp_file="" sampler_pid=""
+  if [[ "$can_live" == true ]]; then
+    tmp_file="$(mktemp /tmp/strata-stats.XXXXXX 2>/dev/null || echo "")"
+    if [[ -n "$tmp_file" ]]; then
+      (
+        while true; do
+          sleep 1
+          print_stats_and_info_grid true > "${tmp_file}.tmp" 2>/dev/null && mv -f "${tmp_file}.tmp" "$tmp_file" 2>/dev/null || true
+        done
+      ) &
+      sampler_pid=$!
+    fi
   fi
 
   _cleanup_live_sampler() {
@@ -2126,11 +2126,19 @@ read_choice_with_live_stats() {
             INDEX_SELECTED="$new_idx"
             local old_up=$(( (total_steps - old_idx) + footer_lines ))
             local new_up=$(( (total_steps - new_idx) + footer_lines ))
-            local old_row new_row
-            old_row="$(format_index_row "$old_idx" false)"
-            new_row="$(format_index_row "$new_idx" true)"
-            printf "\033[?2026h\033[?25l\033[s\033[%dA\r\033[2K%s\033[u\033[s\033[%dA\r\033[2K%s\033[u\033[?25h\033[?2026l" \
-              "$old_up" "$old_row" "$new_up" "$new_row"
+            if (( old_up < term_lines && new_up < term_lines )); then
+              local old_row new_row
+              old_row="$(format_index_row "$old_idx" false)"
+              new_row="$(format_index_row "$new_idx" true)"
+              printf "\033[?2026h\033[?25l\033[s\033[%dA\r\033[2K%s\033[u\033[s\033[%dA\r\033[2K%s\033[u\033[?25h\033[?2026l" \
+                "$old_up" "$old_row" "$new_up" "$new_row"
+            else
+              _cleanup_live_sampler
+              trap - INT TERM
+              printf "\n"
+              _out_var="__refresh__"
+              return 0
+            fi
           fi
         fi
       else
@@ -2197,19 +2205,12 @@ show_index() {
     fi
     print_header
 
-    local body="" warn=false
-    if (( RAM_GB > 0 && RAM_GB < 32 )); then
-      body+="$(echo -e "${C_YELLOW}[WARNING] System RAM is ${RAM_GB} GiB (< 32 GiB). Larger Strata models may not fit or may swap.${C_RESET}")"$'\n'
-      warn=true
+    local body="" hw_warns=""
+    hw_warns="$(format_strata_hw_warnings)"
+    if [[ -n "$hw_warns" ]]; then
+      body+="${hw_warns}"$'\n'
+      body+="$(echo -e "${C_DIM}          You can still apply any host optimizations applicable to this machine below.${C_RESET}")"$'\n\n'
     fi
-    if [[ "$HAS_NVIDIA" == false && "$HAS_AMD" == false && "$HAS_INTEL_ARC" == false ]]; then
-      body+="$(echo -e "${C_YELLOW}[WARNING] No dedicated NVIDIA, AMD Radeon, or Intel Arc GPU detected (${GPU_SUMMARY}). Strata models may not run.${C_RESET}")"$'\n'
-      warn=true
-    elif [[ "$HAS_NVIDIA" == true && "$NVIDIA_VRAM_MB" -gt 0 && "$NVIDIA_VRAM_MB" -lt 6144 ]]; then
-      body+="$(echo -e "${C_YELLOW}[WARNING] NVIDIA GPU VRAM is $((NVIDIA_VRAM_MB / 1024)) GiB (< 6 GiB). Larger Strata models may not fit in VRAM.${C_RESET}")"$'\n'
-      warn=true
-    fi
-    [[ "$warn" == true ]] && body+="$(echo -e "${C_DIM}          You can still apply any host optimizations applicable to this machine below.${C_RESET}")"$'\n\n'
 
     body+="$(echo -e "${C_BOLD}Optimization Index (Applicable to this machine):${C_RESET}")"$'\n\n'
     body+="$(printf "  ${C_BOLD}%-3s | %-13s | %-74s | %s${C_RESET}" "#" "Status" "Optimization" "Notes")"$'\n'
