@@ -1992,6 +1992,7 @@ run_step_view() {
 read_choice_with_live_stats() {
   local -n _out_var="$1"
   local lines_up="$2"
+  local footer_lines="${3:-0}"
   local term_lines can_live=false
   if [[ -t 1 && -t 0 ]]; then
     term_lines="$(tput lines 2>/dev/null || echo 40)"
@@ -2039,7 +2040,26 @@ read_choice_with_live_stats() {
           printf "\b \b"
         fi
       elif [[ "$ch" == $'\e' ]]; then
-        read -rsn2 -t 0.01 _ || true
+        local esc_seq=""
+        IFS= read -rsn2 -t 0.01 esc_seq || true
+        if (( footer_lines > 0 && ${#ACTIVE_STEPS[@]} > 0 )); then
+          local old_idx="$INDEX_SELECTED" new_idx="$INDEX_SELECTED" total_steps="${#ACTIVE_STEPS[@]}"
+          if [[ "$esc_seq" == "[A" || "$esc_seq" == "OA" ]]; then
+            new_idx=$(( (old_idx - 1 + total_steps) % total_steps ))
+          elif [[ "$esc_seq" == "[B" || "$esc_seq" == "OB" ]]; then
+            new_idx=$(( (old_idx + 1) % total_steps ))
+          fi
+          if (( new_idx != old_idx )); then
+            INDEX_SELECTED="$new_idx"
+            local old_up=$(( (total_steps - old_idx) + footer_lines ))
+            local new_up=$(( (total_steps - new_idx) + footer_lines ))
+            local old_row new_row
+            old_row="$(format_index_row "$old_idx" false)"
+            new_row="$(format_index_row "$new_idx" true)"
+            printf "\033[?2026h\033[?25l\033[s\033[%dA\r\033[2K%s\033[u\033[s\033[%dA\r\033[2K%s\033[u\033[?25h\033[?2026l" \
+              "$old_up" "$old_row" "$new_up" "$new_row"
+          fi
+        fi
       else
         buf+="$ch"
         printf "%s" "$ch"
@@ -2067,9 +2087,41 @@ read_choice_with_live_stats() {
   done
 }
 
+INDEX_SELECTED=0
+
+format_index_row() {
+  local idx="$1" selected="${2:-false}"
+  local step="${ACTIVE_STEPS[$idx]}"
+  local num=$(( idx + 1 ))
+  local badge note_txt title_txt ptr row_num
+  "status_${step}" && badge="${C_GREEN}[APPLIED]    ${C_RESET}" || badge="${C_YELLOW}[NOT APPLIED]${C_RESET}"
+  if declare -F "note_${step}" >/dev/null 2>&1; then
+    note_txt="$("note_${step}")"
+  else
+    note_txt="${C_DIM}-${C_RESET}"
+  fi
+  title_txt="$(printf "%-74s" "$("title_${step}")")"
+  if [[ "$selected" == true ]]; then
+    ptr="${C_CYAN}>${C_RESET}"
+    row_num="${C_CYAN}${C_BOLD}$(printf "%2d" "$num")${C_RESET}"
+    title_txt="${C_CYAN}${C_BOLD}${title_txt}${C_RESET}"
+  else
+    ptr=" "
+    row_num="$(printf "%2d" "$num")"
+  fi
+  printf "%b %b  | %b | %b | %b" "$ptr" "$row_num" "$badge" "$title_txt" "$note_txt"
+}
+
 show_index() {
   while true; do
     build_active_steps
+    if (( ${#ACTIVE_STEPS[@]} == 0 )); then
+      INDEX_SELECTED=0
+    elif (( INDEX_SELECTED >= ${#ACTIVE_STEPS[@]} )); then
+      INDEX_SELECTED=$(( ${#ACTIVE_STEPS[@]} - 1 ))
+    elif (( INDEX_SELECTED < 0 )); then
+      INDEX_SELECTED=0
+    fi
     print_header
 
     local body="" warn=false
@@ -2089,23 +2141,24 @@ show_index() {
     body+="$(echo -e "${C_BOLD}Optimization Index (Applicable to this machine):${C_RESET}")"$'\n\n'
     body+="$(printf "  ${C_BOLD}%-3s | %-13s | %-74s | %s${C_RESET}" "#" "Status" "Optimization" "Notes")"$'\n'
     body+="$(printf "  %s" "----+---------------+----------------------------------------------------------------------------+------------------------------------")"$'\n'
-    local i=1 step badge note_txt
-    for step in "${ACTIVE_STEPS[@]}"; do
-      "status_${step}" && badge="${C_GREEN}[APPLIED]    ${C_RESET}" || badge="${C_YELLOW}[NOT APPLIED]${C_RESET}"
-      if declare -F "note_${step}" >/dev/null 2>&1; then
-        note_txt="$("note_${step}")"
+    local idx
+    for (( idx = 0; idx < ${#ACTIVE_STEPS[@]}; idx++ )); do
+      if (( idx == INDEX_SELECTED )); then
+        body+="$(format_index_row "$idx" true)"$'\n'
       else
-        note_txt="${C_DIM}-${C_RESET}"
+        body+="$(format_index_row "$idx" false)"$'\n'
       fi
-      body+="$(printf "  %2d  | %b | %-74s | %b" "$i" "$badge" "$("title_${step}")" "$note_txt")"$'\n'
-      ((i++))
     done
 
+    local footer_lines=8
     body+=$'\n'"$(echo -e "  ${C_BOLD}[w]${C_RESET} Start guided wizard from Step 1")"$'\n'
-    [[ "$STRATA_UPDATE_AVAILABLE" == true ]] && body+="$(echo -e "  ${C_BGREEN}[u]${C_RESET} Install Strata update (${STRATA_UPDATE_SUMMARY})")"$'\n'
+    if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
+      body+="$(echo -e "  ${C_BGREEN}[u]${C_RESET} Install Strata update (${STRATA_UPDATE_SUMMARY})")"$'\n'
+      ((footer_lines++))
+    fi
     body+="$(echo -e "  ${C_GREEN}[a]${C_RESET} Apply all recommended optimizations (excludes Strata & high-idle-power options)")"$'\n'
     body+="$(echo -e "  ${C_RED}[x]${C_RESET} Revert all recommended optimizations")"$'\n'
-    body+="$(echo -e "  ${C_BOLD}[1-${#ACTIVE_STEPS[@]}]${C_RESET} Jump directly to a step")"$'\n'
+    body+="$(echo -e "  ${C_BOLD}[1-${#ACTIVE_STEPS[@]} / ↑↓+Enter]${C_RESET} Jump to or select a step")"$'\n'
     body+="$(echo -e "  ${C_BOLD}[r]${C_RESET} Reboot system")"$'\n'
     body+="$(echo -e "  ${C_BOLD}[q]${C_RESET} Quit")"$'\n\n'
 
@@ -2113,10 +2166,15 @@ show_index() {
     local body_lines lines_up
     body_lines="$(printf "%s" "$body" | wc -l)"
     lines_up=$(( LIVE_STATS_COUNT + POST_HEADER_LINES + body_lines ))
-    read_choice_with_live_stats choice "$lines_up"
+    read_choice_with_live_stats choice "$lines_up" "$footer_lines"
 
     case "$choice" in
       __refresh__) ;;
+      "")
+        if (( ${#ACTIVE_STEPS[@]} > 0 )); then
+          run_step_view "$INDEX_SELECTED" "single"
+        fi
+        ;;
       u|U)
         if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
           echo ""; perform_strata_update; pause_prompt
@@ -2124,7 +2182,7 @@ show_index() {
           echo -e "${C_YELLOW}No Strata update available.${C_RESET}"; sleep 1
         fi
         ;;
-      w|W|"") run_step_view 0 "wizard" ;;
+      w|W) run_step_view 0 "wizard" ;;
       a|A) run_recommended_batch "apply" ;;
       x|X) run_recommended_batch "revert" ;;
       r|R)
