@@ -1946,7 +1946,6 @@ show_index() {
     body+="$(echo -e "  ${C_GREEN}[a]${C_RESET} Apply all recommended optimizations (excludes Strata & high-idle-power options)")"$'\n'
     body+="$(echo -e "  ${C_RED}[x]${C_RESET} Revert all recommended optimizations")"$'\n'
     body+="$(echo -e "  ${C_BOLD}[1-${#ACTIVE_STEPS[@]}]${C_RESET} Jump directly to a step")"$'\n'
-    body+="$(echo -e "  ${C_BOLD}[s]${C_RESET} Refresh live system stats")"$'\n'
     body+="$(echo -e "  ${C_BOLD}[r]${C_RESET} Reboot system")"$'\n'
     body+="$(echo -e "  ${C_BOLD}[q]${C_RESET} Quit")"$'\n\n'
 
@@ -1968,7 +1967,6 @@ show_index() {
       w|W|"") run_step_view 0 "wizard" ;;
       a|A) run_recommended_batch "apply" ;;
       x|X) run_recommended_batch "revert" ;;
-      s|S) ;;
       r|R)
         confirm_yn "Reboot this system now? [y/N]: " "N" && { run_root systemctl reboot; exit 0; }
         sleep 1
