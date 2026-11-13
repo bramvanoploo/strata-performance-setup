@@ -32,6 +32,7 @@ GPU_SUMMARY="" CPU_SUMMARY="" RAM_GB=0 RAM_DETAILS="" NVIDIA_VRAM_MB=0
 HAS_MSI_EC=false SYS_VENDOR="" PRODUCT_NAME="" IS_LAPTOP=false HAS_ASPM=false
 NVIDIA_DEFAULT_PL="" NVIDIA_MAX_PL="" NVIDIA_CURRENT_PL=""
 REBOOT_REQUIRED=false REBOOT_PROMPT_PENDING=false
+PREV_CPU_TOTAL="" PREV_CPU_IDLE="" LIVE_STATS_ROW=17 LIVE_STATS_COUNT=0
 UNIT_FILES_CACHE=""
 declare -A PKG_AVAIL_CACHE
 
@@ -1266,22 +1267,30 @@ render_bar() {
 }
 
 print_live_stats() {
+  local inplace="${1:-false}" eol=""
+  [[ "$inplace" == true ]] && eol=$'\033[K'
+
   local cpu_pct="" ram_pct="" ram_used_gib="" ram_tot_gib=""
   local gpu_pct="" vram_pct="" vram_used_gib="" vram_tot_gib=""
   local pwr_w="" pwr_lim_w="" pwr_pct="" pwr_label="Power"
 
-  # CPU usage (150ms delta on /proc/stat)
+  # CPU usage (/proc/stat delta; 150ms sample only on first call)
   if [[ -r /proc/stat ]]; then
-    local u1 n1 s1 i1 w1 q1 sq1 st1 u2 n2 s2 i2 w2 q2 sq2 st2
+    local u1 n1 s1 i1 w1 q1 sq1 st1 idle_now tot_now
+    if [[ -z "$PREV_CPU_TOTAL" ]]; then
+      read -r _ u1 n1 s1 i1 w1 q1 sq1 st1 _ < /proc/stat
+      PREV_CPU_IDLE=$((i1 + w1))
+      PREV_CPU_TOTAL=$((u1 + n1 + s1 + PREV_CPU_IDLE + q1 + sq1 + st1))
+      sleep 0.15
+    fi
     read -r _ u1 n1 s1 i1 w1 q1 sq1 st1 _ < /proc/stat
-    sleep 0.15
-    read -r _ u2 n2 s2 i2 w2 q2 sq2 st2 _ < /proc/stat
-    local idle1=$((i1 + w1)) idle2=$((i2 + w2))
-    local tot1=$((u1 + n1 + s1 + idle1 + q1 + sq1 + st1))
-    local tot2=$((u2 + n2 + s2 + idle2 + q2 + sq2 + st2))
-    local dt=$((tot2 - tot1)) di=$((idle2 - idle1))
+    idle_now=$((i1 + w1))
+    tot_now=$((u1 + n1 + s1 + idle_now + q1 + sq1 + st1))
+    local dt=$((tot_now - PREV_CPU_TOTAL)) di=$((idle_now - PREV_CPU_IDLE))
     if (( dt > 0 )); then
       cpu_pct=$(( (dt - di) * 100 / dt ))
+      PREV_CPU_TOTAL="$tot_now"
+      PREV_CPU_IDLE="$idle_now"
     fi
   fi
 
@@ -1369,18 +1378,33 @@ print_live_stats() {
     done
   fi
 
-  echo -e "${C_BOLD}Live System Usage:${C_RESET}"
-  [[ -n "$cpu_pct" ]] && printf "  %-8s [%s] %3d%%\n" "CPU:" "$(render_bar "$cpu_pct")" "$cpu_pct"
-  [[ -n "$ram_pct" ]] && printf "  %-8s [%s] %3d%% (%s / %s GiB)\n" "RAM:" "$(render_bar "$ram_pct")" "$ram_pct" "$ram_used_gib" "$ram_tot_gib"
-  [[ -n "$gpu_pct" ]] && printf "  %-8s [%s] %3d%%\n" "GPU:" "$(render_bar "$gpu_pct")" "$gpu_pct"
-  [[ -n "$vram_pct" ]] && printf "  %-8s [%s] %3d%% (%s / %s GiB)\n" "VRAM:" "$(render_bar "$vram_pct")" "$vram_pct" "$vram_used_gib" "$vram_tot_gib"
+  local lines=1
+  printf "%bLive System Usage:%b%s\n" "${C_BOLD}" "${C_RESET}" "$eol"
+  if [[ -n "$cpu_pct" ]]; then
+    printf "  %-8s [%s] %3d%%%s\n" "CPU:" "$(render_bar "$cpu_pct")" "$cpu_pct" "$eol"
+    ((lines++))
+  fi
+  if [[ -n "$ram_pct" ]]; then
+    printf "  %-8s [%s] %3d%% (%s / %s GiB)%s\n" "RAM:" "$(render_bar "$ram_pct")" "$ram_pct" "$ram_used_gib" "$ram_tot_gib" "$eol"
+    ((lines++))
+  fi
+  if [[ -n "$gpu_pct" ]]; then
+    printf "  %-8s [%s] %3d%%%s\n" "GPU:" "$(render_bar "$gpu_pct")" "$gpu_pct" "$eol"
+    ((lines++))
+  fi
+  if [[ -n "$vram_pct" ]]; then
+    printf "  %-8s [%s] %3d%% (%s / %s GiB)%s\n" "VRAM:" "$(render_bar "$vram_pct")" "$vram_pct" "$vram_used_gib" "$vram_tot_gib" "$eol"
+    ((lines++))
+  fi
   if [[ -n "$pwr_w" ]]; then
     if [[ -n "$pwr_pct" && -n "$pwr_lim_w" ]]; then
-      printf "  %-8s [%s] %3d%% (%s / %s W)\n" "${pwr_label}:" "$(render_bar "$pwr_pct")" "$pwr_pct" "$pwr_w" "$pwr_lim_w"
+      printf "  %-8s [%s] %3d%% (%s / %s W)%s\n" "${pwr_label}:" "$(render_bar "$pwr_pct")" "$pwr_pct" "$pwr_w" "$pwr_lim_w" "$eol"
     else
-      printf "  %-8s %s W\n" "${pwr_label}:" "$pwr_w"
+      printf "  %-8s %s W%s\n" "${pwr_label}:" "$pwr_w" "$eol"
     fi
+    ((lines++))
   fi
+  LIVE_STATS_COUNT="$lines"
 }
 
 print_header() {
@@ -1393,11 +1417,13 @@ print_header() {
   echo -e "${C_DIM}CPU:    ${CPU_SUMMARY}${C_RESET}"
   echo -e "${C_DIM}RAM:    ${RAM_GB} GiB${RAM_DETAILS}${C_RESET}"
   echo -e "${C_DIM}GPU(s): ${GPU_SUMMARY}${C_RESET}"
+  LIVE_STATS_ROW=17
   if [[ "$HAS_NVIDIA" == true && -n "$NVIDIA_CURRENT_PL" ]]; then
     echo -e "${C_DIM}NVIDIA Power Limit: ${NVIDIA_CURRENT_PL}W (Default: ${NVIDIA_DEFAULT_PL}W, Max: ${NVIDIA_MAX_PL}W)${C_RESET}"
+    LIVE_STATS_ROW=18
   fi
   echo ""
-  print_live_stats
+  print_live_stats false
   if [[ "$REBOOT_REQUIRED" == true ]]; then
     echo -e "\n${C_YELLOW}[!] Reboot pending: newly added kernel parameters require a reboot to take effect.${C_RESET}"
   fi
@@ -1463,6 +1489,53 @@ run_step_view() {
   done
 }
 
+read_choice_with_live_stats() {
+  local -n _out_var="$1"
+  local term_lines total_lines can_live=false
+  if [[ -t 1 && -t 0 ]]; then
+    term_lines="$(tput lines 2>/dev/null || echo 40)"
+    total_lines=$(( LIVE_STATS_ROW + LIVE_STATS_COUNT + ${#ACTIVE_STEPS[@]} + 14 ))
+    [[ "$REBOOT_REQUIRED" == true ]] && ((total_lines += 2))
+    (( total_lines <= term_lines )) && can_live=true
+  fi
+
+  if [[ "$can_live" == false ]]; then
+    read -r -p "Choice: " _out_var || exit 0
+    return 0
+  fi
+
+  local buf="" ch="" rc=0
+  printf "Choice: "
+  while true; do
+    rc=0
+    IFS= read -rsn1 -t 0.5 ch || rc=$?
+    if (( rc == 0 )); then
+      if [[ -z "$ch" ]]; then
+        printf "\n"
+        _out_var="$buf"
+        return 0
+      elif [[ "$ch" == $'\177' || "$ch" == $'\b' ]]; then
+        if [[ -n "$buf" ]]; then
+          buf="${buf%?}"
+          printf "\b \b"
+        fi
+      elif [[ "$ch" == $'\e' ]]; then
+        read -rsn2 -t 0.01 _ || true
+      else
+        buf+="$ch"
+        printf "%s" "$ch"
+      fi
+    elif (( rc > 128 )); then
+      printf "\033[s\033[%d;1H" "$LIVE_STATS_ROW"
+      print_live_stats true
+      printf "\033[u"
+    else
+      printf "\n"
+      exit 0
+    fi
+  done
+}
+
 show_index() {
   while true; do
     build_active_steps
@@ -1504,7 +1577,7 @@ show_index() {
     echo -e "  ${C_BOLD}[s]${C_RESET} Refresh live system stats"
     echo -e "  ${C_BOLD}[r]${C_RESET} Reboot system"
     echo -e "  ${C_BOLD}[q]${C_RESET} Quit\n"
-    read -r -p "Choice: " choice || exit 0
+    read_choice_with_live_stats choice
 
     case "$choice" in
       w|W|"") run_step_view 0 "wizard" ;;
