@@ -1835,7 +1835,7 @@ read_choice_with_live_stats() {
   if [[ -n "$tmp_file" ]]; then
     (
       while true; do
-        sleep 0.5
+        sleep 1
         print_live_stats true > "${tmp_file}.tmp" 2>/dev/null && mv -f "${tmp_file}.tmp" "$tmp_file" 2>/dev/null || true
       done
     ) &
@@ -1852,7 +1852,7 @@ read_choice_with_live_stats() {
   printf "Choice: "
   while true; do
     rc=0
-    IFS= read -rsn1 -t 0.5 ch || rc=$?
+    IFS= read -rsn1 -t 1 ch || rc=$?
     if (( rc == 0 )); then
       if [[ -z "$ch" ]]; then
         _cleanup_live_sampler
