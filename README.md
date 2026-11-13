@@ -8,6 +8,10 @@ An interactive TUI wizard (`strata-performance-setup.sh`) to inspect, apply, and
 
 The script automatically detects your distribution, CPU, RAM, GPU(s), laptop/chassis vendor, and bootloader, then presents only the optimizations applicable to your machine. Every optimization can be applied or reverted cleanly from the wizard.
 
+<p align="center">
+  <img src="assets/tui-screenshot.png" alt="Strata Performance Setup TUI" width="880">
+</p>
+
 ---
 
 ## Quick Start (Recommended)
