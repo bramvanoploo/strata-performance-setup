@@ -1663,14 +1663,15 @@ print_live_stats() {
       ((lines++))
     fi
   done
+  if [[ -n "$cpu_pwr_w" ]]; then
+    out+=$'\n'"$(printf "  %-8s %s W%s" "CPU Pwr:" "$cpu_pwr_w" "$eol")"
+    ((lines++))
+  fi
   if [[ -n "$sys_pwr_w" ]]; then
     out+=$'\n'"$(printf "  %-8s %s W%s" "Sys Pwr:" "$sys_pwr_w" "$eol")"
     ((lines++))
   elif [[ -n "$cpu_pwr_w" && -n "$total_gpu_pwr_w" ]]; then
-    out+=$'\n'"$(printf "  %-8s ~%s W (CPU %sW + GPU %sW)%s" "Sys Pwr:" "$((cpu_pwr_w + total_gpu_pwr_w))" "$cpu_pwr_w" "$total_gpu_pwr_w" "$eol")"
-    ((lines++))
-  elif [[ -n "$cpu_pwr_w" ]]; then
-    out+=$'\n'"$(printf "  %-8s %s W%s" "CPU Pwr:" "$cpu_pwr_w" "$eol")"
+    out+=$'\n'"$(printf "  %-8s ~%s W%s" "Sys Pwr:" "$((cpu_pwr_w + total_gpu_pwr_w))" "$eol")"
     ((lines++))
   fi
   LIVE_STATS_COUNT="$lines"
