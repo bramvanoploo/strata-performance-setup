@@ -33,6 +33,7 @@ HAS_MSI_EC=false SYS_VENDOR="" PRODUCT_NAME="" IS_LAPTOP=false HAS_ASPM=false
 NVIDIA_DEFAULT_PL="" NVIDIA_MAX_PL="" NVIDIA_CURRENT_PL=""
 REBOOT_REQUIRED=false REBOOT_PROMPT_PENDING=false
 PREV_CPU_TOTAL="" PREV_CPU_IDLE="" LIVE_STATS_COUNT=0 POST_HEADER_LINES=0
+STRATA_UPDATE_AVAILABLE=false STRATA_UPDATE_SUMMARY="" STRATA_UPDATE_CACHE_FILE="" STRATA_POLLER_PID=""
 UNIT_FILES_CACHE=""
 declare -A PKG_AVAIL_CACHE
 
@@ -1117,9 +1118,187 @@ revert_irq_balance() { run_root systemctl disable --now irqbalance.service 2>/de
 applicable_strata_manager() { return 0; }
 title_strata_manager() { echo "Strata: Install, Update, Launch & Systemd Service"; }
 strata_service_installed() { [[ -f /etc/systemd/system/strata.service ]]; }
-strata_update_available() {
+
+check_strata_update_sync() {
   [[ -n "$STRATA_BIN" ]] || return 1
-  grep -qiE "update available|newer|out of date" <<< "$(run_as_user "$STRATA_BIN update --check 2>/dev/null" || true)"
+  local json_out parsed=""
+  json_out="$(run_as_user "$STRATA_BIN update --check --json 2>/dev/null" || true)"
+  if [[ -n "$json_out" ]] && command -v python3 >/dev/null 2>&1; then
+    parsed="$(python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(1)
+updates = []
+for key in ("engine", "control"):
+    comp = d.get(key)
+    if not isinstance(comp, dict):
+        continue
+    inst = comp.get("installed")
+    off = comp.get("offered")
+    inst_v = inst.get("version") if isinstance(inst, dict) else inst
+    off_v = off.get("version") if isinstance(off, dict) else off
+    st = comp.get("status", "")
+    if inst_v and off_v and (st not in ("", "current", "unknown-installed") or inst_v != off_v):
+        updates.append(f"{key} {inst_v} -> {off_v}")
+if updates:
+    print("1|" + ", ".join(updates))
+else:
+    print("0|")
+' <<< "$json_out" 2>/dev/null || true)"
+  fi
+
+  if [[ -z "$parsed" ]]; then
+    local txt_out
+    txt_out="$(run_as_user "$STRATA_BIN update --check 2>/dev/null" || true)"
+    if grep -qiE "update available|newer|out of date" <<< "$txt_out"; then
+      parsed="1|new version available"
+    else
+      parsed="0|"
+    fi
+  fi
+
+  if [[ -n "$STRATA_UPDATE_CACHE_FILE" ]]; then
+    printf "%s\n" "$parsed" > "${STRATA_UPDATE_CACHE_FILE}.tmp" 2>/dev/null && mv -f "${STRATA_UPDATE_CACHE_FILE}.tmp" "$STRATA_UPDATE_CACHE_FILE" 2>/dev/null || true
+  fi
+
+  if [[ "$parsed" == 1\|* ]]; then
+    STRATA_UPDATE_AVAILABLE=true
+    STRATA_UPDATE_SUMMARY="${parsed#1|}"
+    return 0
+  else
+    STRATA_UPDATE_AVAILABLE=false
+    STRATA_UPDATE_SUMMARY=""
+    return 1
+  fi
+}
+
+load_strata_update_state() {
+  [[ -n "$STRATA_UPDATE_CACHE_FILE" && -r "$STRATA_UPDATE_CACHE_FILE" ]] || return 0
+  local line
+  line="$(<"$STRATA_UPDATE_CACHE_FILE")"
+  if [[ "$line" == 1\|* ]]; then
+    STRATA_UPDATE_AVAILABLE=true
+    STRATA_UPDATE_SUMMARY="${line#1|}"
+  else
+    STRATA_UPDATE_AVAILABLE=false
+    STRATA_UPDATE_SUMMARY=""
+  fi
+}
+
+stop_strata_update_poller() {
+  [[ -n "$STRATA_POLLER_PID" ]] && { kill "$STRATA_POLLER_PID" 2>/dev/null || true; wait "$STRATA_POLLER_PID" 2>/dev/null || true; STRATA_POLLER_PID=""; }
+  [[ -n "$STRATA_UPDATE_CACHE_FILE" ]] && rm -f "$STRATA_UPDATE_CACHE_FILE" "${STRATA_UPDATE_CACHE_FILE}.tmp" 2>/dev/null || true
+}
+
+start_strata_update_poller() {
+  [[ -n "$STRATA_BIN" ]] || return 0
+  [[ -n "$STRATA_UPDATE_CACHE_FILE" ]] || STRATA_UPDATE_CACHE_FILE="$(mktemp /tmp/strata-update-check.XXXXXX 2>/dev/null || echo "")"
+  [[ -n "$STRATA_UPDATE_CACHE_FILE" ]] || return 0
+  (
+    while true; do
+      check_strata_update_sync >/dev/null 2>&1 || true
+      sleep 60
+    done
+  ) &
+  STRATA_POLLER_PID=$!
+}
+
+strata_update_available() {
+  check_strata_update_sync
+}
+
+wait_for_strata_model_live() {
+  local max_wait="${1:-120}" elapsed=0 json_out ready_profile=""
+  echo -e "${C_DIM}Waiting for Strata model to become ready...${C_RESET}"
+  while (( elapsed < max_wait )); do
+    if ! unit_active strata.service; then
+      echo -e "${C_RED}strata.service is not active (check 'journalctl -u strata -n 50').${C_RESET}"
+      return 1
+    fi
+    json_out="$(run_as_user "$STRATA_BIN update --check --json 2>/dev/null" || true)"
+    if [[ -n "$json_out" ]] && command -v python3 >/dev/null 2>&1; then
+      ready_profile="$(python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(0)
+for s in d.get("serving") or []:
+    if isinstance(s, dict) and s.get("state") == "ready":
+        print(s.get("profile") or "model")
+        break
+' <<< "$json_out" 2>/dev/null || true)"
+      if [[ -n "$ready_profile" ]]; then
+        echo -e "${C_BGREEN}[LIVE] Strata service is active and model '${ready_profile}' is ready!${C_RESET}"
+        return 0
+      fi
+    fi
+    sleep 2
+    ((elapsed += 2))
+  done
+  if unit_active strata.service; then
+    echo -e "${C_GREEN}strata.service is active (model readiness not reported via JSON within ${max_wait}s).${C_RESET}"
+    return 0
+  fi
+  return 1
+}
+
+perform_strata_update() {
+  refresh_strata_bin
+  if [[ -z "$STRATA_BIN" ]]; then
+    echo -e "${C_YELLOW}Strata is not installed.${C_RESET}"
+    return 1
+  fi
+
+  local was_active=false
+  unit_active strata.service && was_active=true
+
+  echo -e "${C_BOLD}Strata Update${C_RESET}"
+  [[ -n "$STRATA_UPDATE_SUMMARY" ]] && echo -e "Pending update: ${C_CYAN}${STRATA_UPDATE_SUMMARY}${C_RESET}"
+  echo -e "Service status: $([[ "$was_active" == true ]] && echo "${C_GREEN}active (will stop & restart)${C_RESET}" || echo "${C_DIM}inactive${C_RESET}")\n"
+
+  if ! confirm_yn "Install Strata update now? [Y/n]: " "Y"; then
+    echo -e "${C_DIM}Update cancelled.${C_RESET}"
+    return 0
+  fi
+
+  if [[ "$was_active" == true ]]; then
+    echo -e "\n${C_CYAN}Stopping strata.service before updating...${C_RESET}"
+    run_root systemctl stop strata.service || true
+  fi
+
+  echo -e "\n${C_CYAN}Running 'strata update --yes'...${C_RESET}"
+  local rc=0
+  run_as_user "$STRATA_BIN update --yes" || rc=$?
+
+  refresh_strata_bin
+  if (( rc == 0 )); then
+    echo -e "\n${C_GREEN}Strata update completed successfully!${C_RESET}"
+    echo -e "${C_DIM}Installed version: $(run_as_user "$STRATA_BIN --version 2>/dev/null" || echo unknown)${C_RESET}"
+    check_strata_update_sync >/dev/null 2>&1 || true
+  else
+    echo -e "\n${C_RED}Strata update failed (exit code ${rc}).${C_RESET}"
+  fi
+
+  if [[ "$was_active" == true ]]; then
+    echo -e "\n${C_CYAN}Restarting strata.service...${C_RESET}"
+    if run_root systemctl start strata.service; then
+      wait_for_strata_model_live 120
+    else
+      echo -e "${C_RED}Failed to start strata.service (check 'journalctl -u strata -n 50').${C_RESET}"
+    fi
+  elif strata_service_installed; then
+    echo ""
+    if confirm_yn "strata.service is installed but was stopped. Start it now? [y/N]: " "N"; then
+      if run_root systemctl start strata.service; then
+        wait_for_strata_model_live 120
+      else
+        echo -e "${C_RED}Failed to start strata.service.${C_RESET}"
+      fi
+    fi
+  fi
 }
 status_strata_manager() { [[ -n "$STRATA_BIN" ]] && strata_service_installed; }
 explain_strata_manager() {
@@ -1188,13 +1367,14 @@ apply_strata_manager() {
     if confirm_yn "Strata is not installed. Install Strata now? [Y/n]: " "Y"; then
       run_as_user "curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh | sh"
       refresh_strata_bin
+      [[ -n "$STRATA_BIN" && -z "$STRATA_POLLER_PID" ]] && start_strata_update_poller
     fi
   else
     echo -e "${C_GREEN}Strata is installed at: ${STRATA_BIN}${C_RESET}"
     echo -e "${C_DIM}Checking for Strata updates...${C_RESET}"
-    if strata_update_available; then
-      echo -e "${C_CYAN}An update is available for Strata!${C_RESET}"
-      confirm_yn "Run 'strata update' now? [Y/n]: " "Y" && run_as_user "$STRATA_BIN update"
+    if check_strata_update_sync; then
+      echo -e "${C_CYAN}An update is available for Strata (${STRATA_UPDATE_SUMMARY})!${C_RESET}"
+      perform_strata_update
     else
       echo -e "${C_GREEN}Strata is up to date.${C_RESET}"
     fi
@@ -1422,11 +1602,16 @@ print_header() {
     echo -e "${C_DIM}NVIDIA Power Limit: ${NVIDIA_CURRENT_PL}W (Default: ${NVIDIA_DEFAULT_PL}W, Max: ${NVIDIA_MAX_PL}W)${C_RESET}"
   fi
   echo ""
+  load_strata_update_state
   print_live_stats false
   POST_HEADER_LINES=1
+  if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
+    echo -e "\n${C_BGREEN}[UPDATE AVAILABLE]${C_RESET} ${C_CYAN}Strata update ready (${STRATA_UPDATE_SUMMARY}). Press [u] to install & restart service.${C_RESET}"
+    ((POST_HEADER_LINES += 2))
+  fi
   if [[ "$REBOOT_REQUIRED" == true ]]; then
     echo -e "\n${C_YELLOW}[!] Reboot pending: newly added kernel parameters require a reboot to take effect.${C_RESET}"
-    POST_HEADER_LINES=3
+    ((POST_HEADER_LINES += 2))
   fi
   echo ""
 }
@@ -1456,9 +1641,17 @@ run_step_view() {
       fi
     fi
 
+    [[ "$STRATA_UPDATE_AVAILABLE" == true ]] && echo -e "  ${C_BGREEN}[u]${C_RESET} Install Strata update (${STRATA_UPDATE_SUMMARY})"
     echo -e "  ${C_DIM}[n]${C_RESET} Next step (Skip)   ${C_DIM}[b]${C_RESET} Previous step   ${C_DIM}[i]${C_RESET} Back to Index   ${C_DIM}[q]${C_RESET} Quit\n"
     read -r -p "Select action: " action || exit 0
     case "$action" in
+      u|U)
+        if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
+          echo ""; perform_strata_update; pause_prompt
+        else
+          echo -e "${C_YELLOW}No Strata update available.${C_RESET}"; sleep 1
+        fi
+        ;;
       a|A)
         if [[ "$step" != "strata_manager" && "$applied" == true ]]; then
           echo -e "${C_YELLOW}This optimization is already applied.${C_RESET}"; sleep 1
@@ -1546,6 +1739,15 @@ read_choice_with_live_stats() {
         printf "%s" "$ch"
       fi
     elif (( rc > 128 )); then
+      local prev_upd="$STRATA_UPDATE_AVAILABLE"
+      load_strata_update_state
+      if [[ "$prev_upd" == false && "$STRATA_UPDATE_AVAILABLE" == true && -z "$buf" ]]; then
+        _cleanup_live_sampler
+        trap - INT TERM
+        printf "\n"
+        _out_var="__refresh__"
+        return 0
+      fi
       if [[ -n "$tmp_file" && -s "$tmp_file" ]]; then
         stats_block="$(<"$tmp_file")"
         printf "\033[?2026h\033[?25l\033[s\033[%dA\r%s\033[u\033[?25h\033[?2026l" "$lines_up" "$stats_block"
@@ -1594,6 +1796,7 @@ show_index() {
     done
 
     body+=$'\n'"$(echo -e "  ${C_BOLD}[w]${C_RESET} Start guided wizard from Step 1")"$'\n'
+    [[ "$STRATA_UPDATE_AVAILABLE" == true ]] && body+="$(echo -e "  ${C_BGREEN}[u]${C_RESET} Install Strata update (${STRATA_UPDATE_SUMMARY})")"$'\n'
     body+="$(echo -e "  ${C_GREEN}[a]${C_RESET} Apply all recommended optimizations (excludes Strata & high-idle-power options)")"$'\n'
     body+="$(echo -e "  ${C_RED}[x]${C_RESET} Revert all recommended optimizations")"$'\n'
     body+="$(echo -e "  ${C_BOLD}[1-${#ACTIVE_STEPS[@]}]${C_RESET} Jump directly to a step")"$'\n'
@@ -1608,6 +1811,14 @@ show_index() {
     read_choice_with_live_stats choice "$lines_up"
 
     case "$choice" in
+      __refresh__) ;;
+      u|U)
+        if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
+          echo ""; perform_strata_update; pause_prompt
+        else
+          echo -e "${C_YELLOW}No Strata update available.${C_RESET}"; sleep 1
+        fi
+        ;;
       w|W|"") run_step_view 0 "wizard" ;;
       a|A) run_recommended_batch "apply" ;;
       x|X) run_recommended_batch "revert" ;;
@@ -1628,5 +1839,7 @@ show_index() {
   done
 }
 
+trap 'stop_strata_update_poller' EXIT
 detect_environment
+start_strata_update_poller
 show_index
