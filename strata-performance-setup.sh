@@ -33,7 +33,7 @@ HAS_MSI_EC=false SYS_VENDOR="" PRODUCT_NAME="" IS_LAPTOP=false HAS_ASPM=false
 NVIDIA_DEFAULT_PL="" NVIDIA_MAX_PL="" NVIDIA_CURRENT_PL=""
 REBOOT_REQUIRED=false REBOOT_PROMPT_PENDING=false
 PREV_CPU_TOTAL="" PREV_CPU_IDLE="" PREV_RAPL_UJ="" PREV_RAPL_US="" LIVE_STATS_COUNT=0 POST_HEADER_LINES=0
-declare -a LIVE_STAT_LINES=() SYS_INFO_LINES=()
+declare -a LIVE_STAT_LINES=() SYS_INFO_LINES=() STRATA_STAT_LINES=()
 STRATA_UPDATE_AVAILABLE=false STRATA_UPDATE_SUMMARY="" STRATA_UPDATE_CACHE_FILE="" STRATA_POLLER_PID=""
 UNIT_FILES_CACHE=""
 declare -A PKG_AVAIL_CACHE
@@ -1780,7 +1780,6 @@ build_sys_info_lines() {
     total_vram_gb="$(awk "BEGIN {g=$TOTAL_VRAM_MB/1024; if (g == int(g)) printf \"%d\", g; else printf \"%.1f\", g}")"
     SYS_INFO_LINES+=("$(printf "%bVRAM:   %s GiB%b" "${C_DIM}" "$total_vram_gb" "${C_RESET}")")
   fi
-  SYS_INFO_LINES+=("$(printf "%bStrata: %s%b" "${C_DIM}" "${STRATA_VERSION:-Not installed}" "${C_RESET}")")
   if [[ "$HAS_NVIDIA" == true && -n "$NVIDIA_CURRENT_PL" ]]; then
     SYS_INFO_LINES+=("$(printf "%bNVIDIA Power Limit: %sW (Default: %sW, Max: %sW)%b" "${C_DIM}" "$NVIDIA_CURRENT_PL" "$NVIDIA_DEFAULT_PL" "$NVIDIA_MAX_PL" "${C_RESET}")")
   fi
@@ -1798,8 +1797,15 @@ pad_ansi_col() {
   fi
 }
 
-format_strata_serving_line() {
-  [[ -n "$STRATA_RUNNING_PRESET" ]] || return 0
+collect_strata_stats_lines() {
+  STRATA_STAT_LINES=()
+  STRATA_STAT_LINES+=("$(printf "%bStrata:%b" "${C_BOLD}" "${C_RESET}")")
+  STRATA_STAT_LINES+=("$(printf "  %-8s %b%s%b" "Version:" "${C_DIM}" "${STRATA_VERSION:-Not installed}" "${C_RESET}")")
+  if [[ -z "$STRATA_RUNNING_PRESET" ]]; then
+    [[ -n "$STRATA_BIN" ]] && STRATA_STAT_LINES+=("$(printf "  %-8s %bNot serving%b" "Status:" "${C_DIM}" "${C_RESET}")")
+    return 0
+  fi
+
   local model="" live_str="0.0 tok/s (idle)" avg_str="—"
   if [[ -n "$STRATA_RUNNING_URL" ]] && command -v curl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
     local m_json
@@ -1837,10 +1843,9 @@ print(f"{model}|{live_s}|{avg_s}")
   fi
   local preset_disp="$STRATA_RUNNING_PRESET"
   [[ -n "$model" ]] && preset_disp+=" ($model)"
-  printf "%bStrata Serving:%b %s %b|%b Live: %b%s%b %b|%b Avg: %b%s%b" \
-    "${C_BOLD}" "${C_RESET}" "$preset_disp" \
-    "${C_DIM}" "${C_RESET}" "${C_CYAN}" "$live_str" "${C_RESET}" \
-    "${C_DIM}" "${C_RESET}" "${C_GREEN}" "$avg_str" "${C_RESET}"
+  STRATA_STAT_LINES+=("$(printf "  %-8s %s" "Preset:" "$preset_disp")")
+  STRATA_STAT_LINES+=("$(printf "  %-8s %b%s%b" "Live:" "${C_CYAN}" "$live_str" "${C_RESET}")")
+  STRATA_STAT_LINES+=("$(printf "  %-8s %b%s%b" "Avg:" "${C_GREEN}" "$avg_str" "${C_RESET}")")
 }
 
 print_stats_and_info_grid() {
@@ -1881,11 +1886,15 @@ print_stats_and_info_grid() {
       ((total_lines++))
     done
   fi
-  local serving_line=""
-  serving_line="$(format_strata_serving_line || true)"
-  if [[ -n "$serving_line" ]]; then
-    out+=$'\n'"${eol}"$'\n'"${serving_line}${eol}"
-    ((total_lines += 2))
+  collect_strata_stats_lines
+  if (( ${#STRATA_STAT_LINES[@]} > 0 )); then
+    out+=$'\n'"${eol}"
+    ((total_lines++))
+    local sl
+    for sl in "${STRATA_STAT_LINES[@]}"; do
+      out+=$'\n'"${sl}${eol}"
+      ((total_lines++))
+    done
   fi
   LIVE_STATS_COUNT="$total_lines"
   printf "%s\n" "$out"
