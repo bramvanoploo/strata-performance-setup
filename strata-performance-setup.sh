@@ -28,7 +28,7 @@ TARGET_HOME="$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6 || eval ec
 STRATA_BIN="" STRATA_VERSION=""
 DISTRO_FAMILY="unknown" DISTRO_ID="unknown" OS_PRETTY="" KERNEL_VER="" AUR_HELPER=""
 HAS_NVIDIA=false HAS_NVIDIA_POWERD=false HAS_AMD=false HAS_INTEL_GPU=false HAS_INTEL_ARC=false
-GPU_SUMMARY="" CPU_SUMMARY="" RAM_GB=0 RAM_DETAILS="" NVIDIA_VRAM_MB=0
+GPU_SUMMARY="" CPU_SUMMARY="" RAM_GB=0 RAM_DETAILS="" NVIDIA_VRAM_MB=0 TOTAL_VRAM_MB=0
 HAS_MSI_EC=false SYS_VENDOR="" PRODUCT_NAME="" IS_LAPTOP=false HAS_ASPM=false
 NVIDIA_DEFAULT_PL="" NVIDIA_MAX_PL="" NVIDIA_CURRENT_PL=""
 REBOOT_REQUIRED=false REBOOT_PROMPT_PENDING=false
@@ -354,6 +354,9 @@ detect_environment() {
     [[ "$raw_def" =~ ^[0-9]+(\.[0-9]+)?$ ]] && NVIDIA_DEFAULT_PL="$(awk "BEGIN {printf \"%.0f\", $raw_def}")"
     [[ "$raw_max" =~ ^[0-9]+(\.[0-9]+)?$ ]] && NVIDIA_MAX_PL="$(awk "BEGIN {printf \"%.0f\", $raw_max}")"
     [[ "$raw_vram" =~ ^[0-9]+$ ]] && NVIDIA_VRAM_MB="$raw_vram"
+    local nv_vram_sum
+    nv_vram_sum="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | awk '/^[0-9]+$/ {s+=$1} END {print s+0}' || true)"
+    [[ "$nv_vram_sum" =~ ^[0-9]+$ ]] && TOTAL_VRAM_MB=$((TOTAL_VRAM_MB + nv_vram_sum))
   elif lspci 2>/dev/null | grep -iE "vga|3d|display" | grep -qi "nvidia"; then
     HAS_NVIDIA=true
   fi
@@ -363,6 +366,14 @@ detect_environment() {
   GPU_SUMMARY="$(echo "$gpu_lines" | sed 's/^[^ ]* [^:]*: //' | paste -sd '; ' -)"
   [[ -z "$GPU_SUMMARY" ]] && GPU_SUMMARY="Unknown"
   echo "$gpu_lines" | grep -qiE "amd|ati|radeon" && HAS_AMD=true
+  if [[ "$HAS_AMD" == true ]]; then
+    local vram_file vt
+    for vram_file in /sys/class/drm/card*/device/mem_info_vram_total; do
+      [[ -r "$vram_file" ]] || continue
+      vt="$(cat "$vram_file" 2>/dev/null || echo 0)"
+      [[ "$vt" =~ ^[0-9]+$ ]] && (( vt > 0 )) && TOTAL_VRAM_MB=$((TOTAL_VRAM_MB + vt / 1048576))
+    done
+  fi
   if echo "$gpu_lines" | grep -qi "intel"; then
     HAS_INTEL_GPU=true
     echo "$gpu_lines" | grep -qiE "Arc|DG2|Battlemage|Alchemist" && HAS_INTEL_ARC=true
@@ -1743,6 +1754,11 @@ print_header() {
   echo -e "${C_DIM}CPU:    ${CPU_SUMMARY}${C_RESET}"
   echo -e "${C_DIM}RAM:    ${RAM_GB} GiB${RAM_DETAILS}${C_RESET}"
   echo -e "${C_DIM}GPU(s): ${GPU_SUMMARY}${C_RESET}"
+  if (( TOTAL_VRAM_MB > 0 )); then
+    local total_vram_gb
+    total_vram_gb="$(awk "BEGIN {g=$TOTAL_VRAM_MB/1024; if (g == int(g)) printf \"%d\", g; else printf \"%.1f\", g}")"
+    echo -e "${C_DIM}VRAM:   ${total_vram_gb} GiB${C_RESET}"
+  fi
   echo -e "${C_DIM}Strata: ${STRATA_VERSION:-Not installed}${C_RESET}"
   if [[ "$HAS_NVIDIA" == true && -n "$NVIDIA_CURRENT_PL" ]]; then
     echo -e "${C_DIM}NVIDIA Power Limit: ${NVIDIA_CURRENT_PL}W (Default: ${NVIDIA_DEFAULT_PL}W, Max: ${NVIDIA_MAX_PL}W)${C_RESET}"
