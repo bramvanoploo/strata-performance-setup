@@ -33,6 +33,7 @@ HAS_MSI_EC=false SYS_VENDOR="" PRODUCT_NAME="" IS_LAPTOP=false HAS_ASPM=false
 NVIDIA_DEFAULT_PL="" NVIDIA_MAX_PL="" NVIDIA_CURRENT_PL=""
 REBOOT_REQUIRED=false REBOOT_PROMPT_PENDING=false
 PREV_CPU_TOTAL="" PREV_CPU_IDLE="" PREV_RAPL_UJ="" PREV_RAPL_US="" LIVE_STATS_COUNT=0 POST_HEADER_LINES=0
+declare -a LIVE_STAT_LINES=() SYS_INFO_LINES=()
 STRATA_UPDATE_AVAILABLE=false STRATA_UPDATE_SUMMARY="" STRATA_UPDATE_CACHE_FILE="" STRATA_POLLER_PID=""
 UNIT_FILES_CACHE=""
 declare -A PKG_AVAIL_CACHE
@@ -1689,17 +1690,15 @@ print_live_stats() {
     fi
   fi
 
-  local out="" lines=1
-  out+="$(printf "%bLive System Usage:%b%s\n" "${C_BOLD}" "${C_RESET}" "$eol")"
+  LIVE_STAT_LINES=()
+  LIVE_STAT_LINES+=("$(printf "%bLive System Usage:%b" "${C_BOLD}" "${C_RESET}")")
   if [[ -n "$cpu_pct" ]]; then
     local cpu_t_str=""
     [[ -n "$cpu_temp" ]] && cpu_t_str=" ($(format_temp "$cpu_temp"))"
-    out+=$'\n'"$(printf "  %-8s [%s] %3d%%%s%s" "CPU:" "$(render_bar "$cpu_pct")" "$cpu_pct" "$cpu_t_str" "$eol")"
-    ((lines++))
+    LIVE_STAT_LINES+=("$(printf "  %-8s [%s] %3d%%%s" "CPU:" "$(render_bar "$cpu_pct")" "$cpu_pct" "$cpu_t_str")")
   fi
   if [[ -n "$ram_pct" ]]; then
-    out+=$'\n'"$(printf "  %-8s [%s] %3d%% (%s / %s GiB)%s" "RAM:" "$(render_bar "$ram_pct")" "$ram_pct" "$ram_used_gib" "$ram_tot_gib" "$eol")"
-    ((lines++))
+    LIVE_STAT_LINES+=("$(printf "  %-8s [%s] %3d%% (%s / %s GiB)" "RAM:" "$(render_bar "$ram_pct")" "$ram_pct" "$ram_used_gib" "$ram_tot_gib")")
   fi
   local gpu_count="${#gpu_pcts[@]}" gi=0
   local pwr_parts=()
@@ -1711,12 +1710,10 @@ print_live_stats() {
     if [[ -n "${gpu_pcts[$gi]}" ]]; then
       local gpu_t_str=""
       [[ -n "${gpu_temps[$gi]}" ]] && gpu_t_str=" ($(format_temp "${gpu_temps[$gi]}"))"
-      out+=$'\n'"$(printf "  %-8s [%s] %3d%%%s%s" "$g_lbl" "$(render_bar "${gpu_pcts[$gi]}")" "${gpu_pcts[$gi]}" "$gpu_t_str" "$eol")"
-      ((lines++))
+      LIVE_STAT_LINES+=("$(printf "  %-8s [%s] %3d%%%s" "$g_lbl" "$(render_bar "${gpu_pcts[$gi]}")" "${gpu_pcts[$gi]}" "$gpu_t_str")")
     fi
     if [[ -n "${vram_pcts[$gi]}" ]]; then
-      out+=$'\n'"$(printf "  %-8s [%s] %3d%% (%s / %s GiB)%s" "$v_lbl" "$(render_bar "${vram_pcts[$gi]}")" "${vram_pcts[$gi]}" "${vram_useds[$gi]}" "${vram_tots[$gi]}" "$eol")"
-      ((lines++))
+      LIVE_STAT_LINES+=("$(printf "  %-8s [%s] %3d%% (%s / %s GiB)" "$v_lbl" "$(render_bar "${vram_pcts[$gi]}")" "${vram_pcts[$gi]}" "${vram_useds[$gi]}" "${vram_tots[$gi]}")")
     fi
     if [[ -n "${pwr_ws[$gi]}" ]]; then
       if [[ -n "${pwr_pcts[$gi]}" && -n "${pwr_lim_ws[$gi]}" ]]; then
@@ -1738,10 +1735,79 @@ print_live_stats() {
       (( pi > 0 )) && pwr_line+=" | "
       pwr_line+="${pwr_parts[$pi]}"
     done
-    out+=$'\n'"$(printf "  %-8s %s%s" "Power:" "$pwr_line" "$eol")"
-    ((lines++))
+    LIVE_STAT_LINES+=("$(printf "  %-8s %s" "Power:" "$pwr_line")")
   fi
-  LIVE_STATS_COUNT="$lines"
+}
+
+build_sys_info_lines() {
+  SYS_INFO_LINES=()
+  SYS_INFO_LINES+=("$(printf "%bSystem Information:%b" "${C_BOLD}" "${C_RESET}")")
+  SYS_INFO_LINES+=("$(printf "%bOS:     %s (%s) | Kernel: %s | Laptop: %s%b" "${C_DIM}" "${OS_PRETTY:-$DISTRO_ID}" "$DISTRO_FAMILY" "$KERNEL_VER" "$IS_LAPTOP" "${C_RESET}")")
+  SYS_INFO_LINES+=("$(printf "%bCPU:    %s%b" "${C_DIM}" "$CPU_SUMMARY" "${C_RESET}")")
+  SYS_INFO_LINES+=("$(printf "%bRAM:    %s GiB%s%b" "${C_DIM}" "$RAM_GB" "$RAM_DETAILS" "${C_RESET}")")
+  SYS_INFO_LINES+=("$(printf "%bGPU(s): %s%b" "${C_DIM}" "$GPU_SUMMARY" "${C_RESET}")")
+  if (( TOTAL_VRAM_MB > 0 )); then
+    local total_vram_gb
+    total_vram_gb="$(awk "BEGIN {g=$TOTAL_VRAM_MB/1024; if (g == int(g)) printf \"%d\", g; else printf \"%.1f\", g}")"
+    SYS_INFO_LINES+=("$(printf "%bVRAM:   %s GiB%b" "${C_DIM}" "$total_vram_gb" "${C_RESET}")")
+  fi
+  SYS_INFO_LINES+=("$(printf "%bStrata: %s%b" "${C_DIM}" "${STRATA_VERSION:-Not installed}" "${C_RESET}")")
+  if [[ "$HAS_NVIDIA" == true && -n "$NVIDIA_CURRENT_PL" ]]; then
+    SYS_INFO_LINES+=("$(printf "%bNVIDIA Power Limit: %sW (Default: %sW, Max: %sW)%b" "${C_DIM}" "$NVIDIA_CURRENT_PL" "$NVIDIA_DEFAULT_PL" "$NVIDIA_MAX_PL" "${C_RESET}")")
+  fi
+}
+
+pad_ansi_col() {
+  local str="$1" width="$2"
+  local vis
+  vis="$(sed $'s/\033\\[[0-9;]*m//g' <<< "$str")"
+  local pad=$(( width - ${#vis} ))
+  if (( pad > 0 )); then
+    printf "%s%*s" "$str" "$pad" ""
+  else
+    printf "%s" "$str"
+  fi
+}
+
+print_stats_and_info_grid() {
+  local inplace="${1:-false}" eol=""
+  [[ "$inplace" == true ]] && eol=$'\033[K'
+
+  print_live_stats "$inplace" || true
+  local term_cols=120
+  [[ -t 1 ]] && term_cols="$(tput cols 2>/dev/null || echo 120)"
+
+  local out="" total_lines=0
+  if (( term_cols >= 110 )); then
+    local n_left="${#LIVE_STAT_LINES[@]}" n_right="${#SYS_INFO_LINES[@]}"
+    local max_rows=$(( n_left > n_right ? n_left : n_right ))
+    local r left_s right_s
+    local sep
+    sep="$(printf "  %b│%b  " "${C_DIM}" "${C_RESET}")"
+    for ((r=0; r<max_rows; r++)); do
+      left_s=""
+      right_s=""
+      (( r < n_left )) && left_s="${LIVE_STAT_LINES[$r]}"
+      (( r < n_right )) && right_s="${SYS_INFO_LINES[$r]}"
+      if (( r > 0 )); then out+=$'\n'; fi
+      out+="$(pad_ansi_col "$left_s" 56)${sep}${right_s}${eol}"
+    done
+    total_lines="$max_rows"
+  else
+    local l
+    for l in "${LIVE_STAT_LINES[@]}"; do
+      [[ -n "$out" ]] && out+=$'\n'
+      out+="${l}${eol}"
+      ((total_lines++))
+    done
+    out+=$'\n'"${eol}"
+    ((total_lines++))
+    for l in "${SYS_INFO_LINES[@]}"; do
+      out+=$'\n'"${l}${eol}"
+      ((total_lines++))
+    done
+  fi
+  LIVE_STATS_COUNT="$total_lines"
   printf "%s\n" "$out"
 }
 
@@ -1751,22 +1817,9 @@ print_header() {
   echo -e "${C_BOLD}${C_CYAN}======================================================================${C_RESET}"
   echo -e "${C_BOLD}${C_CYAN}   Strata Host Performance Optimizer & Setup Wizard${C_RESET}"
   echo -e "${C_BOLD}${C_CYAN}======================================================================${C_RESET}"
-  echo -e "${C_DIM}OS:     ${OS_PRETTY:-$DISTRO_ID} (${DISTRO_FAMILY}) | Kernel: ${KERNEL_VER} | Laptop: ${IS_LAPTOP}${C_RESET}"
-  echo -e "${C_DIM}CPU:    ${CPU_SUMMARY}${C_RESET}"
-  echo -e "${C_DIM}RAM:    ${RAM_GB} GiB${RAM_DETAILS}${C_RESET}"
-  echo -e "${C_DIM}GPU(s): ${GPU_SUMMARY}${C_RESET}"
-  if (( TOTAL_VRAM_MB > 0 )); then
-    local total_vram_gb
-    total_vram_gb="$(awk "BEGIN {g=$TOTAL_VRAM_MB/1024; if (g == int(g)) printf \"%d\", g; else printf \"%.1f\", g}")"
-    echo -e "${C_DIM}VRAM:   ${total_vram_gb} GiB${C_RESET}"
-  fi
-  echo -e "${C_DIM}Strata: ${STRATA_VERSION:-Not installed}${C_RESET}"
-  if [[ "$HAS_NVIDIA" == true && -n "$NVIDIA_CURRENT_PL" ]]; then
-    echo -e "${C_DIM}NVIDIA Power Limit: ${NVIDIA_CURRENT_PL}W (Default: ${NVIDIA_DEFAULT_PL}W, Max: ${NVIDIA_MAX_PL}W)${C_RESET}"
-  fi
-  echo ""
   load_strata_update_state
-  print_live_stats false
+  build_sys_info_lines
+  print_stats_and_info_grid false
   POST_HEADER_LINES=1
   if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
     echo -e "\n${C_BGREEN}[UPDATE AVAILABLE]${C_RESET} ${C_CYAN}Strata update ready (${STRATA_UPDATE_SUMMARY}). Press [u] to install & restart service.${C_RESET}"
@@ -1866,7 +1919,7 @@ read_choice_with_live_stats() {
     (
       while true; do
         sleep 1
-        print_live_stats true > "${tmp_file}.tmp" 2>/dev/null && mv -f "${tmp_file}.tmp" "$tmp_file" 2>/dev/null || true
+        print_stats_and_info_grid true > "${tmp_file}.tmp" 2>/dev/null && mv -f "${tmp_file}.tmp" "$tmp_file" 2>/dev/null || true
       done
     ) &
     sampler_pid=$!
