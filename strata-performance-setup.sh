@@ -1910,7 +1910,12 @@ print_header() {
   refresh_strata_running
   build_sys_info_lines
   print_stats_and_info_grid false
-  POST_HEADER_LINES=1
+  local _rule_w=120 _hdr_rule=""
+  [[ -t 1 ]] && _rule_w="$(tput cols 2>/dev/null || echo 120)"
+  (( _rule_w > 135 )) && _rule_w=135
+  printf -v _hdr_rule "%*s" "$_rule_w" ""
+  echo -e "${C_DIM}${_hdr_rule// /─}${C_RESET}"
+  POST_HEADER_LINES=2
   if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
     echo -e "\n${C_BGREEN}[UPDATE AVAILABLE]${C_RESET} ${C_CYAN}Strata update ready (${STRATA_UPDATE_SUMMARY}). Press [u] to install & restart service.${C_RESET}"
     ((POST_HEADER_LINES += 2))
