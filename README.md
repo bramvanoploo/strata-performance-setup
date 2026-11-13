@@ -111,13 +111,33 @@ The header continuously refreshes every **1 second** without interrupting your i
 
 Once launched, the main index lists every optimization applicable to your machine along with its live `[APPLIED]` / `[NOT APPLIED]` status:
 
-- Press `w` (or `Enter`) to walk through the **guided wizard** step by step
+- Navigate the index with **`↑` / `↓`** and press **`Enter`** (or type a **step number**) to open a step, or press `w` to walk through the **guided wizard** step by step
 - Press `a` to **apply all recommended optimizations** for your hardware in one action (with confirmation; excludes Strata setup and minimal-gain/higher-idle-power options like CPU Performance and PCIe ASPM)
 - Press `x` to **revert all recommended optimizations** in one action (with confirmation)
 - Press `u` (when shown) to **install a pending Strata update** and restart `strata.service`
 - Press `r` on the index to **reboot** the system (the wizard also prompts automatically whenever a kernel-parameter change requires a reboot)
-- Enter a **step number** to jump directly to a specific optimization
-- Inside any step, press `a` to **apply** (when not yet applied, or to open the Strata Manager menu), `r` to **revert** (when applied), `n` / `b` to move next/back, or `i` to return to the index
+- Inside any step, press `a` to **apply** (when not yet applied, or to open the Strata Manager menu), `r` to **revert** (when applied), `n` / `b` to move next/back, or `i` / `Esc` to return to the index
+
+---
+
+## Credits & Third-Party Projects
+
+This wizard relies on and integrates with the following open-source projects for hardware control, system tuning, and LLM serving (beyond standard OS/kernel utilities):
+
+| Project | Role in Wizard | Repository |
+| --- | --- | --- |
+| **Strata** | LLM inference engine, CLI, updates, and `strata.service` | [Niko1221/Strata](https://github.com/Niko1221/Strata) |
+| **LACT (`lactd`)** | GPU core & VRAM clock offset tuning (NVIDIA / AMD / Intel) | [ilya-zlobintsev/LACT](https://github.com/ilya-zlobintsev/LACT) |
+| **gpu-unlock** | NVIDIA consumer GPU SM/tensor unlock kernel module (`gpu-unlock-dkms`) | [Zagitta/gpu-unlock](https://github.com/Zagitta/gpu-unlock) |
+| **msi-ec** | MSI laptop Embedded Controller driver for shift/fan/Cooler Boost | [MControlSuite/msi-ec](https://github.com/MControlSuite/msi-ec) |
+| **MControlCenter** | MSI laptop cooling and performance profile companion app | [dmitry-s93/MControlCenter](https://github.com/dmitry-s93/MControlCenter) |
+| **LenovoLegionLinux** | Lenovo Legion fan & power mode control (`legion_cli`) | [johnfanv2/LenovoLegionLinux](https://github.com/johnfanv2/LenovoLegionLinux) |
+| **TUXEDO Control Center** | TUXEDO laptop power/cooling daemon (`tccd`) | [tuxedocomputers/tuxedo-control-center](https://github.com/tuxedocomputers/tuxedo-control-center) |
+| **libsmbios** | Dell thermal management CLI (`smbios-thermal-ctl`) | [dell/libsmbios](https://github.com/dell/libsmbios) |
+| **ananicy-cpp** | Automatic process nice/scheduler tuning daemon | [ananicy-cpp/ananicy-cpp](https://gitlab.com/ananicy-cpp/ananicy-cpp) |
+| **bpftune** | eBPF-driven automatic Linux kernel & sysctl tuning | [oracle/bpftune](https://github.com/oracle/bpftune) |
+| **irqbalance** | Multi-core hardware IRQ load-balancing daemon | [Irqbalance/irqbalance](https://github.com/Irqbalance/irqbalance) |
+| **zram-generator** | Systemd generator for `zstd`-compressed zram swap | [systemd/zram-generator](https://github.com/systemd/zram-generator) |
 
 ---
 
