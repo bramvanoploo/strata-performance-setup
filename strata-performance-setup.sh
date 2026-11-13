@@ -25,7 +25,7 @@ fi
 
 TARGET_USER="${SUDO_USER:-${USER:-$(id -un)}}"
 TARGET_HOME="$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6 || eval echo "~$TARGET_USER")"
-STRATA_BIN=""
+STRATA_BIN="" STRATA_VERSION=""
 DISTRO_FAMILY="unknown" DISTRO_ID="unknown" OS_PRETTY="" KERNEL_VER="" AUR_HELPER=""
 HAS_NVIDIA=false HAS_NVIDIA_POWERD=false HAS_AMD=false HAS_INTEL_GPU=false HAS_INTEL_ARC=false
 GPU_SUMMARY="" CPU_SUMMARY="" RAM_GB=0 RAM_DETAILS="" NVIDIA_VRAM_MB=0
@@ -303,6 +303,18 @@ refresh_strata_bin() {
   elif [[ -x "$TARGET_HOME/.local/bin/strata" ]]; then STRATA_BIN="$TARGET_HOME/.local/bin/strata"
   elif [[ -x "/usr/local/bin/strata" ]]; then STRATA_BIN="/usr/local/bin/strata"
   else STRATA_BIN=""; fi
+
+  if [[ -n "$STRATA_BIN" ]]; then
+    local raw_ver
+    raw_ver="$(run_as_user "$STRATA_BIN --version 2>/dev/null" | head -n1 || true)"
+    if [[ -n "$raw_ver" ]]; then
+      STRATA_VERSION="$(sed -E 's/^strata[[:space:]]+//; s/; python [^)]*//g' <<< "$raw_ver")"
+    else
+      STRATA_VERSION="installed (${STRATA_BIN})"
+    fi
+  else
+    STRATA_VERSION=""
+  fi
 }
 
 detect_environment() {
@@ -1731,6 +1743,7 @@ print_header() {
   echo -e "${C_DIM}CPU:    ${CPU_SUMMARY}${C_RESET}"
   echo -e "${C_DIM}RAM:    ${RAM_GB} GiB${RAM_DETAILS}${C_RESET}"
   echo -e "${C_DIM}GPU(s): ${GPU_SUMMARY}${C_RESET}"
+  echo -e "${C_DIM}Strata: ${STRATA_VERSION:-Not installed}${C_RESET}"
   if [[ "$HAS_NVIDIA" == true && -n "$NVIDIA_CURRENT_PL" ]]; then
     echo -e "${C_DIM}NVIDIA Power Limit: ${NVIDIA_CURRENT_PL}W (Default: ${NVIDIA_DEFAULT_PL}W, Max: ${NVIDIA_MAX_PL}W)${C_RESET}"
   fi
