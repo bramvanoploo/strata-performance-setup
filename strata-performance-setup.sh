@@ -23,7 +23,7 @@ else
   C_RESET='' C_BOLD='' C_DIM='' C_RED='' C_GREEN='' C_BGREEN='' C_YELLOW='' C_CYAN=''
 fi
 
-TARGET_USER="${SUDO_USER:-$USER}"
+TARGET_USER="${SUDO_USER:-${USER:-$(id -un)}}"
 TARGET_HOME="$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6 || eval echo "~$TARGET_USER")"
 STRATA_BIN=""
 DISTRO_FAMILY="unknown" DISTRO_ID="unknown" OS_PRETTY="" KERNEL_VER="" AUR_HELPER=""
@@ -31,6 +31,7 @@ HAS_NVIDIA=false HAS_NVIDIA_POWERD=false HAS_AMD=false HAS_INTEL_GPU=false HAS_I
 GPU_SUMMARY="" CPU_SUMMARY="" RAM_GB=0 RAM_DETAILS="" NVIDIA_VRAM_MB=0
 HAS_MSI_EC=false SYS_VENDOR="" PRODUCT_NAME="" IS_LAPTOP=false HAS_ASPM=false
 NVIDIA_DEFAULT_PL="" NVIDIA_MAX_PL="" NVIDIA_CURRENT_PL=""
+REBOOT_REQUIRED=false REBOOT_PROMPT_PENDING=false
 UNIT_FILES_CACHE=""
 declare -A PKG_AVAIL_CACHE
 
@@ -51,7 +52,7 @@ run_as_user() {
 }
 
 unit_exists() {
-  grep -qE "^$1[[:space:]]" <<< "$UNIT_FILES_CACHE"
+  awk -v u="$1" '$1 == u {found=1; exit} END {exit !found}' <<< "$UNIT_FILES_CACHE"
 }
 
 unit_enabled() {
@@ -111,7 +112,7 @@ pkg_install() {
   case "$DISTRO_FAMILY" in
     arch)   run_root pacman -S --needed --noconfirm "$@" ;;
     fedora) run_root dnf install -y "$@" ;;
-    debian) run_root apt-get update -qq && run_root apt-get install -y "$@" ;;
+    debian) run_root apt-get update -qq && run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
     *)      echo -e "${C_RED}Unsupported package manager.${C_RESET}"; return 1 ;;
   esac
 }
@@ -126,12 +127,12 @@ aur_install() {
 
 confirm_yn() {
   local prompt="$1" default="${2:-N}" ans
-  read -r -p "$prompt" ans
+  read -r -p "$prompt" ans || return 1
   [[ -z "$ans" ]] && ans="$default"
   case "$ans" in
-    y|Y) return 0 ;;
-    n|N) return 1 ;;
-    *)   echo -e "${C_RED}Invalid input '${ans}'. Cancelled.${C_RESET}"; return 1 ;;
+    y|Y|yes|YES|Yes) return 0 ;;
+    n|N|no|NO|No)    return 1 ;;
+    *)               echo -e "${C_RED}Invalid input '${ans}'. Cancelled.${C_RESET}"; return 1 ;;
   esac
 }
 
@@ -149,8 +150,24 @@ prompt_install_deps() {
   [[ "$mode" == "aur" ]] && aur_install "${missing[@]}" || pkg_install "${missing[@]}"
 }
 
+prompt_install_repo_or_aur() {
+  local pkg="$1"
+  if pkg_available repo "$pkg"; then
+    prompt_install_deps repo "$@"
+  elif [[ "$DISTRO_FAMILY" == "arch" ]] && pkg_available aur "$pkg"; then
+    prompt_install_deps aur "$@"
+  else
+    return 1
+  fi
+}
+
 has_kernel_param() {
-  grep -qw "$1" /proc/cmdline /etc/default/limine /etc/default/grub /etc/kernel/cmdline 2>/dev/null
+  local param="$1" f
+  grep -Fqw "$param" /proc/cmdline 2>/dev/null && return 0
+  for f in /etc/default/limine /etc/default/grub /etc/kernel/cmdline; do
+    [[ -r "$f" ]] && grep -v '^[[:space:]]*#' "$f" | grep -Fqw "$param" && return 0
+  done
+  return 1
 }
 
 add_kernel_param() {
@@ -166,20 +183,28 @@ add_kernel_param() {
       fi
       command -v limine-mkinitcpio >/dev/null 2>&1 && run_root limine-mkinitcpio || true
     fi
+    REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
     echo -e "${C_GREEN}Added '${param}' to /etc/default/limine (reboot required).${C_RESET}"
   elif [[ -f /etc/default/grub ]]; then
-    if ! grep -qw "$param" /etc/default/grub; then
+    if ! grep -Fqw "$param" /etc/default/grub; then
       run_root sed -i "s/\(GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*\)\"/\1 ${param}\"/" /etc/default/grub
-      command -v grub-mkconfig >/dev/null 2>&1 && run_root grub-mkconfig -o /boot/grub/grub.cfg || true
+      if command -v grub-mkconfig >/dev/null 2>&1; then
+        run_root grub-mkconfig -o /boot/grub/grub.cfg || true
+      elif command -v grub2-mkconfig >/dev/null 2>&1; then
+        run_root grub2-mkconfig -o /boot/grub2/grub.cfg || true
+      fi
     fi
+    REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
     echo -e "${C_GREEN}Added '${param}' to /etc/default/grub (reboot required).${C_RESET}"
   elif [[ -f /etc/kernel/cmdline ]]; then
     if ! grep -qw "$param" /etc/kernel/cmdline; then
       run_root sed -i "s/$/ ${param}/" /etc/kernel/cmdline
       command -v bootctl >/dev/null 2>&1 && run_root bootctl update >/dev/null 2>&1 || true
     fi
+    REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
     echo -e "${C_GREEN}Added '${param}' to /etc/kernel/cmdline (reboot required).${C_RESET}"
   else
+    REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
     echo -e "${C_YELLOW}Please add '${param}' to your bootloader kernel command line manually.${C_RESET}"
   fi
 }
@@ -191,9 +216,13 @@ remove_kernel_param() {
     run_root sed -i "s/ *${esc}//g" /etc/default/limine
     command -v limine-mkinitcpio >/dev/null 2>&1 && run_root limine-mkinitcpio || true
   fi
-  if [[ -f /etc/default/grub ]] && grep -qw "$param" /etc/default/grub; then
+  if [[ -f /etc/default/grub ]] && grep -Fqw "$param" /etc/default/grub; then
     run_root sed -i "s/ *${esc}//g" /etc/default/grub
-    command -v grub-mkconfig >/dev/null 2>&1 && run_root grub-mkconfig -o /boot/grub/grub.cfg || true
+    if command -v grub-mkconfig >/dev/null 2>&1; then
+      run_root grub-mkconfig -o /boot/grub/grub.cfg || true
+    elif command -v grub2-mkconfig >/dev/null 2>&1; then
+      run_root grub2-mkconfig -o /boot/grub2/grub.cfg || true
+    fi
   fi
   if [[ -f /etc/kernel/cmdline ]] && grep -qw "$param" /etc/kernel/cmdline; then
     run_root sed -i "s/ *${esc}//g" /etc/kernel/cmdline
@@ -201,6 +230,16 @@ remove_kernel_param() {
 }
 
 pause_prompt() { echo ""; read -r -p "Press [Enter] to continue..." _; }
+
+prompt_reboot_if_needed() {
+  [[ "$REBOOT_PROMPT_PENDING" == true ]] || return 0
+  REBOOT_PROMPT_PENDING=false
+  echo -e "\n${C_YELLOW}[REBOOT REQUIRED] One or more applied optimizations require a reboot to take effect.${C_RESET}"
+  if confirm_yn "Reboot this system now? [y/N]: " "N"; then
+    run_root systemctl reboot
+    exit 0
+  fi
+}
 
 # ------------------------------------------------------------------------------
 # Hardware & Environment Detection
@@ -283,7 +322,11 @@ detect_environment() {
   fi
 
   if [[ "$DISTRO_FAMILY" == "arch" ]]; then
-    command -v yay >/dev/null 2>&1 && AUR_HELPER="yay" || { command -v paru >/dev/null 2>&1 && AUR_HELPER="paru"; }
+    if command -v yay >/dev/null 2>&1; then
+      AUR_HELPER="yay"
+    elif command -v paru >/dev/null 2>&1; then
+      AUR_HELPER="paru"
+    fi
   fi
 
   if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
@@ -410,6 +453,7 @@ run_recommended_batch() {
     "${mode}_${step}" || echo -e "${C_YELLOW}Step '${step}' exited with a warning or was skipped.${C_RESET}"
   done
   echo -e "\n${C_GREEN}Finished ${mode}ing recommended optimizations.${C_RESET}"
+  [[ "$mode" == "apply" ]] && prompt_reboot_if_needed
   pause_prompt
 }
 
@@ -565,7 +609,7 @@ title_asus_perf() { echo "ASUS ROG/TUF Performance Profile (asusctl / asusd)"; }
 status_asus_perf() { command -v asusctl >/dev/null 2>&1 && unit_active asusd.service && grep -qi "Performance" <<< "$(asusctl profile -p 2>/dev/null || true)"; }
 explain_asus_perf() { echo -e "Impact:\n  Enables asusd.service and switches asusctl profile to 'Performance'."; }
 apply_asus_perf() {
-  command -v asusctl >/dev/null 2>&1 || prompt_install_deps repo asusctl || prompt_install_deps aur asusctl || return 0
+  command -v asusctl >/dev/null 2>&1 || prompt_install_repo_or_aur asusctl || return 0
   run_root systemctl enable --now asusd.service 2>/dev/null || true
   asusctl profile -P Performance 2>/dev/null || true
 }
@@ -600,7 +644,7 @@ title_lenovo_legion() { echo "Lenovo Legion Performance & Cooling (LenovoLegionL
 status_lenovo_legion() { unit_enabled legiond.service && unit_active legiond.service; }
 explain_lenovo_legion() { echo -e "Impact:\n  Enables legiond.service for Lenovo Legion custom fan curves and max TDP."; }
 apply_lenovo_legion() {
-  command -v legion_cli >/dev/null 2>&1 || prompt_install_deps repo lenovo-legion || prompt_install_deps aur lenovo-legion-dkms-git || return 0
+  command -v legion_cli >/dev/null 2>&1 || prompt_install_repo_or_aur lenovo-legion || prompt_install_deps aur lenovo-legion-dkms-git || return 0
   run_root systemctl enable --now legiond.service 2>/dev/null || true
 }
 revert_lenovo_legion() { run_root systemctl disable --now legiond.service 2>/dev/null || true; }
@@ -614,7 +658,7 @@ title_system76_perf() { echo "System76 High Performance Profile (system76-power)
 status_system76_perf() { command -v system76-power >/dev/null 2>&1 && unit_active system76-power.service && grep -qi "Performance" <<< "$(system76-power profile 2>/dev/null || true)"; }
 explain_system76_perf() { echo -e "Impact:\n  Enables system76-power.service and sets the active profile to 'Performance'."; }
 apply_system76_perf() {
-  command -v system76-power >/dev/null 2>&1 || prompt_install_deps repo system76-power || prompt_install_deps aur system76-power || return 0
+  command -v system76-power >/dev/null 2>&1 || prompt_install_repo_or_aur system76-power || return 0
   run_root systemctl enable --now system76-power.service 2>/dev/null || true
   run_root system76-power profile performance 2>/dev/null || true
 }
@@ -629,7 +673,7 @@ title_tuxedo_perf() { echo "TUXEDO Control Center Fan & TDP Daemon (tccd)"; }
 status_tuxedo_perf() { unit_enabled tccd.service && unit_active tccd.service; }
 explain_tuxedo_perf() { echo -e "Impact:\n  Enables tccd.service for high-TDP performance and fan profiles on TUXEDO laptops."; }
 apply_tuxedo_perf() {
-  unit_exists tccd.service || prompt_install_deps repo tuxedo-control-center || prompt_install_deps aur tuxedo-control-center-bin || return 0
+  unit_exists tccd.service || prompt_install_repo_or_aur tuxedo-control-center || prompt_install_deps aur tuxedo-control-center-bin || return 0
   run_root systemctl enable --now tccd.service 2>/dev/null || true
 }
 revert_tuxedo_perf() { run_root systemctl disable --now tccd.service 2>/dev/null || true; }
@@ -686,7 +730,10 @@ revert_cpu_performance() {
 # 5. Memlock & Realtime
 applicable_memlock_realtime() { return 0; }
 title_memlock_realtime() { echo "Unlimited Memory Lock & Realtime Privileges (memlock=unlimited)"; }
-status_memlock_realtime() { [[ -f /etc/security/limits.d/99-strata-memlock.conf || -f /etc/security/limits.d/99-realtime-privileges.conf ]]; }
+status_memlock_realtime() {
+  [[ -f /etc/security/limits.d/99-strata-memlock.conf ]] && return 0
+  [[ -f /etc/security/limits.d/99-realtime-privileges.conf ]] && id -nG "$TARGET_USER" 2>/dev/null | grep -qw realtime
+}
 explain_memlock_realtime() {
   cat <<'EOF'
 Impact:
@@ -822,7 +869,7 @@ EOF
 apply_lact_overclock() {
   if ! command -v lact >/dev/null 2>&1; then
     case "$DISTRO_FAMILY" in
-      arch)   prompt_install_deps repo lact || prompt_install_deps aur lact || return 0 ;;
+      arch)   prompt_install_repo_or_aur lact || return 0 ;;
       fedora) prompt_install_deps repo lact || return 0 ;;
       debian) prompt_install_deps repo lact || return 0 ;;
     esac
@@ -850,20 +897,24 @@ apply_lact_overclock() {
 
   if [[ -f /etc/lact/config.yaml ]]; then
     run_root cp -n /etc/lact/config.yaml /etc/lact/config.yaml.bak.strata-setup 2>/dev/null || true
-    local gpu_id
-    gpu_id="$(grep -E '^\s+[0-9A-Fa-f]{4}:[0-9A-Fa-f]{4}' /etc/lact/config.yaml | head -n1 | tr -d ' :')"
-    if [[ -n "$gpu_id" ]]; then
-      run_root python3 -c "
-import yaml
+    if run_root python3 -c "
+import sys, yaml
 p = '/etc/lact/config.yaml'
 with open(p) as f: d = yaml.safe_load(f) or {}
-g = d.setdefault('gpus', {}).setdefault('$gpu_id', {})
+gpus = d.get('gpus') or {}
+if not gpus: sys.exit(1)
+gpu_id = next(iter(gpus))
+g = gpus[gpu_id] if isinstance(gpus[gpu_id], dict) else {}
 g['gpu_clock_offsets'] = {0: int('$core_off')}
 g['mem_clock_offsets'] = {0: int('$mem_off')}
 g.setdefault('power_mizer_mode', 'Adaptive')
+gpus[gpu_id] = g
+d['gpus'] = gpus
 with open(p, 'w') as f: yaml.safe_dump(d, f, sort_keys=False)
-" 2>/dev/null || echo -e "${C_YELLOW}Could not auto-edit /etc/lact/config.yaml; configure in LACT GUI.${C_RESET}"
+" 2>/dev/null; then
       run_root systemctl restart lactd.service
+    else
+      echo -e "${C_YELLOW}Could not auto-edit /etc/lact/config.yaml; configure in LACT GUI.${C_RESET}"
     fi
   fi
 }
@@ -897,7 +948,7 @@ EOF
 }
 apply_gpu_unlock() {
   if ! pkg_installed gpu-unlock-dkms; then
-    prompt_install_deps repo gpu-unlock-dkms gpu-unlock-firmware || prompt_install_deps aur gpu-unlock-dkms gpu-unlock-firmware || return 0
+    prompt_install_repo_or_aur gpu-unlock-dkms gpu-unlock-firmware || return 0
   fi
   add_kernel_param "gpu_unlock.targets=all"
 }
@@ -1211,6 +1262,9 @@ print_header() {
   if [[ "$HAS_NVIDIA" == true && -n "$NVIDIA_CURRENT_PL" ]]; then
     echo -e "${C_DIM}NVIDIA Power Limit: ${NVIDIA_CURRENT_PL}W (Default: ${NVIDIA_DEFAULT_PL}W, Max: ${NVIDIA_MAX_PL}W)${C_RESET}"
   fi
+  if [[ "$REBOOT_REQUIRED" == true ]]; then
+    echo -e "${C_YELLOW}[!] Reboot pending: newly added kernel parameters require a reboot to take effect.${C_RESET}"
+  fi
   echo ""
 }
 
@@ -1234,21 +1288,24 @@ run_step_view() {
     else
       if [[ "$applied" == true ]]; then
         echo -e "  ${C_RED}[r]${C_RESET} Revert this optimization"
-        echo -e "  ${C_CYAN}[a]${C_RESET} Re-apply / Update configuration"
       else
         echo -e "  ${C_GREEN}[a]${C_RESET} Apply this optimization"
       fi
     fi
 
     echo -e "  ${C_DIM}[n]${C_RESET} Next step (Skip)   ${C_DIM}[b]${C_RESET} Previous step   ${C_DIM}[i]${C_RESET} Back to Index   ${C_DIM}[q]${C_RESET} Quit\n"
-    read -r -p "Select action: " action
+    read -r -p "Select action: " action || exit 0
     case "$action" in
       a|A)
-        echo ""; "apply_${step}"; pause_prompt
-        [[ "$mode" == "single" ]] && return 0
+        if [[ "$step" != "strata_manager" && "$applied" == true ]]; then
+          echo -e "${C_YELLOW}This optimization is already applied.${C_RESET}"; sleep 1
+        else
+          echo ""; "apply_${step}"; prompt_reboot_if_needed; pause_prompt
+          [[ "$mode" == "single" ]] && return 0
+        fi
         ;;
       r|R)
-        if [[ "$applied" == true || "$step" == "strata_manager" ]]; then
+        if [[ "$applied" == true ]] || { [[ "$step" == "strata_manager" ]] && strata_service_installed; }; then
           echo ""; "revert_${step}"; pause_prompt
           [[ "$mode" == "single" ]] && return 0
         else
@@ -1310,7 +1367,7 @@ show_index() {
     echo -e "  ${C_BOLD}[1-${#ACTIVE_STEPS[@]}]${C_RESET} Jump directly to a step"
     echo -e "  ${C_BOLD}[r]${C_RESET} Reboot system"
     echo -e "  ${C_BOLD}[q]${C_RESET} Quit\n"
-    read -r -p "Choice: " choice
+    read -r -p "Choice: " choice || exit 0
 
     case "$choice" in
       w|W|"") run_step_view 0 "wizard" ;;
