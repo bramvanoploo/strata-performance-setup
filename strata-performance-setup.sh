@@ -1471,16 +1471,22 @@ revert_strata_manager() {
 # TUI Wizard Engine
 # ------------------------------------------------------------------------------
 print_logo() {
+  local rule_w="${1:-70}"
+  local logo_w=50
+  local pad=$(( (rule_w - logo_w) / 2 ))
+  (( pad < 0 )) && pad=0
+  local indent=""
+  printf -v indent "%*s" "$pad" ""
   if [[ -t 1 ]]; then
-    echo -e "\033[1;96m  ███████╗████████╗██████╗  █████╗ ████████╗ █████╗ \033[0m"
-    echo -e "\033[0;96m  ██╔════╝╚══██╔══╝██╔══██╗██╔══██╗╚══██╔══╝██╔══██╗\033[0m"
-    echo -e "\033[0;36m  ███████╗   ██║   ██████╔╝███████║   ██║   ███████║\033[0m"
-    echo -e "\033[1;34m  ╚════██║   ██║   ██╔══██╗██╔══██║   ██║   ██╔══██║\033[0m"
-    echo -e "\033[0;35m  ███████║   ██║   ██║  ██║██║  ██║   ██║   ██║  ██║\033[0m"
-    echo -e "\033[2;35m  ╚══════╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝\033[0m"
-    echo -e "  \033[0;36m═══════ \033[1;96mP E R F O R M A N C E   \033[1;35mS E T U P \033[0;35m════════\033[0m\n"
+    echo -e "${indent}\033[1;96m███████╗████████╗██████╗  █████╗ ████████╗ █████╗ \033[0m"
+    echo -e "${indent}\033[0;96m██╔════╝╚══██╔══╝██╔══██╗██╔══██╗╚══██╔══╝██╔══██╗\033[0m"
+    echo -e "${indent}\033[0;36m███████╗   ██║   ██████╔╝███████║   ██║   ███████║\033[0m"
+    echo -e "${indent}\033[1;34m╚════██║   ██║   ██╔══██╗██╔══██║   ██║   ██╔══██║\033[0m"
+    echo -e "${indent}\033[0;35m███████║   ██║   ██║  ██║██║  ██║   ██║   ██║  ██║\033[0m"
+    echo -e "${indent}\033[2;35m╚══════╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝\033[0m"
+    echo -e "${indent}\033[0;36m═══════ \033[1;96mP E R F O R M A N C E   \033[1;35mS E T U P \033[0;35m════════\033[0m\n"
   else
-    echo "  STRATA - PERFORMANCE SETUP"
+    echo "${indent}STRATA - PERFORMANCE SETUP"
   fi
 }
 
@@ -1919,10 +1925,10 @@ print_stats_and_info_grid() {
 
 print_header() {
   clear 2>/dev/null || true
-  print_logo
   local _rule_w=120 _hdr_eq="" _hdr_rule=""
   [[ -t 1 ]] && _rule_w="$(tput cols 2>/dev/null || echo 120)"
   (( _rule_w > 135 )) && _rule_w=135
+  print_logo "$_rule_w"
   printf -v _hdr_eq "%*s" "$_rule_w" ""
   _hdr_eq="${_hdr_eq// /=}"
   local _title="Strata Host Performance Optimizer & Setup Wizard"
