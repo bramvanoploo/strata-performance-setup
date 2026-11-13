@@ -1922,6 +1922,46 @@ print_header() {
   echo ""
 }
 
+read_step_action() {
+  local -n _act_out="$1"
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    read -r -p "Select action: " _act_out || exit 0
+    return 0
+  fi
+
+  local buf="" ch="" esc_seq="" rc=0
+  printf "Select action: "
+  while true; do
+    rc=0
+    IFS= read -rsn1 ch || rc=$?
+    if (( rc != 0 )); then
+      printf "\n"
+      exit 0
+    fi
+    if [[ -z "$ch" ]]; then
+      printf "\n"
+      _act_out="$buf"
+      return 0
+    elif [[ "$ch" == $'\177' || "$ch" == $'\b' ]]; then
+      if [[ -n "$buf" ]]; then
+        buf="${buf%?}"
+        printf "\b \b"
+      fi
+    elif [[ "$ch" == $'\e' ]]; then
+      esc_seq=""
+      IFS= read -rsn2 -t 0.01 esc_seq || true
+      if [[ -z "$esc_seq" ]]; then
+        printf "\n"
+        _act_out="__esc__"
+        return 0
+      fi
+    else
+      buf+="$ch"
+      printf "%s" "$ch"
+    fi
+  done
+}
+
 run_step_view() {
   local idx="$1" mode="${2:-wizard}" total="${#ACTIVE_STEPS[@]}" step applied action
   while true; do
@@ -1948,9 +1988,10 @@ run_step_view() {
     fi
 
     [[ "$STRATA_UPDATE_AVAILABLE" == true ]] && echo -e "  ${C_BGREEN}[u]${C_RESET} Install Strata update (${STRATA_UPDATE_SUMMARY})"
-    echo -e "  ${C_DIM}[n]${C_RESET} Next step (Skip)   ${C_DIM}[b]${C_RESET} Previous step   ${C_DIM}[i]${C_RESET} Back to Index   ${C_DIM}[q]${C_RESET} Quit\n"
-    read -r -p "Select action: " action || exit 0
+    echo -e "  ${C_DIM}[n]${C_RESET} Next step (Skip)   ${C_DIM}[b]${C_RESET} Previous step   ${C_DIM}[i/Esc]${C_RESET} Back to Index   ${C_DIM}[q]${C_RESET} Quit\n"
+    read_step_action action
     case "$action" in
+      __esc__|i|I) return 0 ;;
       u|U)
         if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
           echo ""; perform_strata_update; pause_prompt
@@ -1982,7 +2023,6 @@ run_step_view() {
         mode="wizard"
         (( idx > 0 )) && ((idx--))
         ;;
-      i|I) return 0 ;;
       q|Q) exit 0 ;;
       *) echo -e "${C_RED}Invalid action '${action}'.${C_RESET}"; sleep 1 ;;
     esac
