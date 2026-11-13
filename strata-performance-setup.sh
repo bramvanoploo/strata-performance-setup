@@ -1249,6 +1249,140 @@ print_logo() {
   fi
 }
 
+render_bar() {
+  local pct="$1" width="${2:-20}"
+  (( pct < 0 )) && pct=0
+  (( pct > 100 )) && pct=100
+  local filled=$(( pct * width / 100 ))
+  local empty=$(( width - filled ))
+  local color="$C_GREEN"
+  if (( pct >= 85 )); then color="$C_RED"
+  elif (( pct >= 60 )); then color="$C_YELLOW"
+  fi
+  local bar_fill="" bar_empty="" i
+  for ((i=0; i<filled; i++)); do bar_fill+="█"; done
+  for ((i=0; i<empty; i++)); do bar_empty+="░"; done
+  printf "%b%s%b%s%b" "$color" "$bar_fill" "$C_DIM" "$bar_empty" "$C_RESET"
+}
+
+print_live_stats() {
+  local cpu_pct="" ram_pct="" ram_used_gib="" ram_tot_gib=""
+  local gpu_pct="" vram_pct="" vram_used_gib="" vram_tot_gib=""
+  local pwr_w="" pwr_lim_w="" pwr_pct="" pwr_label="Power"
+
+  # CPU usage (150ms delta on /proc/stat)
+  if [[ -r /proc/stat ]]; then
+    local u1 n1 s1 i1 w1 q1 sq1 st1 u2 n2 s2 i2 w2 q2 sq2 st2
+    read -r _ u1 n1 s1 i1 w1 q1 sq1 st1 _ < /proc/stat
+    sleep 0.15
+    read -r _ u2 n2 s2 i2 w2 q2 sq2 st2 _ < /proc/stat
+    local idle1=$((i1 + w1)) idle2=$((i2 + w2))
+    local tot1=$((u1 + n1 + s1 + idle1 + q1 + sq1 + st1))
+    local tot2=$((u2 + n2 + s2 + idle2 + q2 + sq2 + st2))
+    local dt=$((tot2 - tot1)) di=$((idle2 - idle1))
+    if (( dt > 0 )); then
+      cpu_pct=$(( (dt - di) * 100 / dt ))
+    fi
+  fi
+
+  # RAM usage (/proc/meminfo)
+  if [[ -r /proc/meminfo ]]; then
+    local mem_stats
+    mem_stats="$(awk '
+      /^MemTotal:/ {t=$2}
+      /^MemAvailable:/ {a=$2}
+      END {
+        if (t > 0) {
+          u = t - a
+          printf "%d %.1f %.1f", int(u * 100 / t + 0.5), u / 1048576, t / 1048576
+        }
+      }' /proc/meminfo 2>/dev/null || true)"
+    if [[ -n "$mem_stats" ]]; then
+      read -r ram_pct ram_used_gib ram_tot_gib <<< "$mem_stats"
+    fi
+  fi
+
+  # GPU, VRAM, and Power usage
+  if [[ "$HAS_NVIDIA" == true ]] && command -v nvidia-smi >/dev/null 2>&1; then
+    local nv_line
+    nv_line="$(nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,power.draw,power.limit --format=csv,noheader,nounits 2>/dev/null | head -n1 || true)"
+    if [[ -n "$nv_line" ]]; then
+      local g_u m_u m_t p_d p_l
+      IFS=',' read -r g_u m_u m_t p_d p_l <<< "$nv_line"
+      g_u="${g_u// /}"; m_u="${m_u// /}"; m_t="${m_t// /}"; p_d="${p_d// /}"; p_l="${p_l// /}"
+      [[ "$g_u" =~ ^[0-9]+(\.[0-9]+)?$ ]] && gpu_pct="$(awk "BEGIN {printf \"%.0f\", $g_u}")"
+      if [[ "$m_u" =~ ^[0-9]+(\.[0-9]+)?$ && "$m_t" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk "BEGIN {exit !($m_t > 0)}"; then
+        read -r vram_pct vram_used_gib vram_tot_gib <<< "$(awk "BEGIN {printf \"%.0f %.1f %.1f\", ($m_u/$m_t)*100, $m_u/1024, $m_t/1024}")"
+      fi
+      if [[ "$p_d" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        pwr_w="$(awk "BEGIN {printf \"%.0f\", $p_d}")"
+        if [[ "$p_l" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk "BEGIN {exit !($p_l > 0)}"; then
+          pwr_lim_w="$(awk "BEGIN {printf \"%.0f\", $p_l}")"
+          pwr_pct="$(awk "BEGIN {printf \"%.0f\", ($p_d/$p_l)*100}")"
+        fi
+        pwr_label="GPU Pwr"
+      fi
+    fi
+  elif [[ "$HAS_AMD" == true ]]; then
+    local card_dir
+    for card_dir in /sys/class/drm/card*/device; do
+      [[ -r "$card_dir/gpu_busy_percent" ]] || continue
+      gpu_pct="$(cat "$card_dir/gpu_busy_percent" 2>/dev/null || true)"
+      if [[ -r "$card_dir/mem_info_vram_used" && -r "$card_dir/mem_info_vram_total" ]]; then
+        local vu vt
+        vu="$(cat "$card_dir/mem_info_vram_used" 2>/dev/null || echo 0)"
+        vt="$(cat "$card_dir/mem_info_vram_total" 2>/dev/null || echo 0)"
+        if (( vt > 0 )); then
+          read -r vram_pct vram_used_gib vram_tot_gib <<< "$(awk "BEGIN {printf \"%.0f %.1f %.1f\", ($vu/$vt)*100, $vu/1073741824, $vt/1073741824}")"
+        fi
+      fi
+      local hwmon_dir
+      for hwmon_dir in "$card_dir"/hwmon/hwmon*; do
+        if [[ -r "$hwmon_dir/power1_average" ]]; then
+          local pa pc
+          pa="$(cat "$hwmon_dir/power1_average" 2>/dev/null || echo 0)"
+          pwr_w=$((pa / 1000000))
+          if [[ -r "$hwmon_dir/power1_cap" ]]; then
+            pc="$(cat "$hwmon_dir/power1_cap" 2>/dev/null || echo 0)"
+            if (( pc > 0 )); then
+              pwr_lim_w=$((pc / 1000000))
+              pwr_pct=$((pa * 100 / pc))
+            fi
+          fi
+          pwr_label="GPU Pwr"
+          break
+        fi
+      done
+      break
+    done
+  fi
+
+  # Fallback battery power if no GPU power telemetry
+  if [[ -z "$pwr_w" ]]; then
+    local bat_p
+    for bat_p in /sys/class/power_supply/BAT*/power_now; do
+      if [[ -r "$bat_p" ]]; then
+        local uw
+        uw="$(cat "$bat_p" 2>/dev/null || echo 0)"
+        (( uw > 0 )) && { pwr_w=$((uw / 1000000)); pwr_label="Battery"; break; }
+      fi
+    done
+  fi
+
+  echo -e "${C_BOLD}Live System Usage:${C_RESET}"
+  [[ -n "$cpu_pct" ]] && printf "  %-8s [%s] %3d%%\n" "CPU:" "$(render_bar "$cpu_pct")" "$cpu_pct"
+  [[ -n "$ram_pct" ]] && printf "  %-8s [%s] %3d%% (%s / %s GiB)\n" "RAM:" "$(render_bar "$ram_pct")" "$ram_pct" "$ram_used_gib" "$ram_tot_gib"
+  [[ -n "$gpu_pct" ]] && printf "  %-8s [%s] %3d%%\n" "GPU:" "$(render_bar "$gpu_pct")" "$gpu_pct"
+  [[ -n "$vram_pct" ]] && printf "  %-8s [%s] %3d%% (%s / %s GiB)\n" "VRAM:" "$(render_bar "$vram_pct")" "$vram_pct" "$vram_used_gib" "$vram_tot_gib"
+  if [[ -n "$pwr_w" ]]; then
+    if [[ -n "$pwr_pct" && -n "$pwr_lim_w" ]]; then
+      printf "  %-8s [%s] %3d%% (%s / %s W)\n" "${pwr_label}:" "$(render_bar "$pwr_pct")" "$pwr_pct" "$pwr_w" "$pwr_lim_w"
+    else
+      printf "  %-8s %s W\n" "${pwr_label}:" "$pwr_w"
+    fi
+  fi
+}
+
 print_header() {
   clear 2>/dev/null || true
   print_logo
@@ -1262,8 +1396,10 @@ print_header() {
   if [[ "$HAS_NVIDIA" == true && -n "$NVIDIA_CURRENT_PL" ]]; then
     echo -e "${C_DIM}NVIDIA Power Limit: ${NVIDIA_CURRENT_PL}W (Default: ${NVIDIA_DEFAULT_PL}W, Max: ${NVIDIA_MAX_PL}W)${C_RESET}"
   fi
+  echo ""
+  print_live_stats
   if [[ "$REBOOT_REQUIRED" == true ]]; then
-    echo -e "${C_YELLOW}[!] Reboot pending: newly added kernel parameters require a reboot to take effect.${C_RESET}"
+    echo -e "\n${C_YELLOW}[!] Reboot pending: newly added kernel parameters require a reboot to take effect.${C_RESET}"
   fi
   echo ""
 }
@@ -1365,6 +1501,7 @@ show_index() {
     echo -e "  ${C_GREEN}[a]${C_RESET} Apply all recommended optimizations (excludes Strata & high-idle-power options)"
     echo -e "  ${C_RED}[x]${C_RESET} Revert all recommended optimizations"
     echo -e "  ${C_BOLD}[1-${#ACTIVE_STEPS[@]}]${C_RESET} Jump directly to a step"
+    echo -e "  ${C_BOLD}[s]${C_RESET} Refresh live system stats"
     echo -e "  ${C_BOLD}[r]${C_RESET} Reboot system"
     echo -e "  ${C_BOLD}[q]${C_RESET} Quit\n"
     read -r -p "Choice: " choice || exit 0
@@ -1373,6 +1510,7 @@ show_index() {
       w|W|"") run_step_view 0 "wizard" ;;
       a|A) run_recommended_batch "apply" ;;
       x|X) run_recommended_batch "revert" ;;
+      s|S) ;;
       r|R)
         confirm_yn "Reboot this system now? [y/N]: " "N" && { run_root systemctl reboot; exit 0; }
         sleep 1
