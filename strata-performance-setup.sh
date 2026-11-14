@@ -914,7 +914,7 @@ build_active_steps() {
     "applicable_${step}" && candidates+=("$step")
   done
   ACTIVE_STEPS=()
-  for (( pts = 10; pts >= 1; pts-- )); do
+  for (( pts = 5; pts >= 1; pts-- )); do
     for step in "${candidates[@]}"; do
       (( ${STEP_GAIN_PTS[$step]:-1} == pts )) && ACTIVE_STEPS+=("$step")
     done
@@ -3376,8 +3376,9 @@ apply_bench_history_config() {
 HIST_SELECTED=0
 
 show_benchmark_history() {
+  local -A HIST_EXPANDED=()
   while true; do
-    print_header
+    print_header none true
     if ! command -v python3 >/dev/null 2>&1; then
       echo -e "${C_BOLD}Strata Benchmark History & Coupled Configurations${C_RESET}"
       echo -e "${C_DIM}----------------------------------------------------------------------${C_RESET}"
@@ -3591,8 +3592,46 @@ for _, rp, p in found_files:
     if row:
         out_rows.append(row)
 
+def _num(s):
+    try:
+        return float(s) if s not in ("", "—", None) else None
+    except Exception:
+        return None
+
+best_idx = None
+best_score = None
 for idx, cols in enumerate(out_rows):
-    safe_cols = [str(c).replace("|", "/").replace("\n", " ").replace("\r", "") for c in cols]
+    dv = _num(cols[13])
+    if dv is None:
+        dv = _num(cols[3])
+    pv = _num(cols[14])
+    if pv is None:
+        pv = _num(cols[4])
+    if dv is not None:
+        sc = (dv, pv if pv is not None else -1.0)
+        if best_score is None or sc > best_score:
+            best_score = sc
+            best_idx = idx
+
+best_dec = best_score[0] if best_score is not None else None
+best_pre = (_num(out_rows[best_idx][14]) if _num(out_rows[best_idx][14]) is not None else _num(out_rows[best_idx][4])) if best_idx is not None else None
+
+for idx, cols in enumerate(out_rows):
+    d_pct = ""
+    p_pct = ""
+    is_best = "1" if (best_idx is not None and idx == best_idx) else "0"
+    if best_idx is not None and idx != best_idx:
+        dv = _num(cols[13])
+        if dv is None:
+            dv = _num(cols[3])
+        pv = _num(cols[14])
+        if pv is None:
+            pv = _num(cols[4])
+        if dv is not None and best_dec is not None and best_dec > 0:
+            d_pct = f"{((dv - best_dec) / best_dec) * 100.0:.1f}"
+        if pv is not None and best_pre is not None and best_pre > 0:
+            p_pct = f"{((pv - best_pre) / best_pre) * 100.0:.1f}"
+    safe_cols = [str(c).replace("|", "/").replace("\n", " ").replace("\r", "") for c in cols + [d_pct, p_pct, is_best]]
     print("|".join([str(idx)] + safe_cols))
 PY
 )
@@ -3624,13 +3663,13 @@ PY
     HIST_HDR_PLAIN=()
     HIST_HDR_SEL=()
 
-    local body="" r idx ts tag model dec_s pre_s sw gw cw act_n act_csv req_s qual_s has_opts avg_dec_s avg_pre_s dur_s
-    local pwr_s dec_cell pre_cell chk_cell act_lbl _s
+    local body="" r idx ts tag model dec_s pre_s sw gw cw act_n act_csv req_s qual_s has_opts avg_dec_s avg_pre_s dur_s d_pct p_pct is_best
+    local pwr_s dec_cell pre_cell chk_cell diff_cell act_lbl _s
     local opt_items=()
     body+="$(echo -e "${C_BOLD}Strata Benchmark Results & Coupled Configurations (${#rows[@]} recorded)${C_RESET}")"$'\n'
     body+="$(echo -e "${C_DIM}${_hdr_rule}${C_RESET}")"$'\n'
     for r in "${rows[@]}"; do
-      IFS='|' read -r idx ts tag model dec_s pre_s sw gw cw act_n act_csv req_s qual_s has_opts avg_dec_s avg_pre_s dur_s <<< "$r"
+      IFS='|' read -r idx ts tag model dec_s pre_s sw gw cw act_n act_csv req_s qual_s has_opts avg_dec_s avg_pre_s dur_s d_pct p_pct is_best <<< "$r"
       pwr_s="$(format_avg_power_str "$sw" "$gw" "$cw")"
       [[ -z "$pwr_s" ]] && pwr_s="n/a (not recorded)"
 
@@ -3668,16 +3707,47 @@ PY
         act_lbl="Press [Enter] or [$((idx + 1))] to apply/restore these ${act_n} option(s)"
       fi
 
-      local hdr_base="[$((idx + 1))] ${ts}${tag:+ (${tag})}"
+      local is_exp=false exp_tag="[+]"
+      if [[ "${HIST_EXPANDED[$idx]:-0}" == "1" ]]; then
+        is_exp=true
+        exp_tag="[-]"
+      fi
+      diff_cell=""
+      local diff_hdr=""
+      if [[ "$is_best" == "1" ]]; then
+        diff_cell="$(printf "%b[BEST]%b %b(Best overall performance)%b" "${C_BGREEN}" "${C_RESET}" "${C_DIM}" "${C_RESET}")"
+        diff_hdr="$(printf "%b[BEST]%b" "${C_BGREEN}" "${C_RESET}")"
+      else
+        local _dp=()
+        [[ -n "$d_pct" ]] && _dp+=("Decode $(format_pct_delta "$d_pct")")
+        [[ -n "$p_pct" ]] && _dp+=("Prefill $(format_pct_delta "$p_pct")")
+        if (( ${#_dp[@]} > 0 )); then
+          diff_cell="${_dp[0]}"
+          (( ${#_dp[@]} > 1 )) && diff_cell+=" | ${_dp[1]}"
+          diff_hdr="$diff_cell"
+        fi
+      fi
+
+      local _dvis="${diff_hdr//$'\033'\[*([0-9;])m/}"
+      local _dlen=${#_dvis}
+      local left_max=$(( hdr_w - (_dlen > 0 ? _dlen + 2 : 0) ))
+      (( left_max < 10 )) && left_max=10
+      local opts_tag="(${act_n} opts)"
+      [[ "$has_opts" != "1" ]] && opts_tag="(CLI)"
+      local hdr_base="${exp_tag} [$((idx + 1))] ${ts}${tag:+ (${tag})} | ${opts_tag}"
       local hdr_plain_txt="  ${hdr_base}" hdr_sel_txt="> ${hdr_base}"
-      (( ${#hdr_plain_txt} > hdr_w )) && hdr_plain_txt="${hdr_plain_txt:0:$((hdr_w - 3))}..."
-      (( ${#hdr_sel_txt} > hdr_w )) && hdr_sel_txt="${hdr_sel_txt:0:$((hdr_w - 3))}..."
+      (( ${#hdr_plain_txt} > left_max )) && hdr_plain_txt="${hdr_plain_txt:0:$((left_max - 3))}..."
+      (( ${#hdr_sel_txt} > left_max )) && hdr_sel_txt="${hdr_sel_txt:0:$((left_max - 3))}..."
       (( ${#model} > val_w )) && model="${model:0:$((val_w - 3))}..."
       (( ${#act_lbl} > val_w )) && act_lbl="${act_lbl:0:$((val_w - 3))}..."
 
+      local gap_p=$(( hdr_w - ${#hdr_plain_txt} - _dlen ))
+      local gap_s=$(( hdr_w - ${#hdr_sel_txt} - _dlen ))
+      (( gap_p < 0 )) && gap_p=0
+      (( gap_s < 0 )) && gap_s=0
       local row_plain row_sel
-      row_plain="$(printf "  | ${C_BOLD}%-*s${C_RESET} |" "$hdr_w" "$hdr_plain_txt")"
-      row_sel="$(printf "  | ${C_CYAN}${C_BOLD}%-*s${C_RESET} |" "$hdr_w" "$hdr_sel_txt")"
+      row_plain="$(printf "  | ${C_BOLD}%s${C_RESET}%*s%s |" "$hdr_plain_txt" "$gap_p" "" "$diff_hdr")"
+      row_sel="$(printf "  | ${C_CYAN}${C_BOLD}%s${C_RESET}%*s%s |" "$hdr_sel_txt" "$gap_s" "" "$diff_hdr")"
       HIST_HDR_PLAIN+=("$row_plain")
       HIST_HDR_SEL+=("$row_sel")
 
@@ -3690,29 +3760,34 @@ PY
       else
         body+="${row_plain}"$'\n'
       fi
-      body+="${_tbl_rule}"$'\n'
-      body+="$(printf "  | %-20s | %-*s |" "Model" "$val_w" "$model")"$'\n'
-      body+="$(printf "  | %-20s | ${C_GREEN}%-*s${C_RESET} |" "Decode (Med / Avg)" "$val_w" "$dec_cell")"$'\n'
-      body+="$(printf "  | %-20s | ${C_CYAN}%-*s${C_RESET} |" "Prefill (Med / Avg)" "$val_w" "$pre_cell")"$'\n'
-      body+="$(printf "  | %-20s | ${C_YELLOW}%-*s${C_RESET} |" "Average Power" "$val_w" "$pwr_s")"$'\n'
-      [[ -n "$chk_cell" ]] && body+="$(printf "  | %-20s | %-*s |" "Checks" "$val_w" "$chk_cell")"$'\n'
-      local opts_hdr="Active Opts (${act_n})"
-      [[ "$has_opts" != "1" ]] && opts_hdr="Active Opts (CLI)"
-      local first_opt_row=true _opt_line
-      for _opt_line in "${opt_items[@]}"; do
-        (( ${#_opt_line} > val_w )) && _opt_line="${_opt_line:0:$((val_w - 3))}..."
-        if [[ "$first_opt_row" == true ]]; then
-          body+="$(printf "  | %-20s | %-*s |" "$opts_hdr" "$val_w" "$_opt_line")"$'\n'
-          first_opt_row=false
-        else
-          body+="$(printf "  | %-20s | %-*s |" "" "$val_w" "$_opt_line")"$'\n'
-        fi
-      done
-      body+="$(printf "  | %-20s | ${C_BOLD}%-*s${C_RESET} |" "Restore Options" "$val_w" "$act_lbl")"$'\n'
-      body+="${_tbl_rule}"$'\n'
+      if [[ "$is_exp" == true ]]; then
+        body+="${_tbl_rule}"$'\n'
+        [[ -n "$diff_cell" ]] && body+="$(printf "  | %-20s | %s |" "Diff (vs Best)" "$(pad_ansi_col "$diff_cell" "$val_w")")"$'\n'
+        body+="$(printf "  | %-20s | %-*s |" "Model" "$val_w" "$model")"$'\n'
+        body+="$(printf "  | %-20s | ${C_GREEN}%-*s${C_RESET} |" "Decode (Med / Avg)" "$val_w" "$dec_cell")"$'\n'
+        body+="$(printf "  | %-20s | ${C_CYAN}%-*s${C_RESET} |" "Prefill (Med / Avg)" "$val_w" "$pre_cell")"$'\n'
+        body+="$(printf "  | %-20s | %-*s |" "Average Power" "$val_w" "$pwr_s")"$'\n'
+        [[ -n "$chk_cell" ]] && body+="$(printf "  | %-20s | %-*s |" "Checks" "$val_w" "$chk_cell")"$'\n'
+        local opts_hdr="Active Opts (${act_n})"
+        [[ "$has_opts" != "1" ]] && opts_hdr="Active Opts (CLI)"
+        local first_opt_row=true _opt_line
+        for _opt_line in "${opt_items[@]}"; do
+          (( ${#_opt_line} > val_w )) && _opt_line="${_opt_line:0:$((val_w - 3))}..."
+          if [[ "$first_opt_row" == true ]]; then
+            body+="$(printf "  | %-20s | %-*s |" "$opts_hdr" "$val_w" "$_opt_line")"$'\n'
+            first_opt_row=false
+          else
+            body+="$(printf "  | %-20s | %-*s |" "" "$val_w" "$_opt_line")"$'\n'
+          fi
+        done
+        body+="$(printf "  | %-20s | ${C_BOLD}%-*s${C_RESET} |" "Restore Options" "$val_w" "$act_lbl")"$'\n'
+        body+="${_tbl_rule}"$'\n'
+      else
+        body+="${_tbl_top}"$'\n'
+      fi
     done
 
-    body+=$'\n'"$(echo -e "  ${C_DIM}Use [↑/↓ + Enter] or [1-${#rows[@]} + Enter] to apply a benchmark's active options, or [b/q/Esc] to go back:${C_RESET}")"$'\n'
+    body+=$'\n'"$(echo -e "  ${C_DIM}Use [↑/↓] select, [e/Space] expand/collapse, [Enter] or [1-${#rows[@]} + Enter] apply active options, [b/q/Esc] back:${C_RESET}")"$'\n'
     printf "%s" "$body"
     local body_lines lines_up h_choice hi
     body_lines="$(printf "%s" "$body" | wc -l)"
@@ -3720,9 +3795,17 @@ PY
       HIST_HDR_LINES[$hi]=$(( body_lines - HIST_HDR_LINES[$hi] + 1 ))
     done
     lines_up=$(( LIVE_STATS_COUNT + POST_HEADER_LINES + body_lines ))
-    read_line_with_live_stats h_choice "Choose: " "$lines_up" "${#rows[@]}"
+    read_line_with_live_stats h_choice "Select action: " "$lines_up" "${#rows[@]}"
     case "$h_choice" in
       __refresh__) continue ;;
+      __toggle__)
+        if [[ "${HIST_EXPANDED[$HIST_SELECTED]:-0}" == "1" ]]; then
+          HIST_EXPANDED[$HIST_SELECTED]=0
+        else
+          HIST_EXPANDED[$HIST_SELECTED]=1
+        fi
+        continue
+        ;;
       __esc__|b|B|q|Q) return 0 ;;
       *)
         [[ -z "$h_choice" ]] && h_choice=$(( HIST_SELECTED + 1 ))
@@ -3773,6 +3856,7 @@ PY
 }
 
 run_strata_benchmark() {
+  LAST_BENCH_COMPLETED=false
   refresh_strata_bin
   refresh_strata_running
   if [[ -z "$STRATA_BIN" || -z "$STRATA_RUNNING_URL" ]]; then
@@ -3841,6 +3925,7 @@ run_strata_benchmark() {
   fi
 
   save_bench_history_entry "$res_file" "$mode" "$avg_sys" "$avg_gpu" "$avg_cpu" "$samples" "$active_csv" "$applicable_csv"
+  LAST_BENCH_COMPLETED=true
   STRATA_BENCH_CACHE_KEY=""
   BENCH_HISTORY_COUNT_KEY=""
   local pwr_disp
@@ -4156,7 +4241,11 @@ run_strata_option() {
       __esc__|i|I) return 0 ;;
       a|A)
         echo ""
-        "strata_action_${opt}"
+        "strata_action_${opt}" || true
+        if [[ "$opt" == "benchmark" && "${LAST_BENCH_COMPLETED:-false}" == true ]]; then
+          show_stats_page
+          return 0
+        fi
         [[ "$opt" != "history" ]] && pause_prompt
         ;;
       h|H)
@@ -4598,6 +4687,10 @@ build_sys_info_lines() {
   if grep -qiE "PowerEdge|ProLiant|ThinkSystem|Supermicro|PRIMERGY|SYS-[0-9]" <<<"${SYS_VENDOR} ${PRODUCT_NAME}"; then
     SYS_INFO_LINES+=("$(printf "%bServer: set the BIOS/BMC system power profile to 'Performance' (not automated)%b" "${C_DIM}" "${C_RESET}")")
   fi
+  local _si
+  for (( _si = 1; _si < ${#SYS_INFO_LINES[@]}; _si++ )); do
+    SYS_INFO_LINES[$_si]="  ${SYS_INFO_LINES[$_si]}"
+  done
 }
 
 shopt -s extglob
@@ -4686,12 +4779,12 @@ print(f"{model}|{live_s}|{avg_s}")
 format_pct_delta() {
   local pct="$1"
   [[ -n "$pct" ]] || return 1
-  if [[ "$pct" == -* ]]; then
-    printf "%b%s%%%b" "${C_RED}" "$pct" "${C_RESET}"
-  elif [[ "$pct" == "0.0" ]]; then
+  if [[ "$pct" == "0.0" || "$pct" == "-0.0" ]]; then
     printf "%b0.0%%%b" "${C_DIM}" "${C_RESET}"
+  elif [[ "$pct" == -* ]]; then
+    printf "%b%s%%%b" "${C_RED}" "$pct" "${C_RESET}"
   else
-    printf "%b+%s%%%b" "${C_GREEN}" "$pct" "${C_RESET}"
+    printf "%b+%s%%%b" "${C_BGREEN}" "$pct" "${C_RESET}"
   fi
 }
 
@@ -4940,14 +5033,18 @@ d_pct = ""
 p_pct = ""
 if len(items) >= 2:
     cur, prev = items[0], items[1]
-    if cur["dec"] is not None and prev["dec"] is not None and prev["dec"] > 0:
-        d_pct = f"{((cur['dec'] - prev['dec']) / prev['dec']) * 100.0:.1f}"
-    if cur["pre"] is not None and prev["pre"] is not None and prev["pre"] > 0:
-        p_pct = f"{((cur['pre'] - prev['pre']) / prev['pre']) * 100.0:.1f}"
+    cur_d = cur.get("avg_dec") if cur.get("avg_dec") is not None else cur.get("dec")
+    prev_d = prev.get("avg_dec") if prev.get("avg_dec") is not None else prev.get("dec")
+    cur_p = cur.get("avg_pre") if cur.get("avg_pre") is not None else cur.get("pre")
+    prev_p = prev.get("avg_pre") if prev.get("avg_pre") is not None else prev.get("pre")
+    if cur_d is not None and prev_d is not None and prev_d > 0:
+        d_pct = f"{((cur_d - prev_d) / prev_d) * 100.0:.1f}"
+    if cur_p is not None and prev_p is not None and prev_p > 0:
+        p_pct = f"{((cur_p - prev_p) / prev_p) * 100.0:.1f}"
 
-print(fmt_rec("CUR", items[0]))
+print(fmt_rec("CUR", items[0], d_pct, p_pct))
 if len(items) >= 2:
-    print(fmt_rec("PREV", items[1], d_pct, p_pct))
+    print(fmt_rec("PREV", items[1]))
 PY
 )"
   fi
@@ -4972,31 +5069,30 @@ PY
     [[ -n "$b_tag" ]] && date_disp+=" (${b_tag})"
     STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b" "Date:" "${C_DIM}" "$date_disp" "${C_RESET}")")
     STRATA_BENCH_LINES+=("$(printf "  %-8s %s" "Model:" "$b_model")")
-    STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b | Prefill: %b%s%b" "Decode:" "${C_GREEN}" "$b_dec" "${C_RESET}" "${C_CYAN}" "$b_pre" "${C_RESET}")")
     if [[ -n "$b_avg_dec" || -n "$b_avg_pre" ]]; then
       local avg_parts=()
       [[ -n "$b_avg_dec" ]] && avg_parts+=("${b_avg_dec} decode")
       [[ -n "$b_avg_pre" ]] && avg_parts+=("${b_avg_pre} prefill")
       local avg_str="${avg_parts[0]}"
       (( ${#avg_parts[@]} > 1 )) && avg_str+=" | ${avg_parts[1]}"
-      STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b" "Avg:" "${C_GREEN}" "$avg_str" "${C_RESET}")")
+      STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b" "Avg:" "${C_CYAN}" "$avg_str" "${C_RESET}")")
     fi
     local b_pwr
     b_pwr="$(format_avg_power_str "$b_sw" "$b_gw" "$b_cw")"
     if [[ -n "$b_pwr" ]]; then
-      STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b" "Power:" "${C_YELLOW}" "$b_pwr" "${C_RESET}")")
+      STRATA_BENCH_LINES+=("$(printf "  %-8s %s" "Power:" "$b_pwr")")
     else
       STRATA_BENCH_LINES+=("$(printf "  %-8s %bn/a (not recorded)%b" "Power:" "${C_DIM}" "${C_RESET}")")
     fi
+    STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b | Prefill: %b%s%b" "Decode:" "${C_CYAN}" "$b_dec" "${C_RESET}" "${C_CYAN}" "$b_pre" "${C_RESET}")")
+    local summary_tail=""
+    [[ -n "$b_req" ]] && summary_tail="Reqs: ${b_req}"
+    if [[ -n "$b_qual" ]]; then
+      [[ -n "$summary_tail" ]] && summary_tail+=" | "
+      summary_tail+="$b_qual"
+    fi
+    [[ -n "$summary_tail" ]] && STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b" "Checks:" "${C_DIM}" "$summary_tail" "${C_RESET}")")
     if [[ "$kind" == "CUR" ]]; then
-      local summary_tail=""
-      [[ -n "$b_req" ]] && summary_tail="Reqs: ${b_req}"
-      if [[ -n "$b_qual" ]]; then
-        [[ -n "$summary_tail" ]] && summary_tail+=" | "
-        summary_tail+="$b_qual"
-      fi
-      [[ -n "$summary_tail" ]] && STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b" "Checks:" "${C_DIM}" "$summary_tail" "${C_RESET}")")
-    else
       local diff_parts=()
       [[ -n "$b_dpct" ]] && diff_parts+=("Decode $(format_pct_delta "$b_dpct")")
       [[ -n "$b_ppct" ]] && diff_parts+=("Prefill $(format_pct_delta "$b_ppct")")
@@ -5101,7 +5197,7 @@ format_stats_toggle_row() {
 }
 
 print_header() {
-  local show_toggle="${1:-false}"
+  local hdr_mode="${1:-none}" skip_rule="${2:-false}"
   clear 2>/dev/null || true
   local _rule_w=120 _hdr_eq="" _hdr_rule=""
   [[ -t 1 ]] && _rule_w="$(tput cols 2>/dev/null || echo 120)"
@@ -5117,8 +5213,7 @@ print_header() {
   echo -e "${C_BOLD}${C_CYAN}${_hdr_eq}${C_RESET}"
   load_strata_update_state
   refresh_strata_running
-  build_sys_info_lines
-  if [[ "$show_toggle" == true ]]; then
+  if [[ "$hdr_mode" == "toggle" ]]; then
     LIVE_STATS_COUNT=0
     LIVE_STAT_LINES=()
     echo ""
@@ -5127,12 +5222,21 @@ print_header() {
     printf "%s\n" "$(format_stats_toggle_row "$_tgl_sel")"
     echo ""
     POST_HEADER_LINES=3
-  else
+  elif [[ "$hdr_mode" == "stats" ]]; then
+    build_sys_info_lines
     print_stats_and_info_grid false
     POST_HEADER_LINES=2
+  else
+    LIVE_STATS_COUNT=0
+    LIVE_STAT_LINES=()
+    POST_HEADER_LINES=2
   fi
-  printf -v _hdr_rule "%*s" "$_rule_w" ""
-  echo -e "${C_DIM}${_hdr_rule// /─}${C_RESET}"
+  if [[ "$skip_rule" != true ]]; then
+    printf -v _hdr_rule "%*s" "$_rule_w" ""
+    echo -e "${C_DIM}${_hdr_rule// /─}${C_RESET}"
+  else
+    POST_HEADER_LINES=$((POST_HEADER_LINES - 1))
+  fi
   if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
     echo -e "\n${C_BGREEN}[UPDATE AVAILABLE]${C_RESET} ${C_CYAN}Strata update ready (${STRATA_UPDATE_SUMMARY}). Press [u] to install & restart service.${C_RESET}"
     ((POST_HEADER_LINES += 2))
@@ -5187,7 +5291,7 @@ _render_live_stats_inplace() {
 
 read_line_with_live_stats() {
   local -n _line_out="$1"
-  local prompt_str="${2:-Choose: }"
+  local prompt_str="${2:-Select action: }"
   local lines_up="${3:-0}"
   local total_rows="${4:-0}"
   if [[ ! -t 0 || ! -t 1 ]]; then
@@ -5197,7 +5301,7 @@ read_line_with_live_stats() {
 
   local term_lines=40 compact_bar=false
   term_lines="$(tput lines 2>/dev/null || echo 40)"
-  if ! _can_live_stats "$lines_up" "$term_lines"; then
+  if (( LIVE_STATS_COUNT > 0 )) && ! _can_live_stats "$lines_up" "$term_lines"; then
     compact_bar=true
     local _bar0
     _bar0="$(format_compact_live_bar)"
@@ -5211,7 +5315,9 @@ read_line_with_live_stats() {
   fi
 
   local tmp_file="" sampler_pid=""
-  tmp_file="$(mktemp /tmp/strata-stats.XXXXXX 2>/dev/null || echo "")"
+  if (( LIVE_STATS_COUNT > 0 )); then
+    tmp_file="$(mktemp /tmp/strata-stats.XXXXXX 2>/dev/null || echo "")"
+  fi
   if [[ -n "$tmp_file" ]]; then
     (
       trap 'exit 0' TERM INT
@@ -5293,6 +5399,10 @@ read_line_with_live_stats() {
           fi
         fi
       else
+        if (( total_rows > 0 )) && [[ -z "$buf" && ( "$ch" == "e" || "$ch" == "E" || "$ch" == " " ) ]]; then
+          _cleanup_line_live; trap - INT TERM; printf "\n"
+          _line_out="__toggle__"; return 0
+        fi
         local _accept=false
         if [[ -z "$buf" && "$ch" =~ ^[bBqQ]$ ]]; then
           _accept=true
@@ -5342,7 +5452,7 @@ read_step_action() {
 
   local term_lines=40 compact_bar=false
   term_lines="$(tput lines 2>/dev/null || echo 40)"
-  if ! _can_live_stats "$lines_up" "$term_lines"; then
+  if (( LIVE_STATS_COUNT > 0 )) && ! _can_live_stats "$lines_up" "$term_lines"; then
     compact_bar=true
     local _bar0
     _bar0="$(format_compact_live_bar)"
@@ -5356,7 +5466,9 @@ read_step_action() {
   fi
 
   local tmp_file="" sampler_pid=""
-  tmp_file="$(mktemp /tmp/strata-stats.XXXXXX 2>/dev/null || echo "")"
+  if (( LIVE_STATS_COUNT > 0 )); then
+    tmp_file="$(mktemp /tmp/strata-stats.XXXXXX 2>/dev/null || echo "")"
+  fi
   if [[ -n "$tmp_file" ]]; then
     (
       trap 'exit 0' TERM INT
@@ -5539,7 +5651,7 @@ read_choice_with_live_stats() {
   local toggle_up="${4:-0}"
   local term_lines=40
   if [[ ! -t 1 || ! -t 0 ]]; then
-    read -r -p "Choice: " _out_var || exit 0
+    read -r -p "Select action: " _out_var || exit 0
     return 0
   fi
 
@@ -5566,7 +5678,7 @@ read_choice_with_live_stats() {
   trap '_cleanup_live_sampler; exit 0' INT TERM
 
   local buf="" ch="" rc=0 stats_block=""
-  printf "Choice: "
+  printf "Select action: "
   while true; do
     rc=0
     IFS= read -rsn1 -t 1 ch || rc=$?
@@ -5705,46 +5817,46 @@ read_choice_with_live_stats() {
 
 INDEX_SELECTED=0
 
-# Relative performance/utility rating per step on a 10-point scale (0 = no rating/stars, 1 = 0.5 stars, 10 = 5.0 stars).
+# Relative performance/utility rating per step on a 5-point scale (0 = no rating/stars, 1 = 1 star, 5 = 5 stars).
 declare -A STEP_GAIN_PTS=(
-  [gpu_unlock]=10
-  [amd_apu_memory]=10
-  [gpu_groups]=9
-  [intel_compute_stack]=9
-  [lact_overclock]=9
-  [jetson_perf]=9
-  [jetson_fan]=6
-  [nvidia_power_limit]=8
-  [amd_gpu_perf]=8
-  [intel_gpu_perf]=8
-  [ryzenadj_tdp]=8
-  [nvidia_ecc]=8
-  [headless_target]=7
-  [numactl_interleave]=7
-  [amd_x3d_mode]=7
-  [intel_rapl]=7
-  [msi_cooling]=7
-  [lenovo_legion]=7
-  [asus_perf]=6
-  [dell_thermal]=6
-  [system76_perf]=6
-  [tuxedo_perf]=6
-  [acpi_platform_profile]=6
-  [intel_pcore_pinning]=6
-  [zram_swap]=6
-  [numa_balancing]=6
-  [sysctl_tuning]=5
-  [memlock_realtime]=5
-  [nvme_tuning]=5
-  [nvidia_persistenced]=4
-  [nvidia_powerd]=4
-  [intel_thermald]=4
-  [iommu_pt]=4
-  [scx_scheduler]=4
-  [net_tuning]=3
-  [irq_balance]=3
-  [prevent_sleep]=2
-  [hugepages_1g]=2
+  [gpu_unlock]=5
+  [amd_apu_memory]=5
+  [gpu_groups]=4
+  [intel_compute_stack]=4
+  [lact_overclock]=4
+  [jetson_perf]=4
+  [nvidia_power_limit]=4
+  [amd_gpu_perf]=4
+  [intel_gpu_perf]=4
+  [ryzenadj_tdp]=4
+  [nvidia_ecc]=4
+  [headless_target]=4
+  [numactl_interleave]=4
+  [amd_x3d_mode]=4
+  [intel_rapl]=4
+  [msi_cooling]=4
+  [lenovo_legion]=4
+  [jetson_fan]=3
+  [asus_perf]=3
+  [dell_thermal]=3
+  [system76_perf]=3
+  [tuxedo_perf]=3
+  [acpi_platform_profile]=3
+  [intel_pcore_pinning]=3
+  [zram_swap]=3
+  [numa_balancing]=3
+  [sysctl_tuning]=3
+  [memlock_realtime]=3
+  [nvme_tuning]=3
+  [nvidia_persistenced]=2
+  [nvidia_powerd]=2
+  [intel_thermald]=2
+  [iommu_pt]=2
+  [scx_scheduler]=2
+  [net_tuning]=2
+  [irq_balance]=2
+  [prevent_sleep]=1
+  [hugepages_1g]=1
   [cpu_performance]=1
   [cstate_limit]=1
   [pcie_aspm]=1
@@ -5758,11 +5870,10 @@ render_gain_stars() {
     printf "         "
     return 0
   fi
-  (( pts > 10 )) && pts=10
-  local full=$(( pts / 2 )) half=$(( pts % 2 )) empty=$(( 5 - pts / 2 - pts % 2 ))
+  (( pts > 5 )) && pts=5
+  local full="$pts" empty=$(( 5 - pts ))
   local filled_str="" empty_str="" i
   for ((i=0; i<full; i++)); do filled_str+="★"; done
-  (( half == 1 )) && filled_str+="½"
   for ((i=0; i<empty; i++)); do empty_str+="☆"; done
   printf "%b%s%b%b%s%b    " "${C_YELLOW}" "$filled_str" "${C_RESET}" "${C_DIM}" "$empty_str" "${C_RESET}"
 }
@@ -5829,8 +5940,8 @@ index_row_up_offset() {
     echo "$toggle_up"
   elif (( idx <= n_opt )); then
     local o_idx=$(( idx - 1 ))
-    # Below opt table: blank + legend + blank + Strata title + header + sep (6 lines) + n_str rows + footer_menu_lines
-    echo $(( (n_opt - o_idx) + 6 + n_str + footer_menu_lines ))
+    # Below opt table: blank + legend + blank + Strata title + blank + header + sep (7 lines) + n_str rows + footer_menu_lines
+    echo $(( (n_opt - o_idx) + 7 + n_str + footer_menu_lines ))
   else
     local s_idx=$(( idx - 1 - n_opt ))
     echo $(( (n_str - s_idx) + footer_menu_lines ))
@@ -5839,7 +5950,7 @@ index_row_up_offset() {
 
 show_stats_page() {
   while true; do
-    print_header false
+    print_header stats
     local body=""
     body+="$(echo -e "  ${C_DIM}Live-updating every 1s. Press ${C_BOLD}[i / b / Enter / Esc]${C_RESET}${C_DIM} to return to Index, or ${C_BOLD}[q]${C_RESET}${C_DIM} to Quit.${C_RESET}")"$'\n\n'
     printf "%s" "$body"
@@ -5874,7 +5985,7 @@ show_index() {
     elif (( INDEX_SELECTED < 0 )); then
       INDEX_SELECTED=0
     fi
-    print_header true
+    print_header toggle
 
     local body="" hw_warns=""
     hw_warns="$(format_strata_hw_warnings)"
@@ -5896,7 +6007,7 @@ show_index() {
     done
     body+=$'\n'"$(echo -e "  ${C_YELLOW}[!]${C_RESET} ${C_DIM}Higher idle power, minimal gain${C_RESET}")"$'\n'
 
-    body+=$'\n'"$(echo -e "${C_BOLD}Strata Options:${C_RESET}")"$'\n'
+    body+=$'\n'"$(echo -e "${C_BOLD}Strata Options:${C_RESET}")"$'\n\n'
     body+="$(printf "  ${C_BOLD}%-3s | %-15s | %s${C_RESET}" "#" "Status" "Option")"$'\n'
     body+="$(printf "  %s" "----+-----------------+-------------------------------------------------------")"$'\n'
     local s_idx abs_idx
