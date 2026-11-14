@@ -50,7 +50,7 @@ The wizard supports systemd-based Linux distributions across three package famil
 | :--- | :--- | :--- |
 | **Arch-based** | Arch Linux, CachyOS, EndeavourOS, Manjaro, Garuda (and `ID_LIKE=arch`) | `pacman` (plus `yay` or `paru` for AUR packages) |
 | **Fedora-based** | Fedora, Nobara, RHEL, CentOS, Rocky Linux, AlmaLinux (and `ID_LIKE=fedora` / `rhel`) | `dnf` |
-| **Debian-based** | Debian, Ubuntu, Pop!\_OS, Linux Mint, KDE neon (and `ID_LIKE=debian` / `ubuntu`) | `apt-get` |
+| **Debian-based** | Debian, Ubuntu (including **Jetson Linux R32 / L4T R32.x**), Pop!\_OS, Linux Mint, KDE neon (and `ID_LIKE=debian` / `ubuntu`) | `apt-get` |
 
 > **Bootloaders:** Kernel command-line parameters (used when BIOS locks runtime PCIe ASPM writes or for `gpu-unlock`) are automatically configured for **Limine** (`/etc/default/limine`), **GRUB** (`/etc/default/grub` via `grub-mkconfig` or `grub2-mkconfig`), or **systemd-boot** (`/etc/kernel/cmdline`).
 
@@ -72,6 +72,12 @@ The script probes your system at startup and enables hardware-specific steps onl
   - LACT (`lactd`) core & VRAM clock offsets
 - **Intel Arc / Integrated GPUs**:
   - Minimum GPU frequency locked to RP0/max (supports both `xe` and `i915` kernel drivers) for SYCL
+- **NVIDIA Jetson (Jetson Linux R32 / L4T R32.x)**:
+  - **Jetson TX2 Series** (`TX2`, `TX2 4GB`, `TX2i`, `TX2 NX` / `tegra186`) auto-detection via device tree & `/etc/nv_tegra_release`
+  - `nvpmodel -m 0` (`MAXN` mode enabling all Denver 2 + Cortex-A57 cores) and `jetson_clocks` persisted via systemd
+  - PWM Fan maximum cooling (`target_pwm=255` via `strata-jetson-fan.service`)
+  - CUDA device access (`video` group for `/dev/nvhost-gpu`)
+  - Kernel 4.9 / Ubuntu 18.04 compatibility (THP `madvise` fallback and `zram-tools` / `zram-config` / `strata-zram.service` with `zstd` → `lz4` → `lzo`)
 
 ### Laptops & OEM Thermal / EC Controls
 - **Generic ACPI Platform Profile** (`performance` mode via `/sys/firmware/acpi/platform_profile` — ThinkPad, IdeaPad, Legion, ASUS, HP, Dell, Acer, AMD PMF)
@@ -86,8 +92,8 @@ The script probes your system at startup and enables hardware-specific steps onl
 - **Server Uptime:** Masks `sleep`, `suspend`, `hibernate`, and `hybrid-sleep` targets, and ignores laptop lid-close suspend
 - **Memory & Realtime:** Grants unlimited `memlock`, `nice -11`, and `rtprio 98` so model weights and KV caches stay pinned in RAM
 - **CPU & PCIe:** Optional CPU `performance` governor / `power-profiles-daemon` and PCIe ASPM `performance` policy
-- **Kernel & Swap:** `sysctl` VM tuning (`vfs_cache_pressure=50`, `dirty_ratio=10`, `zone_reclaim_mode=0`), `ananicy-cpp` / `bpftune` on Arch/CachyOS, `zstd`-compressed `zram` swap, and `irqbalance`
-- **Strata Management:** Installs or updates [Strata](https://github.com/Niko1221/Strata), runs `strata launch`, and sets up `strata.service` from a saved preset
+- **Kernel & Swap:** `sysctl` VM tuning (`vfs_cache_pressure=50`, `dirty_ratio=10`, `zone_reclaim_mode=0`), `ananicy-cpp` / `bpftune` on Arch/CachyOS, `sched_ext` BPF CPU scheduler (`scx_loader` / `scx` with `bpfland`), `zstd`-compressed `zram` swap, and `irqbalance`
+- **Strata Management & Benchmarking:** Installs or updates [Strata](https://github.com/Niko1221/Strata), runs `strata launch`, manages `strata.service` from a saved preset, runs Strata benchmarks with coupled host-option/power tracking, and lets you inspect and restore past benchmark configurations
 
 > **Recommended Specs:** The wizard will warn if your system has under **32 GiB RAM** or under **6 GiB NVIDIA VRAM** (or no dedicated NVIDIA/AMD/Intel Arc GPU), as larger models may not fit in memory, though you can still apply any applicable host optimizations.
 
@@ -95,12 +101,12 @@ The script probes your system at startup and enables hardware-specific steps onl
 
 ## Live Dashboard & Strata Monitoring
 
-The header continuously refreshes every **1 second** without interrupting your input:
+The header continuously refreshes every **1 second** across **all pages** (index, step views, and benchmark history) without interrupting your input:
 
-- **Live System Usage (left):** Color-coded bars for CPU usage + temperature, RAM usage, per-GPU utilization + temperature and VRAM (supports single and multi-GPU NVIDIA/AMD setups), and horizontal `Power:` (`GPU`, `CPU`, and `Sys` watts).
-  - *Tip:* On systems without a PSU or battery hwmon sensor, run with `sudo` (`sudo ~/strata-performance-setup.sh`) so the script can read root-only `intel-rapl` energy counters for `CPU` and `Sys` power.
-- **System Information (right):** OS, kernel, CPU model/threads, RAM capacity/speed/timings, GPU model(s), total VRAM, and NVIDIA power limits.
-- **Strata Block:** Installed Strata version, active serving preset and model, live `tok/s`, and session average `tok/s` (request and token totals).
+- **Live System Usage (left):** Color-coded bars for CPU usage + temperature, RAM usage, per-GPU utilization + temperature and VRAM (supports single/multi-GPU NVIDIA/AMD setups and Jetson Tegra X2 load/`GPU-therm`), and horizontal `Power:` (`GPU`, `CPU`, and `Sys` watts, including Jetson INA3221 `VDD_IN`/`VDD_GPU`/`VDD_CPU` rails).
+  - *Tip:* On x86 systems without a PSU or battery hwmon sensor, run with `sudo` (`sudo ~/strata-performance-setup.sh`) so the script can read root-only `intel-rapl` energy counters for `CPU` and `Sys` power.
+- **System Information (right):** OS, kernel, Jetson board/L4T/SoC (when on Jetson), CPU model/threads, RAM capacity/speed/timings, GPU model(s), total VRAM, and NVIDIA power limits.
+- **Strata & Latest Benchmark Block:** Installed Strata version, live running state & `strata.service` status (polled every 1s), active serving preset and model, live/session average `tok/s`, and the **Latest Benchmark** summary (model, median & average decode/prefill `tok/s`, average power, and check/sanity counts).
 - **Active Update Polling:** Checks for Strata updates in the background every **60 seconds**, displays an `[UPDATE AVAILABLE]` banner on every screen when a new version is found, and lets you press `u` to stop `strata.service`, run `strata update --yes`, restart `strata.service`, and notify you once the model is `[LIVE]` again.
 
 ---
@@ -109,12 +115,13 @@ The header continuously refreshes every **1 second** without interrupting your i
 
 Once launched, the main index lists every optimization applicable to your machine along with its live `[APPLIED]` / `[NOT APPLIED]` status:
 
-- Navigate the index with **`↑` / `↓`** and press **`Enter`** (or type a **step number**) to open a step, or press `w` to walk through the **guided wizard** step by step
+- Navigate the index with **`↑` / `↓`** and press **`Enter`** (or type a **step number** / `s1`–`s5`) to open a step or Strata option, or press `w` to walk through the **guided wizard** step by step
 - Press `a` to **apply all recommended optimizations** for your hardware in one action (with confirmation; excludes Strata setup and minimal-gain/higher-idle-power options like CPU Performance and PCIe ASPM)
 - Press `x` to **revert all recommended optimizations** in one action (with confirmation)
 - Press `u` (when shown) to **install a pending Strata update** and restart `strata.service`
-- Press `r` on the index to **reboot** the system (the wizard also prompts automatically whenever a kernel-parameter change requires a reboot)
+- Press `r` on the index to **reboot** the system (the wizard also prompts automatically whenever applying or reverting a change requires a reboot)
 - Inside any step, press `a` to **apply** (when not yet applied, or to open the Strata Manager menu), `r` to **revert** (when applied), `n` / `b` to move next/back, or `i` / `Esc` to return to the index
+- Open **View All Benchmark Results & Coupled Options** (from Strata Options) to browse full-width tables of all recorded benchmarks with median/average `tok/s`, average system/GPU/CPU power, and a vertical list of active optimizations; use **`↑` / `↓` + `Enter`** (or `[1-N]`) to restore a benchmark's host configuration (with `[y]` Apply / `[N/c/Esc]` Cancel confirmation)
 
 ---
 
@@ -135,6 +142,7 @@ This wizard relies on and integrates with the following open-source projects for
 | **TUXEDO Control Center** | TUXEDO laptop power/cooling daemon (`tccd`) | [tuxedocomputers/tuxedo-control-center](https://github.com/tuxedocomputers/tuxedo-control-center) |
 | **libsmbios** | Dell thermal management CLI (`smbios-thermal-ctl`) | [dell/libsmbios](https://github.com/dell/libsmbios) |
 | **ananicy-cpp** | Automatic process nice/scheduler tuning daemon | [ananicy-cpp/ananicy-cpp](https://gitlab.com/ananicy-cpp/ananicy-cpp) |
+| **sched_ext (`scx`)** | BPF CPU scheduler (`scx_loader` / `scxctl` with `bpfland`) | [sched-ext/scx](https://github.com/sched-ext/scx) |
 | **bpftune** | eBPF-driven automatic Linux kernel & sysctl tuning | [oracle/bpftune](https://github.com/oracle/bpftune) |
 | **irqbalance** | Multi-core hardware IRQ load-balancing daemon | [Irqbalance/irqbalance](https://github.com/Irqbalance/irqbalance) |
 | **zram-generator** | Systemd generator for `zstd`-compressed zram swap (Arch / Fedora) | [systemd/zram-generator](https://github.com/systemd/zram-generator) |
