@@ -9,6 +9,7 @@
 #   - Arch-based (CachyOS, Arch Linux, EndeavourOS, Manjaro)
 #   - Fedora-based (Fedora, Nobara)
 #   - Debian-based (Debian, Ubuntu, Pop!_OS, Linux Mint)
+#   - openSUSE-based (Tumbleweed, Leap, SLE)
 # ==============================================================================
 
 set -uo pipefail
@@ -24,19 +25,25 @@ else
 fi
 
 TARGET_USER="${SUDO_USER:-${USER:-$(id -un)}}"
-TARGET_HOME="$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6 || eval echo "~$TARGET_USER")"
+TARGET_HOME="$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6 || true)"
+[[ -n "$TARGET_HOME" ]] || TARGET_HOME="$HOME"
 STRATA_BIN="" STRATA_VERSION="" STRATA_RUNNING_PRESET="" STRATA_RUNNING_URL=""
 DISTRO_FAMILY="unknown" DISTRO_ID="unknown" OS_PRETTY="" KERNEL_VER="" AUR_HELPER=""
 HAS_NVIDIA=false HAS_NVIDIA_POWERD=false HAS_AMD=false HAS_INTEL_GPU=false HAS_INTEL_ARC=false
 GPU_SUMMARY="" GPU_RAW="" CPU_SUMMARY="" RAM_GB=0 RAM_DETAILS="" NVIDIA_VRAM_MB=0 TOTAL_VRAM_MB=0
 HAS_MSI_EC=false SYS_VENDOR="" PRODUCT_NAME="" IS_LAPTOP=false HAS_ASPM=false
 NVIDIA_DEFAULT_PL="" NVIDIA_MAX_PL="" NVIDIA_CURRENT_PL=""
+NVIDIA_MAX_GFX_CLK="" NVIDIA_MAX_MEM_CLK="" NVIDIA_ECC_CUR="" NVIDIA_ECC_PEND=""
+IS_VIRT="" NUMA_NODES=1 CPU_SOCKETS=1 DISCRETE_GPU_COUNT=0 DMI_MEM_CACHE=""
+declare -a RAM_HEALTH_LINES=() GPU_TOPO_LINES=()
+RYZENADJ_MARKER="/etc/strata-ryzenadj.prev" RAPL_MARKER="/etc/strata-rapl.prev" TUNED_MARKER="/etc/strata-tuned.prev" NUMACTL_MARKER="/etc/strata-numactl.enabled"
+HEADLESS_MARKER="/etc/strata-headless.prev" PSTATE_MARKER="/etc/strata-pstate.prev" GPU_GROUPS_MARKER="/etc/strata-gpu-groups.added"
 REBOOT_REQUIRED=false REBOOT_PROMPT_PENDING=false
 PREV_CPU_TOTAL="" PREV_CPU_IDLE="" PREV_RAPL_UJ="" PREV_RAPL_US="" LIVE_STATS_COUNT=0 POST_HEADER_LINES=0
 declare -a LIVE_STAT_LINES=() SYS_INFO_LINES=() STRATA_STAT_LINES=()
 STRATA_UPDATE_AVAILABLE=false STRATA_UPDATE_SUMMARY="" STRATA_UPDATE_CACHE_FILE="" STRATA_POLLER_PID=""
 UNIT_FILES_CACHE=""
-declare -A PKG_AVAIL_CACHE
+declare -A PKG_AVAIL_CACHE PKG_INST_CACHE
 
 # ------------------------------------------------------------------------------
 # Core Helpers (Privileges, Packages, Services, Bootloader)
@@ -48,9 +55,28 @@ run_root() {
 
 run_as_user() {
   if [[ $EUID -eq 0 && "$TARGET_USER" != "root" ]]; then
-    su - "$TARGET_USER" -c "$*"
+    if command -v runuser >/dev/null 2>&1; then
+      runuser -u "$TARGET_USER" -- bash -c "$*"
+    else
+      su - "$TARGET_USER" -c "$*"
+    fi
   else
     bash -c "$*"
+  fi
+}
+
+# Argument-safe execution as TARGET_USER without extra shell interpolation.
+run_as_user_exec() {
+  if [[ $EUID -eq 0 && "$TARGET_USER" != "root" ]]; then
+    if command -v runuser >/dev/null 2>&1; then
+      runuser -u "$TARGET_USER" -- "$@"
+    else
+      local cmd=""
+      printf -v cmd '%q ' "$@"
+      su - "$TARGET_USER" -c "$cmd"
+    fi
+  else
+    "$@"
   fi
 }
 
@@ -81,12 +107,17 @@ remove_service() {
 }
 
 pkg_installed() {
+  local pkg="$1" rc=1
+  [[ -n "${PKG_INST_CACHE[$pkg]+x}" ]] && return "${PKG_INST_CACHE[$pkg]}"
   case "$DISTRO_FAMILY" in
-    arch)   pacman -Qi "$1" >/dev/null 2>&1 ;;
-    fedora) rpm -q "$1" >/dev/null 2>&1 ;;
-    debian) dpkg -s "$1" >/dev/null 2>&1 ;;
+    arch)   pacman -Qi "$pkg" >/dev/null 2>&1 && rc=0 ;;
+    fedora) rpm -q "$pkg" >/dev/null 2>&1 && rc=0 ;;
+    debian) dpkg -s "$pkg" >/dev/null 2>&1 && rc=0 ;;
+    suse)   rpm -q "$pkg" >/dev/null 2>&1 && rc=0 ;;
     *)      return 1 ;;
   esac
+  PKG_INST_CACHE[$pkg]=$rc
+  return "$rc"
 }
 
 pkg_available() {
@@ -98,13 +129,14 @@ pkg_available() {
     case "$DISTRO_FAMILY" in
       arch)
         if [[ "$mode" == "aur" ]]; then
-          [[ -n "$AUR_HELPER" ]] && run_as_user "$AUR_HELPER -Si '$pkg'" >/dev/null 2>&1 && rc=0
+          [[ -n "$AUR_HELPER" ]] && run_as_user_exec "$AUR_HELPER" -Si "$pkg" >/dev/null 2>&1 && rc=0
         else
           pacman -Si "$pkg" >/dev/null 2>&1 && rc=0
         fi
         ;;
       fedora) [[ "$mode" == "repo" ]] && dnf info --available "$pkg" >/dev/null 2>&1 && rc=0 ;;
       debian) [[ "$mode" == "repo" ]] && apt-cache show "$pkg" >/dev/null 2>&1 && rc=0 ;;
+      suse)   [[ "$mode" == "repo" ]] && zypper --non-interactive info "$pkg" 2>/dev/null | grep -qi "^Repository" && rc=0 ;;
     esac
   fi
   PKG_AVAIL_CACHE[$key]=$rc
@@ -112,12 +144,16 @@ pkg_available() {
 }
 
 pkg_install() {
+  local rc=0
   case "$DISTRO_FAMILY" in
-    arch)   run_root pacman -S --needed --noconfirm "$@" ;;
-    fedora) run_root dnf install -y "$@" ;;
-    debian) run_root apt-get update -qq && run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
+    arch)   run_root pacman -S --needed --noconfirm "$@" || rc=$? ;;
+    fedora) run_root dnf install -y "$@" || rc=$? ;;
+    debian) run_root apt-get update -qq && run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" || rc=$? ;;
+    suse)   run_root zypper --non-interactive install "$@" || rc=$? ;;
     *)      echo -e "${C_RED}Unsupported package manager.${C_RESET}"; return 1 ;;
   esac
+  PKG_INST_CACHE=()
+  return "$rc"
 }
 
 aur_install() {
@@ -125,7 +161,10 @@ aur_install() {
     echo -e "${C_YELLOW}AUR helper (yay/paru) unavailable; please install: $*${C_RESET}"
     return 1
   }
-  run_as_user "$AUR_HELPER -S --needed --noconfirm $*"
+  local rc=0
+  run_as_user_exec "$AUR_HELPER" -S --needed --noconfirm "$@" || rc=$?
+  PKG_INST_CACHE=()
+  return "$rc"
 }
 
 confirm_yn() {
@@ -164,33 +203,104 @@ prompt_install_repo_or_aur() {
   fi
 }
 
+bls_entries_dir() {
+  local d
+  for d in /boot/loader/entries /efi/loader/entries /boot/efi/loader/entries; do
+    compgen -G "$d/*.conf" >/dev/null 2>&1 && { echo "$d"; return 0; }
+  done
+  return 1
+}
+
+_escape_ere() {
+  printf '%s' "$1" | sed 's/[][(){}.+*?^$|\\]/\\&/g'
+}
+
+_file_has_kparam() {
+  local param="$1" file="$2" esc
+  [[ -r "$file" ]] || return 1
+  esc="$(_escape_ere "$param")"
+  grep -v '^[[:space:]]*#' "$file" | grep -Eq "(^|[[:space:]\"'])${esc}([[:space:]\"']|\$)"
+}
+
+_remove_kparam_from_file() {
+  local param="$1" file="$2"
+  [[ -f "$file" ]] || return 0
+  if command -v python3 >/dev/null 2>&1; then
+    run_root python3 - "$file" "$param" <<'PYEOF'
+import re, sys
+p, tok = sys.argv[1], sys.argv[2]
+with open(p) as f:
+    txt = f.read()
+pat = re.compile(r'(?:(?<=^)|(?<=[\s"\']))' + re.escape(tok) + r'(?=$|[\s"\'])')
+out = []
+for ln in txt.splitlines(True):
+    if ln.lstrip().startswith('#'):
+        out.append(ln)
+        continue
+    nl = pat.sub('', ln)
+    if nl != ln:
+        nl = re.sub(r' {2,}', ' ', nl)
+        nl = re.sub(r'=(["\']) ', r'=\1', nl)
+        nl = re.sub(r' (["\'])(?=\s|$)', r'\1', nl)
+    out.append(nl)
+new_txt = ''.join(out)
+if new_txt != txt:
+    with open(p, 'w') as f:
+        f.write(new_txt)
+PYEOF
+  else
+    local esc
+    esc="$(printf '%s' "$param" | sed 's/[.[\*^$()+?{|/\\]/\\&/g')"
+    run_root sed -i -E "/^[[:space:]]*#/!{s/(^|[[:space:]\"'])${esc}([[:space:]\"']|\$)/\1\2/g; s/  +/ /g; s/=\" /=\"/g; s/ \"/\"/g}" "$file"
+  fi
+}
+
 has_kernel_param() {
   local param="$1" f
-  grep -Fqw "$param" /proc/cmdline 2>/dev/null && return 0
-  for f in /etc/default/limine /etc/default/grub /etc/kernel/cmdline; do
-    [[ -r "$f" ]] && grep -v '^[[:space:]]*#' "$f" | grep -Fqw "$param" && return 0
+  _file_has_kparam "$param" /proc/cmdline && return 0
+  for f in /etc/default/limine /etc/default/grub /etc/kernel/cmdline /boot/refind_linux.conf /boot/loader/entries/*.conf /efi/loader/entries/*.conf /boot/efi/loader/entries/*.conf; do
+    _file_has_kparam "$param" "$f" && return 0
   done
   return 1
 }
 
 add_kernel_param() {
-  local param="$1"
-  grep -qw "$param" /proc/cmdline 2>/dev/null && return 0
+  local param="$1" bls_dir
+  _file_has_kparam "$param" /proc/cmdline && return 0
+
+  if [[ "$DISTRO_FAMILY" == "fedora" || "$DISTRO_FAMILY" == "suse" ]] && command -v grubby >/dev/null 2>&1 && [[ ! -f /etc/default/limine ]]; then
+    run_root grubby --update-kernel=ALL --args="$param" || true
+    REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
+    echo -e "${C_GREEN}Added '${param}' via grubby (reboot required).${C_RESET}"
+    return 0
+  fi
 
   if [[ -f /etc/default/limine ]]; then
-    if ! grep -qw "$param" /etc/default/limine; then
+    if ! _file_has_kparam "$param" /etc/default/limine; then
       if grep -qE '^KERNEL_CMDLINE\[default\]\+?="' /etc/default/limine; then
         run_root sed -i "s/\(KERNEL_CMDLINE\[default\]+\{0,1\}=\"[^\"]*\)\"/\1 ${param}\"/" /etc/default/limine
+        run_root sed -i 's/KERNEL_CMDLINE\[default\]\(+\{0,1\}\)=\" /KERNEL_CMDLINE[default]\1=\"/' /etc/default/limine
       else
-        echo "KERNEL_CMDLINE[default]+=\" ${param}\"" | run_root tee -a /etc/default/limine >/dev/null
+        echo "KERNEL_CMDLINE[default]+=\"${param}\"" | run_root tee -a /etc/default/limine >/dev/null
       fi
       command -v limine-mkinitcpio >/dev/null 2>&1 && run_root limine-mkinitcpio || true
     fi
     REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
     echo -e "${C_GREEN}Added '${param}' to /etc/default/limine (reboot required).${C_RESET}"
   elif [[ -f /etc/default/grub ]]; then
-    if ! grep -Fqw "$param" /etc/default/grub; then
-      run_root sed -i "s/\(GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*\)\"/\1 ${param}\"/" /etc/default/grub
+    if ! _file_has_kparam "$param" /etc/default/grub; then
+      if grep -qE '^GRUB_CMDLINE_LINUX_DEFAULT="' /etc/default/grub; then
+        run_root sed -i "s/\(^GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*\)\"/\1 ${param}\"/" /etc/default/grub
+        run_root sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=\" /GRUB_CMDLINE_LINUX_DEFAULT=\"/' /etc/default/grub
+      elif grep -qE "^GRUB_CMDLINE_LINUX_DEFAULT='" /etc/default/grub; then
+        run_root sed -i "s/\(^GRUB_CMDLINE_LINUX_DEFAULT='[^']*\)'/\1 ${param}'/" /etc/default/grub
+        run_root sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=' /GRUB_CMDLINE_LINUX_DEFAULT='/" /etc/default/grub
+      elif grep -qE '^GRUB_CMDLINE_LINUX="' /etc/default/grub; then
+        run_root sed -i "s/\(^GRUB_CMDLINE_LINUX=\"[^\"]*\)\"/\1 ${param}\"/" /etc/default/grub
+        run_root sed -i 's/^GRUB_CMDLINE_LINUX=\" /GRUB_CMDLINE_LINUX=\"/' /etc/default/grub
+      else
+        echo "GRUB_CMDLINE_LINUX_DEFAULT=\"${param}\"" | run_root tee -a /etc/default/grub >/dev/null
+      fi
       if command -v grub-mkconfig >/dev/null 2>&1; then
         run_root grub-mkconfig -o /boot/grub/grub.cfg || true
       elif command -v grub2-mkconfig >/dev/null 2>&1; then
@@ -200,12 +310,30 @@ add_kernel_param() {
     REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
     echo -e "${C_GREEN}Added '${param}' to /etc/default/grub (reboot required).${C_RESET}"
   elif [[ -f /etc/kernel/cmdline ]]; then
-    if ! grep -qw "$param" /etc/kernel/cmdline; then
-      run_root sed -i "s/$/ ${param}/" /etc/kernel/cmdline
+    if ! _file_has_kparam "$param" /etc/kernel/cmdline; then
+      run_root sed -i "s/[[:space:]]*$/ ${param}/; s/^[[:space:]]*//" /etc/kernel/cmdline
       command -v bootctl >/dev/null 2>&1 && run_root bootctl update >/dev/null 2>&1 || true
     fi
     REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
     echo -e "${C_GREEN}Added '${param}' to /etc/kernel/cmdline (reboot required).${C_RESET}"
+  elif bls_dir="$(bls_entries_dir)"; then
+    local f
+    for f in "$bls_dir"/*.conf; do
+      [[ -f "$f" ]] || continue
+      if ! _file_has_kparam "$param" "$f"; then
+        if grep -qE '^options[[:space:]]' "$f"; then
+          run_root sed -i "s/^options .*/& ${param}/" "$f"
+        else
+          echo "options ${param}" | run_root tee -a "$f" >/dev/null
+        fi
+      fi
+    done
+    REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
+    echo -e "${C_GREEN}Added '${param}' to systemd-boot entries in ${bls_dir} (reboot required).${C_RESET}"
+  elif [[ -f /boot/refind_linux.conf ]]; then
+    _file_has_kparam "$param" /boot/refind_linux.conf || run_root sed -i -E "s/\"[[:space:]]*$/ ${param}\"/" /boot/refind_linux.conf
+    REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
+    echo -e "${C_GREEN}Added '${param}' to /boot/refind_linux.conf (reboot required).${C_RESET}"
   else
     REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
     echo -e "${C_YELLOW}Please add '${param}' to your bootloader kernel command line manually.${C_RESET}"
@@ -213,22 +341,32 @@ add_kernel_param() {
 }
 
 remove_kernel_param() {
-  local param="$1" esc
-  esc="$(printf '%s' "$param" | sed 's/[.[\*^$()+?{|]/\\&/g')"
-  if [[ -f /etc/default/limine ]] && grep -qw "$param" /etc/default/limine; then
-    run_root sed -i "s/ *${esc}//g" /etc/default/limine
+  local param="$1"
+  if _file_has_kparam "$param" /etc/default/limine; then
+    _remove_kparam_from_file "$param" /etc/default/limine
     command -v limine-mkinitcpio >/dev/null 2>&1 && run_root limine-mkinitcpio || true
   fi
-  if [[ -f /etc/default/grub ]] && grep -Fqw "$param" /etc/default/grub; then
-    run_root sed -i "s/ *${esc}//g" /etc/default/grub
+  if _file_has_kparam "$param" /etc/default/grub; then
+    _remove_kparam_from_file "$param" /etc/default/grub
     if command -v grub-mkconfig >/dev/null 2>&1; then
       run_root grub-mkconfig -o /boot/grub/grub.cfg || true
     elif command -v grub2-mkconfig >/dev/null 2>&1; then
       run_root grub2-mkconfig -o /boot/grub2/grub.cfg || true
     fi
   fi
-  if [[ -f /etc/kernel/cmdline ]] && grep -qw "$param" /etc/kernel/cmdline; then
-    run_root sed -i "s/ *${esc}//g" /etc/kernel/cmdline
+  if _file_has_kparam "$param" /etc/kernel/cmdline; then
+    _remove_kparam_from_file "$param" /etc/kernel/cmdline
+    command -v bootctl >/dev/null 2>&1 && run_root bootctl update >/dev/null 2>&1 || true
+  fi
+  if [[ "$DISTRO_FAMILY" == "fedora" || "$DISTRO_FAMILY" == "suse" ]] && command -v grubby >/dev/null 2>&1; then
+    run_root grubby --update-kernel=ALL --remove-args="$param" >/dev/null 2>&1 || true
+  fi
+  local ef
+  for ef in /boot/loader/entries/*.conf /efi/loader/entries/*.conf /boot/efi/loader/entries/*.conf; do
+    [[ -f "$ef" ]] && _file_has_kparam "$param" "$ef" && _remove_kparam_from_file "$param" "$ef"
+  done
+  if _file_has_kparam "$param" /boot/refind_linux.conf; then
+    _remove_kparam_from_file "$param" /boot/refind_linux.conf
   fi
 }
 
@@ -282,14 +420,9 @@ for p in glob.glob("/sys/bus/i2c/drivers/ee1004/*/eeprom") + glob.glob("/sys/bus
     fi
   fi
 
-  if [[ -z "$ddr_type" || -z "$ddr_speed" ]] && command -v dmidecode >/dev/null 2>&1; then
-    local dmi_out=""
-    if [[ $EUID -eq 0 ]]; then dmi_out="$(dmidecode -t 17 2>/dev/null || true)"
-    elif sudo -n true >/dev/null 2>&1; then dmi_out="$(sudo -n dmidecode -t 17 2>/dev/null || true)"; fi
-    if [[ -n "$dmi_out" ]]; then
-      [[ -z "$ddr_type" ]] && ddr_type="$(echo "$dmi_out" | awk -F': ' '/^\tType: (DDR|LPDDR)/ {print $2; exit}')"
-      [[ -z "$ddr_speed" ]] && ddr_speed="$(echo "$dmi_out" | awk -F': ' '/^\tConfigured Memory Speed: [0-9]+/ {print $2; exit}' | awk '{print $1}')"
-    fi
+  if [[ -z "$ddr_type" || -z "$ddr_speed" ]] && [[ -n "$DMI_MEM_CACHE" ]]; then
+    [[ -z "$ddr_type" ]] && ddr_type="$(awk -F': ' '/^\tType: (DDR|LPDDR)/ {print $2; exit}' <<<"$DMI_MEM_CACHE")"
+    [[ -z "$ddr_speed" ]] && ddr_speed="$(awk -F': ' '/^\tConfigured Memory Speed: [0-9]+/ {print $2; exit}' <<<"$DMI_MEM_CACHE" | awk '{print $1}')"
   fi
 
   local parts=()
@@ -307,7 +440,7 @@ refresh_strata_bin() {
 
   if [[ -n "$STRATA_BIN" ]]; then
     local raw_ver
-    raw_ver="$(run_as_user "$STRATA_BIN --version 2>/dev/null" | head -n1 || true)"
+    raw_ver="$(run_as_user_exec "$STRATA_BIN" --version 2>/dev/null | head -n1 || true)"
     if [[ -n "$raw_ver" ]]; then
       STRATA_VERSION="$(sed -E 's/^strata[[:space:]]+//; s/; python [^)]*//g' <<< "$raw_ver")"
     else
@@ -323,7 +456,7 @@ refresh_strata_running() {
   STRATA_RUNNING_URL=""
   [[ -n "$STRATA_BIN" ]] || return 0
   local st_json parsed=""
-  st_json="$(run_as_user "$STRATA_BIN launch --status --output json 2>/dev/null" || true)"
+  st_json="$(run_as_user_exec "$STRATA_BIN" launch --status --output json 2>/dev/null || true)"
   if [[ -n "$st_json" ]] && command -v python3 >/dev/null 2>&1; then
     parsed="$(python3 -c '
 import json, sys
@@ -349,6 +482,8 @@ for line in sys.stdin:
 
 detect_environment() {
   UNIT_FILES_CACHE="$(systemctl list-unit-files --no-legend --no-pager 2>/dev/null || true)"
+  IS_VIRT="$(systemd-detect-virt 2>/dev/null || true)"
+  [[ "$IS_VIRT" == "none" ]] && IS_VIRT=""
 
   if [[ -r /etc/os-release ]]; then
     # shellcheck disable=SC1091
@@ -362,6 +497,8 @@ detect_environment() {
       DISTRO_FAMILY="fedora"
     elif [[ "$DISTRO_ID" =~ ^(debian|ubuntu|pop|linuxmint|neon)$ ]] || [[ "$id_like" == *debian* || "$id_like" == *ubuntu* ]]; then
       DISTRO_FAMILY="debian"
+    elif [[ "$DISTRO_ID" =~ ^(opensuse.*|sles|sled|suse)$ ]] || [[ "$id_like" == *suse* ]]; then
+      DISTRO_FAMILY="suse"
     fi
   fi
 
@@ -373,21 +510,29 @@ detect_environment() {
     fi
   fi
 
-  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
-    HAS_NVIDIA=true
-    local raw_cur raw_def raw_max raw_vram
-    raw_cur="$(nvidia-smi --query-gpu=power.limit --format=csv,noheader,nounits 2>/dev/null | head -n1 || true)"
-    raw_def="$(nvidia-smi --query-gpu=power.default_limit --format=csv,noheader,nounits 2>/dev/null | head -n1 || true)"
-    raw_max="$(nvidia-smi --query-gpu=power.max_limit --format=csv,noheader,nounits 2>/dev/null | head -n1 || true)"
-    raw_vram="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -n1 || true)"
-    [[ "$raw_cur" =~ ^[0-9]+(\.[0-9]+)?$ ]] && NVIDIA_CURRENT_PL="$(awk "BEGIN {printf \"%.0f\", $raw_cur}")"
-    [[ "$raw_def" =~ ^[0-9]+(\.[0-9]+)?$ ]] && NVIDIA_DEFAULT_PL="$(awk "BEGIN {printf \"%.0f\", $raw_def}")"
-    [[ "$raw_max" =~ ^[0-9]+(\.[0-9]+)?$ ]] && NVIDIA_MAX_PL="$(awk "BEGIN {printf \"%.0f\", $raw_max}")"
-    [[ "$raw_vram" =~ ^[0-9]+$ ]] && NVIDIA_VRAM_MB="$raw_vram"
-    local nv_vram_sum
-    nv_vram_sum="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | awk '/^[0-9]+$/ {s+=$1} END {print s+0}' || true)"
-    [[ "$nv_vram_sum" =~ ^[0-9]+$ ]] && TOTAL_VRAM_MB=$((TOTAL_VRAM_MB + nv_vram_sum))
-  elif lspci 2>/dev/null | grep -iE "vga|3d|display" | grep -qi "nvidia"; then
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    local nv_q
+    nv_q="$(nvidia-smi --query-gpu=power.limit,power.default_limit,power.max_limit,memory.total --format=csv,noheader,nounits 2>/dev/null || true)"
+    if [[ -n "$nv_q" ]]; then
+      HAS_NVIDIA=true
+      local nv_parsed nv_vram_sum
+      nv_parsed="$(awk -F', *' '
+        NR == 1 {
+          cur = ($1 ~ /^[0-9]+(\.[0-9]+)?$/ ? sprintf("%.0f", $1) : "")
+          def = ($2 ~ /^[0-9]+(\.[0-9]+)?$/ ? sprintf("%.0f", $2) : "")
+          mx  = ($3 ~ /^[0-9]+(\.[0-9]+)?$/ ? sprintf("%.0f", $3) : "")
+          v0  = ($4 ~ /^[0-9]+$/ ? $4 : "")
+        }
+        { if ($4 ~ /^[0-9]+$/) vsum += $4 }
+        END { printf "%s|%s|%s|%s|%d", cur, def, mx, v0, vsum+0 }
+      ' <<<"$nv_q")"
+      IFS='|' read -r NVIDIA_CURRENT_PL NVIDIA_DEFAULT_PL NVIDIA_MAX_PL NVIDIA_VRAM_MB nv_vram_sum <<< "$nv_parsed"
+      [[ "$nv_vram_sum" =~ ^[0-9]+$ ]] && TOTAL_VRAM_MB=$((TOTAL_VRAM_MB + nv_vram_sum))
+      refresh_nvidia_clocks
+      refresh_nvidia_ecc
+    fi
+  fi
+  if [[ "$HAS_NVIDIA" == false ]] && lspci 2>/dev/null | grep -iE "vga|3d|display" | grep -qi "nvidia"; then
     HAS_NVIDIA=true
   fi
 
@@ -410,13 +555,36 @@ detect_environment() {
     echo "$gpu_lines" | grep -qiE "Arc|DG2|Battlemage|Alchemist" && HAS_INTEL_ARC=true
   fi
 
+  if [[ -z "$IS_VIRT" ]] && command -v dmidecode >/dev/null 2>&1; then
+    if [[ $EUID -eq 0 ]]; then DMI_MEM_CACHE="$(dmidecode -t 17 2>/dev/null || true)"
+    elif sudo -n true >/dev/null 2>&1; then DMI_MEM_CACHE="$(sudo -n dmidecode -t 17 2>/dev/null || true)"; fi
+  fi
+
   RAM_GB="$(awk '/MemTotal/ {printf "%.0f", $2/1048576}' /proc/meminfo 2>/dev/null || echo 0)"
   detect_ram_details
+  detect_ram_health
+  detect_gpu_topology
   KERNEL_VER="$(uname -r 2>/dev/null || echo unknown)"
   local cpu_model cpu_threads
   cpu_model="$(awk -F': ' '/^model name/ {print $2; exit}' /proc/cpuinfo 2>/dev/null | sed 's/  */ /g')"
   cpu_threads="$(nproc 2>/dev/null || echo '?')"
+  [[ -z "$cpu_model" ]] && cpu_model="$(lscpu 2>/dev/null | awk -F': +' '/^Model name/ {print $2; exit}')"
   CPU_SUMMARY="${cpu_model:-Unknown CPU} (${cpu_threads} threads)"
+
+  local nd=0 d
+  for d in /sys/devices/system/node/node[0-9]*; do [[ -d "$d" ]] && ((nd++)); done
+  NUMA_NODES=$(( nd > 0 ? nd : 1 ))
+  local sk
+  sk="$(cat /sys/devices/system/cpu/cpu[0-9]*/topology/physical_package_id 2>/dev/null | sort -u | wc -l)"
+  [[ "$sk" =~ ^[0-9]+$ ]] && (( sk > 0 )) || sk="$(lscpu 2>/dev/null | awk -F: '/^Socket\(s\)/ {gsub(/ /,"",$2); print $2}')"
+  CPU_SOCKETS="${sk:-1}"
+
+  local dev cls ven gn=0
+  for dev in /sys/bus/pci/devices/*; do
+    cls="$(cat "$dev/class" 2>/dev/null || true)"; [[ "$cls" == 0x03* ]] || continue
+    ven="$(cat "$dev/vendor" 2>/dev/null || true)"; [[ "$ven" == "0x10de" || "$ven" == "0x1002" ]] && ((gn++))
+  done
+  DISCRETE_GPU_COUNT="$gn"
 
   unit_exists nvidia-powerd.service && HAS_NVIDIA_POWERD=true
   SYS_VENDOR="$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || true)"
@@ -432,29 +600,212 @@ detect_environment() {
 }
 
 # ------------------------------------------------------------------------------
+# Extra Helpers (kernel param values, sysctl snapshots, NVIDIA caches, PCIe diag)
+# ------------------------------------------------------------------------------
+kernel_param_value() {
+  local name="$1" esc f v
+  esc="$(_escape_ere "$name")"
+  v="$(tr ' ' '\n' </proc/cmdline 2>/dev/null | grep -m1 "^${name}=" | cut -d= -f2-)"
+  [[ -n "$v" ]] && { echo "$v"; return 0; }
+  for f in /etc/default/limine /etc/default/grub /etc/kernel/cmdline /boot/refind_linux.conf /boot/loader/entries/*.conf /efi/loader/entries/*.conf /boot/efi/loader/entries/*.conf; do
+    [[ -r "$f" ]] || continue
+    v="$(grep -v '^[[:space:]]*#' "$f" | grep -oE "(^|[[:space:]\"'])${esc}=[^ \"']+" | head -n1 | sed -E 's/^[[:space:]"'\'']+//' | cut -d= -f2-)"
+    [[ -n "$v" ]] && { echo "$v"; return 0; }
+  done
+  return 1
+}
+
+# write_sysctl_with_prev FILE key=value...  (remembers previous runtime values as "# prev" lines)
+write_sysctl_with_prev() {
+  local file="$1"; shift
+  local content="" kv key cur
+  if [[ -f "$file" ]]; then
+    content="$(grep '^# prev ' "$file" 2>/dev/null || true)"
+    [[ -n "$content" ]] && content+=$'\n'
+  else
+    for kv in "$@"; do
+      key="${kv%%=*}"
+      cur="$(sysctl -n "$key" 2>/dev/null | tr '\t' ' ')"
+      [[ -n "$cur" ]] && content+="# prev ${key}=${cur}"$'\n'
+    done
+  fi
+  for kv in "$@"; do content+="${kv%%=*} = ${kv#*=}"$'\n'; done
+  printf '%s' "$content" | run_root tee "$file" >/dev/null
+  run_root sysctl --system >/dev/null 2>&1 || true
+}
+restore_sysctl_prev() {
+  local file="$1" line kv
+  if [[ -f "$file" ]]; then
+    while IFS= read -r line; do
+      kv="${line#\# prev }"
+      run_root sysctl -w "${kv%%=*}=${kv#*=}" >/dev/null 2>&1 || true
+    done < <(grep '^# prev ' "$file" 2>/dev/null || true)
+  fi
+  run_root rm -f "$file"
+}
+
+refresh_nvidia_clocks() {
+  local v
+  v="$(nvidia-smi --query-gpu=clocks.max.graphics --format=csv,noheader,nounits 2>/dev/null | head -n1 | tr -d ' ' || true)"
+  [[ "$v" =~ ^[0-9]+$ ]] && NVIDIA_MAX_GFX_CLK="$v" || NVIDIA_MAX_GFX_CLK=""
+  v="$(nvidia-smi --query-gpu=clocks.max.memory --format=csv,noheader,nounits 2>/dev/null | head -n1 | tr -d ' ' || true)"
+  [[ "$v" =~ ^[0-9]+$ ]] && NVIDIA_MAX_MEM_CLK="$v" || NVIDIA_MAX_MEM_CLK=""
+}
+refresh_nvidia_ecc() {
+  local raw cur pend
+  raw="$(nvidia-smi --query-gpu=ecc.mode.current,ecc.mode.pending --format=csv,noheader 2>/dev/null | head -n1 || true)"
+  cur="$(awk -F', *' '{print $1}' <<<"$raw")"
+  pend="$(awk -F', *' '{print $2}' <<<"$raw")"
+  [[ "$cur" == "Enabled" || "$cur" == "Disabled" ]] && NVIDIA_ECC_CUR="$cur" || NVIDIA_ECC_CUR=""
+  [[ "$pend" == "Enabled" || "$pend" == "Disabled" ]] && NVIDIA_ECC_PEND="$pend" || NVIDIA_ECC_PEND="$NVIDIA_ECC_CUR"
+}
+
+pcie_gen_from_speed() {
+  case "${1%% *}" in
+    2.5) echo 1 ;; 5|5.0) echo 2 ;; 8|8.0) echo 3 ;; 16|16.0) echo 4 ;; 32|32.0) echo 5 ;; 64|64.0) echo 6 ;;
+    *) echo "" ;;
+  esac
+}
+
+detect_ram_health() {
+  RAM_HEALTH_LINES=()
+  [[ -z "$IS_VIRT" && -n "$DMI_MEM_CACHE" ]] || return 0
+  local dimms count=0 type form spd conf slow=""
+  dimms="$(awk 'BEGIN {RS=""; FS="\n"}
+    /Memory Device/ {
+      size=""; type=""; form=""; spd=""; conf=""
+      for (i = 1; i <= NF; i++) {
+        l = $i; sub(/^[ \t]+/, "", l)
+        if (l ~ /^Size:/) size = l
+        else if (l ~ /^Type:/) type = substr(l, 7)
+        else if (l ~ /^Form Factor:/) form = substr(l, 14)
+        else if (l ~ /^Speed:/) { spd = l; gsub(/[^0-9]/, "", spd) }
+        else if (l ~ /^Configured (Memory|Clock) Speed:/) { conf = l; sub(/^[^:]*: */, "", conf); gsub(/[^0-9]/, "", conf) }
+      }
+      if (size != "" && size !~ /No Module/) print type "|" form "|" spd "|" conf
+    }' <<<"$DMI_MEM_CACHE")"
+  [[ -n "$dimms" ]] || return 0
+  while IFS='|' read -r type form spd conf; do
+    ((count++))
+    if [[ "$spd" =~ ^[0-9]+$ && "$conf" =~ ^[0-9]+$ ]] && (( conf > 0 && conf < spd )); then
+      slow="running ${conf} MT/s, rated ${spd} MT/s (enable XMP/EXPO in BIOS)"
+    fi
+  done <<<"$dimms"
+  if (( count == 1 )) && [[ "$type" =~ ^DDR[345]$ && "$form" == *DIMM* ]]; then
+    RAM_HEALTH_LINES+=("$(printf "%bRAM:    %b[!] single DIMM installed (single-channel, halves memory bandwidth)%b" "${C_DIM}" "${C_YELLOW}" "${C_RESET}")")
+  fi
+  if [[ -n "$slow" ]]; then
+    RAM_HEALTH_LINES+=("$(printf "%bRAM:    %b[!] %s%b" "${C_DIM}" "${C_YELLOW}" "$slow" "${C_RESET}")")
+  fi
+}
+
+detect_gpu_topology() {
+  GPU_TOPO_LINES=()
+  local dev cls ven numa n_gpu=0 n_nv=0 nodes=() distinct
+  for dev in /sys/bus/pci/devices/*; do
+    cls="$(cat "$dev/class" 2>/dev/null || true)"
+    [[ "$cls" == 0x03* ]] || continue
+    ven="$(cat "$dev/vendor" 2>/dev/null || true)"
+    [[ "$ven" == "0x10de" || "$ven" == "0x1002" ]] || continue
+    ((n_gpu++))
+    [[ "$ven" == "0x10de" ]] && ((n_nv++))
+    numa="$(cat "$dev/numa_node" 2>/dev/null || true)"
+    [[ "$numa" =~ ^[0-9]+$ ]] && nodes+=("$numa")
+  done
+  (( n_gpu >= 2 )) || return 0
+  if (( ${#nodes[@]} > 1 )); then
+    distinct="$(printf '%s\n' "${nodes[@]}" | sort -u | wc -l)"
+    (( distinct > 1 )) && GPU_TOPO_LINES+=("$(printf "%bMulti-GPU: %b[!] GPUs sit on %s NUMA nodes (cross-socket traffic; keep a model on one node)%b" "${C_DIM}" "${C_YELLOW}" "$distinct" "${C_RESET}")")
+  fi
+  if (( n_nv >= 2 )) && command -v nvidia-smi >/dev/null 2>&1; then
+    if nvidia-smi nvlink -s 2>/dev/null | grep -q "GB/s"; then
+      GPU_TOPO_LINES+=("$(printf "%bMulti-GPU: NVLink active%b" "${C_DIM}" "${C_RESET}")")
+    else
+      GPU_TOPO_LINES+=("$(printf "%bMulti-GPU: no NVLink (GPU-to-GPU traffic uses PCIe)%b" "${C_DIM}" "${C_RESET}")")
+    fi
+  fi
+}
+
+power_daemon_conflict_line() {
+  local active=()
+  unit_active tlp.service && active+=("TLP")
+  unit_active auto-cpufreq.service && active+=("auto-cpufreq")
+  if unit_active tuned.service && unit_active power-profiles-daemon.service; then active+=("tuned+power-profiles-daemon"); fi
+  (( ${#active[@]} > 0 )) || return 0
+  printf "%bPower:  %b[!] %s active (may override governor/EPP set by this tool)%b" "${C_DIM}" "${C_YELLOW}" "${active[*]}" "${C_RESET}"
+}
+
+# Appends one "PCIe:" diagnostic line per discrete/integrated GPU (link width/gen + Resizable BAR).
+append_gpu_pcie_lines() {
+  local dev cls ven cs ms cw mw cg mg addr line rebar max_bar s e f size vt
+  for dev in /sys/bus/pci/devices/*; do
+    cls="$(cat "$dev/class" 2>/dev/null || true)"
+    [[ "$cls" == 0x03* ]] || continue
+    ven="$(cat "$dev/vendor" 2>/dev/null || true)"
+    [[ "$ven" == "0x10de" || "$ven" == "0x1002" || "$ven" == "0x8086" ]] || continue
+    cs="$(cat "$dev/current_link_speed" 2>/dev/null || true)"; ms="$(cat "$dev/max_link_speed" 2>/dev/null || true)"
+    cw="$(cat "$dev/current_link_width" 2>/dev/null || true)"; mw="$(cat "$dev/max_link_width" 2>/dev/null || true)"
+    cg="$(pcie_gen_from_speed "$cs")"; mg="$(pcie_gen_from_speed "$ms")"
+    [[ -n "$cg" && -n "$mg" && "$cw" =~ ^[0-9]+$ && "$mw" =~ ^[0-9]+$ ]] || continue
+    addr="$(basename "$dev")"; addr="${addr#0000:}"
+    line="${addr} Gen${cg} x${cw}"
+    if (( cw < mw )); then
+      line+=" ${C_YELLOW}[!] card supports x${mw}${C_RESET}${C_DIM}"
+    fi
+    (( cg < mg )) && line+=" (max Gen${mg}; may downshift at idle)"
+
+    rebar=""
+    if [[ "$ven" != "0x8086" || "$HAS_INTEL_ARC" == true ]]; then
+      max_bar=0
+      while read -r s e f; do
+        [[ "$s" =~ ^0x[0-9a-fA-F]+$ && "$e" =~ ^0x[0-9a-fA-F]+$ ]] || continue
+        size=$(( e - s + 1 ))
+        (( e > s && size > max_bar )) && max_bar=$size
+      done < "$dev/resource" 2>/dev/null
+      if (( max_bar > 0 )); then
+        vt="$(cat "$dev/mem_info_vram_total" 2>/dev/null || true)"
+        if [[ "$ven" == "0x1002" && "$vt" =~ ^[0-9]+$ ]] && (( vt > 0 )); then
+          (( max_bar * 10 >= vt * 9 )) && rebar=on || rebar=off
+        else
+          (( max_bar > 536870912 )) && rebar=on || rebar=off
+        fi
+      fi
+    fi
+    if [[ "$rebar" == "on" ]]; then
+      line+=" | ReBAR: on"
+    elif [[ "$rebar" == "off" ]]; then
+      line+=" | ${C_YELLOW}[!] ReBAR: off${C_RESET}${C_DIM} (enable Resizable BAR in BIOS)"
+    fi
+    SYS_INFO_LINES+=("$(printf "%bPCIe:   %b%b" "${C_DIM}" "$line" "${C_RESET}")")
+  done
+}
+
+# ------------------------------------------------------------------------------
 # Step Registry
 # ------------------------------------------------------------------------------
 ALL_STEPS=(
-  base_tools prevent_sleep msi_cooling acpi_platform_profile
+  base_tools prevent_sleep headless_target msi_cooling acpi_platform_profile
   asus_perf dell_thermal lenovo_legion system76_perf tuxedo_perf
-  cpu_performance memlock_realtime pcie_aspm
-  nvidia_persistenced nvidia_powerd nvidia_power_limit lact_overclock gpu_unlock
-  amd_gpu_perf intel_gpu_perf
-  sysctl_tuning zram_swap irq_balance strata_manager
+  cpu_performance ryzenadj_tdp intel_rapl intel_thermald amd_x3d_mode intel_pcore_pinning cstate_limit tuned_profile memlock_realtime pcie_aspm iommu_pt gpu_groups
+  nvidia_persistenced nvidia_powerd nvidia_power_limit nvidia_clock_lock nvidia_ecc lact_overclock gpu_unlock
+  amd_gpu_perf amd_apu_memory intel_gpu_perf intel_compute_stack jetson_perf
+  sysctl_tuning nvme_tuning net_tuning zram_swap irq_balance numa_balancing numactl_interleave hugepages_1g scx_scheduler strata_manager
 )
 ACTIVE_STEPS=()
 
+VM_HIDDEN_STEPS=" msi_cooling acpi_platform_profile asus_perf dell_thermal lenovo_legion system76_perf tuxedo_perf cpu_performance cstate_limit pcie_aspm ryzenadj_tdp intel_rapl intel_thermald amd_x3d_mode intel_pcore_pinning tuned_profile jetson_perf "
 build_active_steps() {
   ACTIVE_STEPS=()
   local step
   for step in "${ALL_STEPS[@]}"; do
+    [[ -n "$IS_VIRT" && "$VM_HIDDEN_STEPS" == *" $step "* ]] && continue
     "applicable_${step}" && ACTIVE_STEPS+=("$step")
   done
 }
 
 is_recommended_step() {
   case "$1" in
-    cpu_performance|pcie_aspm|strata_manager) return 1 ;;
+    cpu_performance|pcie_aspm|cstate_limit|nvidia_clock_lock|tuned_profile|hugepages_1g|strata_manager) return 1 ;;
     *) return 0 ;;
   esac
 }
@@ -477,7 +828,7 @@ run_recommended_batch() {
   else
     echo -e "${C_BOLD}Revert Recommended Performance Optimizations${C_RESET}"
   fi
-  echo -e "${C_DIM}Excluded: CPU Performance & PCIe ASPM (minimal gain / higher idle power), Strata setup.${C_RESET}\n"
+  echo -e "${C_DIM}Excluded: CPU Performance, PCIe ASPM, CPU C-State Limit, NVIDIA Clock Lock, tuned profile (minimal gain / higher idle power), 1 GiB hugepages (reserves RAM), Strata setup.${C_RESET}\n"
 
   if [[ ${#targets[@]} -eq 0 ]]; then
     if [[ "$mode" == "apply" ]]; then
@@ -528,6 +879,7 @@ apply_base_tools() {
   case "$DISTRO_FAMILY" in
     arch|fedora) prompt_install_deps repo curl pciutils lm_sensors || return 0 ;;
     debian)      prompt_install_deps repo curl pciutils lm-sensors || return 0 ;;
+    suse)        prompt_install_deps repo curl pciutils sensors || return 0 ;;
   esac
   command -v sensors-detect >/dev/null 2>&1 && run_root sensors-detect --auto >/dev/null 2>&1 || true
 }
@@ -685,6 +1037,7 @@ apply_dell_thermal() {
       arch)   prompt_install_deps repo libsmbios || return 0 ;;
       fedora) prompt_install_deps repo smbios-utils || prompt_install_deps repo libsmbios || return 0 ;;
       debian) prompt_install_deps repo smbios-utils || return 0 ;;
+      suse)   prompt_install_deps repo smbios-utils-bin || prompt_install_deps repo libsmbios || return 0 ;;
     esac
   fi
   run_root smbios-thermal-ctl --set-thermal-mode=performance 2>/dev/null || true
@@ -720,9 +1073,9 @@ apply_system76_perf() {
 }
 revert_system76_perf() { command -v system76-power >/dev/null 2>&1 && run_root system76-power profile balanced 2>/dev/null || true; }
 
-# 3g. TUXEDO
+# 3g. TUXEDO / Clevo / XMG / Schenker
 applicable_tuxedo_perf() {
-  grep -qi "TUXEDO" <<< "$SYS_VENDOR" || return 1
+  grep -qiE "TUXEDO|XMG|SCHENKER|CLEVO|TONGFANG" <<< "${SYS_VENDOR} ${PRODUCT_NAME}" || return 1
   unit_exists tccd.service || pkg_available repo tuxedo-control-center || pkg_available aur tuxedo-control-center-bin
 }
 title_tuxedo_perf() { echo "TUXEDO Control Center Fan & TDP Daemon (tccd)"; }
@@ -749,20 +1102,32 @@ explain_cpu_performance() {
 Impact:
   Sets power-profiles-daemon to 'performance', enables CPU boost, and forces
   scaling_governor='performance' (slightly faster ramp-up from idle).
+  Also switches amd_pstate / intel_pstate to 'active' mode (when present) so the
+  hardware EPP hint ('performance') is honored.
 EOF
   echo -e "\n${C_YELLOW}[WARNING] Enabling this option increases idle power consumption (often +5-10W)${C_RESET}"
   echo -e "${C_YELLOW}          and hardly provides any sustained performance gains over 'powersave'${C_RESET}"
   echo -e "${C_YELLOW}          when EPP (energy_performance_preference) is already 'performance'.${C_RESET}"
 }
 apply_cpu_performance() {
+  if unit_active tlp.service || unit_active auto-cpufreq.service; then
+    echo -e "${C_YELLOW}TLP/auto-cpufreq is active and may override the governor/EPP set here; consider disabling it.${C_RESET}"
+  fi
   if ! command -v cpupower >/dev/null 2>&1; then
     case "$DISTRO_FAMILY" in
       arch)   prompt_install_deps repo cpupower || true ;;
       fedora) prompt_install_deps repo kernel-tools || true ;;
       debian) prompt_install_deps repo linux-cpupower || true ;;
+      suse)   prompt_install_deps repo cpupower || true ;;
     esac
   fi
   command -v powerprofilesctl >/dev/null 2>&1 && powerprofilesctl set performance 2>/dev/null || true
+  if [[ ! -f "$PSTATE_MARKER" ]]; then
+    local pf
+    for pf in /sys/devices/system/cpu/amd_pstate/status /sys/devices/system/cpu/intel_pstate/status; do
+      [[ -r "$pf" ]] && echo "${pf}=$(cat "$pf")"
+    done | run_root tee "$PSTATE_MARKER" >/dev/null
+  fi
   install_service strata-cpu-perf.service <<'EOF'
 [Unit]
 Description=Set CPU Governor and Power Profile to Performance
@@ -771,7 +1136,7 @@ After=multi-user.target power-profiles-daemon.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c 'command -v powerprofilesctl >/dev/null 2>&1 && powerprofilesctl set performance || true; [ -w /sys/devices/system/cpu/cpufreq/boost ] && echo 1 > /sys/devices/system/cpu/cpufreq/boost || true; for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -w "$g" ] && echo performance > "$g"; done; for e in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do [ -w "$e" ] && echo performance > "$e"; done'
+ExecStart=/bin/sh -c 'command -v powerprofilesctl >/dev/null 2>&1 && powerprofilesctl set performance || true; [ -w /sys/devices/system/cpu/cpufreq/boost ] && echo 1 > /sys/devices/system/cpu/cpufreq/boost || true; for p in /sys/devices/system/cpu/amd_pstate/status /sys/devices/system/cpu/intel_pstate/status; do [ -w "$p" ] && echo active > "$p"; done; for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -w "$g" ] && echo performance > "$g"; done; for e in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do [ -w "$e" ] && echo performance > "$e"; done; true'
 
 [Install]
 WantedBy=multi-user.target
@@ -779,6 +1144,13 @@ EOF
 }
 revert_cpu_performance() {
   remove_service strata-cpu-perf.service
+  if [[ -f "$PSTATE_MARKER" ]]; then
+    local pf pm
+    while IFS='=' read -r pf pm; do
+      [[ -n "$pf" && -n "$pm" && -w "$pf" ]] && echo "$pm" | run_root tee "$pf" >/dev/null 2>&1
+    done < "$PSTATE_MARKER"
+    run_root rm -f "$PSTATE_MARKER"
+  fi
   command -v powerprofilesctl >/dev/null 2>&1 && powerprofilesctl set balanced 2>/dev/null || true
   run_root sh -c 'for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -w "$g" ] && echo powersave > "$g"; done' 2>/dev/null || true
 }
@@ -919,7 +1291,8 @@ explain_lact_overclock() {
 Impact:
   Installs/enables LACT (lactd) and applies GPU core & VRAM clock offsets
   (e.g. +135 MHz core, +1000 MHz VRAM). Higher VRAM bandwidth directly speeds
-  up LLM token generation.
+  up LLM token generation. On AMD GPUs it also adds the bootloader parameter
+  'amdgpu.ppfeaturemask=0xffffffff' (reboot) to unlock clock/power controls.
 EOF
 }
 apply_lact_overclock() {
@@ -928,6 +1301,7 @@ apply_lact_overclock() {
       arch)   prompt_install_repo_or_aur lact || return 0 ;;
       fedora) prompt_install_deps repo lact || return 0 ;;
       debian) prompt_install_deps repo lact || return 0 ;;
+      suse)   prompt_install_deps repo lact || return 0 ;;
     esac
   fi
   if ! python3 -c "import yaml" >/dev/null 2>&1; then
@@ -935,10 +1309,14 @@ apply_lact_overclock() {
       arch)   prompt_install_deps repo python-yaml || true ;;
       fedora) prompt_install_deps repo python3-pyyaml || true ;;
       debian) prompt_install_deps repo python3-yaml || true ;;
+      suse)   prompt_install_deps repo python3-PyYAML || true ;;
     esac
   fi
 
   run_root systemctl enable --now lactd.service 2>/dev/null || true
+  if [[ "$HAS_AMD" == true ]] && compgen -G "/sys/class/drm/card*/device/power_dpm_force_performance_level" >/dev/null 2>&1; then
+    add_kernel_param "amdgpu.ppfeaturemask=0xffffffff"
+  fi
   sleep 1
 
   local core_off="135" mem_off="1000" in_core in_mem
@@ -953,21 +1331,21 @@ apply_lact_overclock() {
 
   if [[ -f /etc/lact/config.yaml ]]; then
     run_root cp -n /etc/lact/config.yaml /etc/lact/config.yaml.bak.strata-setup 2>/dev/null || true
-    if run_root python3 -c "
+    if run_root python3 -c '
 import sys, yaml
-p = '/etc/lact/config.yaml'
+p = "/etc/lact/config.yaml"
 with open(p) as f: d = yaml.safe_load(f) or {}
-gpus = d.get('gpus') or {}
+gpus = d.get("gpus") or {}
 if not gpus: sys.exit(1)
 gpu_id = next(iter(gpus))
 g = gpus[gpu_id] if isinstance(gpus[gpu_id], dict) else {}
-g['gpu_clock_offsets'] = {0: int('$core_off')}
-g['mem_clock_offsets'] = {0: int('$mem_off')}
-g.setdefault('power_mizer_mode', 'Adaptive')
+g["gpu_clock_offsets"] = {0: int(sys.argv[1])}
+g["mem_clock_offsets"] = {0: int(sys.argv[2])}
+g.setdefault("power_mizer_mode", "Adaptive")
 gpus[gpu_id] = g
-d['gpus'] = gpus
-with open(p, 'w') as f: yaml.safe_dump(d, f, sort_keys=False)
-" 2>/dev/null; then
+d["gpus"] = gpus
+with open(p, "w") as f: yaml.safe_dump(d, f, sort_keys=False)
+' "$core_off" "$mem_off" 2>/dev/null; then
       run_root systemctl restart lactd.service
     else
       echo -e "${C_YELLOW}Could not auto-edit /etc/lact/config.yaml; configure in LACT GUI.${C_RESET}"
@@ -975,6 +1353,7 @@ with open(p, 'w') as f: yaml.safe_dump(d, f, sort_keys=False)
   fi
 }
 revert_lact_overclock() {
+  [[ "$HAS_AMD" == true ]] && remove_kernel_param "amdgpu.ppfeaturemask=0xffffffff"
   if [[ -f /etc/lact/config.yaml.bak.strata-setup ]]; then
     run_root mv -f /etc/lact/config.yaml.bak.strata-setup /etc/lact/config.yaml
     run_root systemctl restart lactd.service 2>/dev/null || true
@@ -1030,8 +1409,8 @@ After=multi-user.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c 'for f in /sys/class/drm/card*/device/power_dpm_force_performance_level; do [ -w "$f" ] && echo high > "$f"; done'
-ExecStop=/bin/sh -c 'for f in /sys/class/drm/card*/device/power_dpm_force_performance_level; do [ -w "$f" ] && echo auto > "$f"; done'
+ExecStart=/bin/sh -c 'for f in /sys/class/drm/card*/device/power_dpm_force_performance_level; do [ -w "$f" ] && echo high > "$f"; done; true'
+ExecStop=/bin/sh -c 'for f in /sys/class/drm/card*/device/power_dpm_force_performance_level; do [ -w "$f" ] && echo auto > "$f"; done; true'
 
 [Install]
 WantedBy=multi-user.target
@@ -1059,8 +1438,8 @@ After=multi-user.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c 'for d in /sys/class/drm/card*; do [ -w "$d/gt_min_freq_mhz" ] && [ -r "$d/gt_max_freq_mhz" ] && cat "$d/gt_max_freq_mhz" > "$d/gt_min_freq_mhz"; done; for f in /sys/class/drm/card*/device/tile*/gt*/freq*; do [ -w "$f/min_freq" ] && [ -r "$f/rp0_freq" ] && cat "$f/rp0_freq" > "$f/min_freq"; done'
-ExecStop=/bin/sh -c 'for d in /sys/class/drm/card*; do [ -w "$d/gt_min_freq_mhz" ] && [ -r "$d/gt_RPn_freq_mhz" ] && cat "$d/gt_RPn_freq_mhz" > "$d/gt_min_freq_mhz"; done; for f in /sys/class/drm/card*/device/tile*/gt*/freq*; do [ -w "$f/min_freq" ] && [ -r "$f/rpn_freq" ] && cat "$f/rpn_freq" > "$f/min_freq"; done'
+ExecStart=/bin/sh -c 'for d in /sys/class/drm/card*; do [ -w "$d/gt_min_freq_mhz" ] && [ -r "$d/gt_max_freq_mhz" ] && cat "$d/gt_max_freq_mhz" > "$d/gt_min_freq_mhz"; done; for f in /sys/class/drm/card*/device/tile*/gt*/freq*; do [ -w "$f/min_freq" ] && [ -r "$f/rp0_freq" ] && cat "$f/rp0_freq" > "$f/min_freq"; done; true'
+ExecStop=/bin/sh -c 'for d in /sys/class/drm/card*; do [ -w "$d/gt_min_freq_mhz" ] && [ -r "$d/gt_RPn_freq_mhz" ] && cat "$d/gt_RPn_freq_mhz" > "$d/gt_min_freq_mhz"; done; for f in /sys/class/drm/card*/device/tile*/gt*/freq*; do [ -w "$f/min_freq" ] && [ -r "$f/rpn_freq" ] && cat "$f/rpn_freq" > "$f/min_freq"; done; true'
 
 [Install]
 WantedBy=multi-user.target
@@ -1073,16 +1452,55 @@ revert_intel_gpu_perf() {
 
 # 12. Sysctl & Scheduler
 applicable_sysctl_tuning() { return 0; }
-title_sysctl_tuning() { echo "Kernel VM, Sysctl & Auto-Nice Tuning (ananicy-cpp / bpftune / sysctl)"; }
-status_sysctl_tuning() { [[ -f /etc/sysctl.d/99-strata-perf.conf ]]; }
-explain_sysctl_tuning() { echo -e "Impact:\n  Applies vm.vfs_cache_pressure=50, vm.dirty_ratio=10, vm.zone_reclaim_mode=0,\n  and enables ananicy-cpp / bpftune on Arch/CachyOS if available."; }
+title_sysctl_tuning() { echo "Kernel VM, Sysctl, THP & Auto-Nice Tuning (ananicy-cpp / bpftune / sysctl)"; }
+strata_swappiness_value() { if status_zram_swap; then echo 100; else echo 10; fi; }
+write_swappiness_conf() {
+  local v
+  v="$(strata_swappiness_value)"
+  printf 'vm.swappiness = %s\n' "$v" | run_root tee /etc/sysctl.d/99-strata-swappiness.conf >/dev/null
+  run_root sysctl -w "vm.swappiness=${v}" >/dev/null 2>&1 || true
+}
+thp_supported() { [[ -e /sys/kernel/mm/transparent_hugepage/enabled ]]; }
+status_sysctl_tuning() {
+  [[ -f /etc/sysctl.d/99-strata-perf.conf ]] && grep -q max_map_count /etc/sysctl.d/99-strata-perf.conf 2>/dev/null || return 1
+  [[ -f /etc/sysctl.d/99-strata-swappiness.conf ]] || return 1
+  if thp_supported; then [[ -f /etc/tmpfiles.d/99-strata-thp.conf ]] || return 1; fi
+  return 0
+}
+explain_sysctl_tuning() {
+  echo -e "Impact:\n  Applies vm.vfs_cache_pressure=50, vm.dirty_ratio=10, vm.zone_reclaim_mode=0,\n  vm.max_map_count>=1048576 (large mmap'd models / CUDA / ROCm),\n  vm.swappiness (100 with zram swap, 10 without), Transparent Huge Pages\n  (enabled=always, defrag=defer+madvise; fewer TLB misses on big weights),\n  and enables ananicy-cpp / bpftune on Arch/CachyOS if available."
+}
 apply_sysctl_tuning() {
-  run_root tee /etc/sysctl.d/99-strata-perf.conf >/dev/null <<'EOF'
+  local cur_map
+  cur_map="$(sysctl -n vm.max_map_count 2>/dev/null || echo 0)"
+  [[ "$cur_map" =~ ^[0-9]+$ ]] || cur_map=0
+  (( cur_map < 1048576 )) && cur_map=1048576
+  run_root tee /etc/sysctl.d/99-strata-perf.conf >/dev/null <<EOF2
 vm.vfs_cache_pressure = 50
 vm.dirty_ratio = 10
 vm.zone_reclaim_mode = 0
-EOF
+vm.max_map_count = ${cur_map}
+EOF2
+  write_swappiness_conf
   run_root sysctl --system >/dev/null 2>&1 || true
+  if thp_supported; then
+    local en=/sys/kernel/mm/transparent_hugepage/enabled df=/sys/kernel/mm/transparent_hugepage/defrag prev_en prev_df
+    if [[ -f /etc/tmpfiles.d/99-strata-thp.conf ]]; then
+      prev_en="$(sed -nE 's/^# prev_enabled=([^ ]+).*/\1/p' /etc/tmpfiles.d/99-strata-thp.conf)"
+      prev_df="$(sed -nE 's/^# prev_enabled=[^ ]+ prev_defrag=([^ ]+).*/\1/p' /etc/tmpfiles.d/99-strata-thp.conf)"
+    else
+      prev_en="$(sed -E 's/.*\[([a-z+_]+)\].*/\1/' "$en" 2>/dev/null)"
+      prev_df="$(sed -E 's/.*\[([a-z+_]+)\].*/\1/' "$df" 2>/dev/null)"
+    fi
+    run_root mkdir -p /etc/tmpfiles.d
+    run_root tee /etc/tmpfiles.d/99-strata-thp.conf >/dev/null <<EOF2
+# prev_enabled=${prev_en:-madvise} prev_defrag=${prev_df:-madvise}
+w /sys/kernel/mm/transparent_hugepage/enabled - - - - always
+w /sys/kernel/mm/transparent_hugepage/defrag - - - - defer+madvise
+EOF2
+    echo always | run_root tee "$en" >/dev/null 2>&1 || true
+    echo defer+madvise | run_root tee "$df" >/dev/null 2>&1 || true
+  fi
   if [[ "$DISTRO_FAMILY" == "arch" ]]; then
     local svc
     for svc in ananicy-cpp.service bpftune.service; do
@@ -1091,7 +1509,16 @@ EOF
   fi
 }
 revert_sysctl_tuning() {
-  run_root rm -f /etc/sysctl.d/99-strata-perf.conf
+  run_root rm -f /etc/sysctl.d/99-strata-perf.conf /etc/sysctl.d/99-strata-swappiness.conf
+  run_root sysctl -w vm.swappiness=60 >/dev/null 2>&1 || true
+  if [[ -f /etc/tmpfiles.d/99-strata-thp.conf ]]; then
+    local prev_en prev_df
+    prev_en="$(sed -nE 's/^# prev_enabled=([^ ]+).*/\1/p' /etc/tmpfiles.d/99-strata-thp.conf)"
+    prev_df="$(sed -nE 's/^# prev_enabled=[^ ]+ prev_defrag=([^ ]+).*/\1/p' /etc/tmpfiles.d/99-strata-thp.conf)"
+    [[ -n "$prev_en" ]] && echo "$prev_en" | run_root tee /sys/kernel/mm/transparent_hugepage/enabled >/dev/null 2>&1
+    [[ -n "$prev_df" ]] && echo "$prev_df" | run_root tee /sys/kernel/mm/transparent_hugepage/defrag >/dev/null 2>&1
+    run_root rm -f /etc/tmpfiles.d/99-strata-thp.conf
+  fi
   run_root sysctl --system >/dev/null 2>&1 || true
 }
 
@@ -1102,16 +1529,17 @@ applicable_zram_swap() {
     arch)   pkg_available repo zram-generator ;;
     fedora) pkg_available repo zram-generator-defaults || pkg_available repo zram-generator ;;
     debian) pkg_available repo zram-tools ;;
+    suse)   pkg_available repo zram-generator ;;
     *)      return 1 ;;
   esac
 }
 title_zram_swap() { echo "Compressed zram Swap (zstd) for Large Model Safety"; }
 status_zram_swap() { swapon --show=NAME --noheadings 2>/dev/null | grep -q "zram"; }
-explain_zram_swap() { echo -e "Impact:\n  Enables zstd-compressed RAM swap (/dev/zram0) to prevent OOM crashes on\n  large models without slow NVMe swap thrashing."; }
+explain_zram_swap() { echo -e "Impact:\n  Enables zstd-compressed RAM swap (/dev/zram0) to prevent OOM crashes on\n  large models without slow NVMe swap thrashing, and raises vm.swappiness to 100\n  (zram swap is faster than evicting page cache)."; }
 apply_zram_swap() {
   status_zram_swap && { echo -e "${C_GREEN}zram swap is already active.${C_RESET}"; return 0; }
   case "$DISTRO_FAMILY" in
-    arch)
+    arch|suse)
       prompt_install_deps repo zram-generator || return 0
       run_root tee /etc/systemd/zram-generator.conf >/dev/null <<'EOF'
 [zram0]
@@ -1138,10 +1566,11 @@ EOF
       run_root systemctl enable --now zramswap.service
       ;;
   esac
+  write_swappiness_conf
 }
 revert_zram_swap() {
   case "$DISTRO_FAMILY" in
-    arch|fedora)
+    arch|fedora|suse)
       if [[ -f /etc/systemd/zram-generator.conf ]]; then
         run_root systemctl stop systemd-zram-setup@zram0.service 2>/dev/null || true
         run_root rm -f /etc/systemd/zram-generator.conf
@@ -1155,6 +1584,7 @@ revert_zram_swap() {
       [[ -f /etc/default/zramswap.bak.strata-setup ]] && run_root mv -f /etc/default/zramswap.bak.strata-setup /etc/default/zramswap
       ;;
   esac
+  [[ -f /etc/sysctl.d/99-strata-swappiness.conf ]] && write_swappiness_conf
 }
 
 # 12c. IRQ Balance
@@ -1168,6 +1598,801 @@ apply_irq_balance() {
 }
 revert_irq_balance() { run_root systemctl disable --now irqbalance.service 2>/dev/null || true; }
 
+# 12d. NUMA Balancing
+numa_node_count() { echo "${NUMA_NODES:-1}"; }
+cpu_socket_count() { echo "${CPU_SOCKETS:-1}"; }
+applicable_numa_balancing() {
+  [[ -e /proc/sys/kernel/numa_balancing ]] || return 1
+  (( $(numa_node_count) > 1 || $(cpu_socket_count) > 1 ))
+}
+title_numa_balancing() { echo "Disable Automatic NUMA Balancing ($(cpu_socket_count) socket(s), $(numa_node_count) NUMA nodes)"; }
+status_numa_balancing() {
+  [[ -f /etc/sysctl.d/99-strata-numa.conf ]] && [[ "$(cat /proc/sys/kernel/numa_balancing 2>/dev/null)" == "0" ]]
+}
+explain_numa_balancing() {
+  echo -e "Impact:\n  Sets kernel.numa_balancing=0 (persistent via /etc/sysctl.d/99-strata-numa.conf).\n  Stops the kernel from periodically unmapping pages to migrate them between NUMA\n  nodes, which causes page-fault stalls and jitter for large, pinned model memory."
+}
+apply_numa_balancing() {
+  run_root tee /etc/sysctl.d/99-strata-numa.conf >/dev/null <<'EOF2'
+kernel.numa_balancing = 0
+EOF2
+  run_root sysctl -w kernel.numa_balancing=0 >/dev/null 2>&1 || true
+  run_root sysctl --system >/dev/null 2>&1 || true
+}
+revert_numa_balancing() {
+  run_root rm -f /etc/sysctl.d/99-strata-numa.conf
+  run_root sysctl -w kernel.numa_balancing=1 >/dev/null 2>&1 || true
+  run_root sysctl --system >/dev/null 2>&1 || true
+}
+
+# 12e. Headless Boot Target
+applicable_headless_target() {
+  [[ -f "$HEADLESS_MARKER" ]] && return 0
+  [[ "$IS_LAPTOP" == true ]] && return 1
+  [[ "$(systemctl get-default 2>/dev/null)" == "graphical.target" ]] || return 1
+  unit_enabled display-manager.service || unit_active display-manager.service
+}
+title_headless_target() { echo "Headless Boot Target (stop desktop / display manager, free VRAM & RAM)"; }
+status_headless_target() { [[ "$(systemctl get-default 2>/dev/null)" == "multi-user.target" ]]; }
+explain_headless_target() {
+  cat <<'EOF'
+Impact:
+  Sets the default boot target to multi-user.target so the display manager and
+  desktop session no longer start. This frees several hundred MB of VRAM and RAM
+  for models. Over SSH the desktop is stopped immediately; from a local desktop
+  session the change applies on next boot (reboot prompt). Revert restores the
+  previous default target. Only offered on non-laptop machines using a desktop.
+EOF
+}
+apply_headless_target() {
+  local prev
+  prev="$(systemctl get-default 2>/dev/null)"
+  if [[ -n "$prev" && "$prev" != "multi-user.target" ]]; then
+    echo "$prev" | run_root tee "$HEADLESS_MARKER" >/dev/null
+  fi
+  run_root systemctl set-default multi-user.target
+  local remote=false local_gui=false
+  [[ -n "${SSH_CONNECTION:-}${SSH_CLIENT:-}${SSH_TTY:-}" ]] && remote=true
+  if [[ -n "${XDG_SESSION_ID:-}" ]] && [[ "$(loginctl show-session "$XDG_SESSION_ID" -p Remote --value 2>/dev/null)" == "yes" ]]; then
+    remote=true
+  fi
+  if [[ "$remote" == false ]]; then
+    if [[ "${XDG_SESSION_TYPE:-}" =~ ^(x11|wayland)$ || -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+      local_gui=true
+    elif [[ "$(tty 2>/dev/null || true)" == /dev/pts/* ]] && unit_active display-manager.service; then
+      local_gui=true
+    fi
+  fi
+  if [[ "$local_gui" == true ]]; then
+    echo -e "${C_YELLOW}Running inside a local desktop session; the desktop will stop on next boot.${C_RESET}"
+    REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
+  else
+    run_root systemctl isolate multi-user.target || true
+  fi
+}
+revert_headless_target() {
+  local prev="graphical.target"
+  [[ -f "$HEADLESS_MARKER" ]] && prev="$(cat "$HEADLESS_MARKER" 2>/dev/null)"
+  [[ -n "$prev" ]] || prev="graphical.target"
+  run_root systemctl set-default "$prev"
+  run_root rm -f "$HEADLESS_MARKER"
+  echo -e "${C_GREEN}Default target restored to ${prev} (applies on next boot).${C_RESET}"
+}
+
+# 12f. CPU C-State Limit
+cstate_limit_service_installed() { [[ -f /etc/systemd/system/strata-cstate-limit.service ]]; }
+applicable_cstate_limit() {
+  cstate_limit_service_installed && return 0
+  local f lat
+  for f in /sys/devices/system/cpu/cpu0/cpuidle/state*/latency; do
+    [[ -r "$f" ]] || continue
+    lat="$(cat "$f" 2>/dev/null)"
+    [[ "$lat" =~ ^[0-9]+$ ]] && (( lat > 10 )) && return 0
+  done
+  return 1
+}
+title_cstate_limit() { echo "CPU Deep C-State Limit (lowest wake-up latency, C1 only)"; }
+note_cstate_limit() { echo -e "${C_YELLOW}[!] Higher idle power, minimal gain${C_RESET}"; }
+status_cstate_limit() { cstate_limit_service_installed && unit_enabled strata-cstate-limit.service; }
+explain_cstate_limit() {
+  cat <<'EOF'
+Impact:
+  Disables CPU idle states with an exit latency above 10 us (deep C-states) on
+  all cores via a systemd service, so cores wake instantly when tokens/requests
+  arrive (lower latency jitter for CPU-offloaded layers).
+EOF
+  echo -e "\n${C_YELLOW}[WARNING] Keeping cores out of deep sleep increases idle power consumption${C_RESET}"
+  echo -e "${C_YELLOW}          and hardly provides sustained performance gains for GPU-bound inference.${C_RESET}"
+}
+apply_cstate_limit() {
+  install_service strata-cstate-limit.service <<'EOF'
+[Unit]
+Description=Limit CPU Deep C-States for Strata Low-Latency Inference
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'for s in /sys/devices/system/cpu/cpu*/cpuidle/state*; do [ -w "$s/disable" ] && [ "$(cat "$s/latency")" -gt 10 ] && echo 1 > "$s/disable"; done; true'
+ExecStop=/bin/sh -c 'for s in /sys/devices/system/cpu/cpu*/cpuidle/state*; do [ -w "$s/disable" ] && echo 0 > "$s/disable"; done; true'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+revert_cstate_limit() {
+  remove_service strata-cstate-limit.service
+  run_root sh -c 'for s in /sys/devices/system/cpu/cpu*/cpuidle/state*; do [ -w "$s/disable" ] && echo 0 > "$s/disable"; done; true' 2>/dev/null || true
+}
+
+# 12g. GPU Device Access Groups
+gpu_missing_groups() {
+  local g
+  for g in render video; do
+    getent group "$g" >/dev/null 2>&1 || continue
+    id -nG "$TARGET_USER" 2>/dev/null | tr ' ' '\n' | grep -qx "$g" || echo "$g"
+  done
+}
+applicable_gpu_groups() {
+  [[ "$TARGET_USER" != "root" ]] || return 1
+  compgen -G "/dev/dri/renderD*" >/dev/null 2>&1 || [[ -e /dev/kfd ]] || return 1
+  getent group render >/dev/null 2>&1 || getent group video >/dev/null 2>&1
+}
+title_gpu_groups() { echo "GPU Device Access Groups (render / video for ROCm, Intel Arc, Vulkan)"; }
+status_gpu_groups() { [[ -z "$(gpu_missing_groups)" ]]; }
+explain_gpu_groups() {
+  cat <<'EOF'
+Impact:
+  Adds your user to the 'render' and 'video' groups (when missing) so ROCm/HIP,
+  Intel SYCL/Level Zero and Vulkan can open /dev/dri/render* and /dev/kfd.
+  Prevents 'GPU not found' / silent CPU fallback. Requires re-login to take effect.
+EOF
+}
+apply_gpu_groups() {
+  local g added=()
+  for g in $(gpu_missing_groups); do
+    run_root usermod -aG "$g" "$TARGET_USER" && added+=("$g")
+  done
+  if (( ${#added[@]} > 0 )); then
+    printf '%s\n' "${added[@]}" | run_root tee -a "$GPU_GROUPS_MARKER" >/dev/null
+    echo -e "${C_GREEN}Added ${TARGET_USER} to: ${added[*]} (log out and back in to apply).${C_RESET}"
+  fi
+}
+revert_gpu_groups() {
+  local g
+  if [[ -f "$GPU_GROUPS_MARKER" ]]; then
+    while IFS= read -r g; do
+      [[ -n "$g" ]] && run_root gpasswd -d "$TARGET_USER" "$g" >/dev/null 2>&1 || true
+    done < "$GPU_GROUPS_MARKER"
+    run_root rm -f "$GPU_GROUPS_MARKER"
+  else
+    echo -e "${C_YELLOW}Group memberships were not added by this script; leaving them intact.${C_RESET}"
+  fi
+}
+
+# 12h. NVIDIA Clock Lock
+applicable_nvidia_clock_lock() { [[ "$HAS_NVIDIA" == true && -n "$NVIDIA_MAX_GFX_CLK" ]]; }
+title_nvidia_clock_lock() { echo "NVIDIA Lock GPU Clocks at Maximum (${NVIDIA_MAX_GFX_CLK} MHz core)"; }
+note_nvidia_clock_lock() { echo -e "${C_YELLOW}[!] Higher idle power, minimal gain${C_RESET}"; }
+status_nvidia_clock_lock() { [[ -f /etc/systemd/system/nvidia-clock-lock.service ]] && unit_enabled nvidia-clock-lock.service; }
+explain_nvidia_clock_lock() {
+  cat <<EOF
+Impact:
+  Locks GPU core clocks at ${NVIDIA_MAX_GFX_CLK} MHz (and VRAM clocks at ${NVIDIA_MAX_MEM_CLK:-max} MHz when
+  supported) via 'nvidia-smi -lgc/-lmc' and a persistent systemd service. Removes clock
+  ramp-up delay for stable, lowest-latency token decode.
+EOF
+  echo -e "\n${C_YELLOW}[WARNING] Locked clocks keep the GPU at high power even when idle${C_RESET}"
+  echo -e "${C_YELLOW}          and hardly provide gains for sustained, GPU-bound generation.${C_RESET}"
+}
+apply_nvidia_clock_lock() {
+  local smi_bin out
+  smi_bin="$(command -v nvidia-smi)"
+  if ! out="$(run_root "$smi_bin" -lgc "${NVIDIA_MAX_GFX_CLK},${NVIDIA_MAX_GFX_CLK}" 2>&1)"; then
+    echo -e "${C_YELLOW}nvidia-smi -lgc is not supported on this GPU: ${out}${C_RESET}"
+    return 1
+  fi
+  local mem_start="" mem_stop=""
+  if [[ -n "$NVIDIA_MAX_MEM_CLK" ]]; then
+    mem_start="ExecStart=-${smi_bin} -lmc ${NVIDIA_MAX_MEM_CLK},${NVIDIA_MAX_MEM_CLK}"
+    mem_stop="ExecStop=-${smi_bin} -rmc"
+  fi
+  install_service nvidia-clock-lock.service <<EOF
+[Unit]
+Description=Lock NVIDIA GPU Clocks at Maximum for Strata
+After=nvidia-persistenced.service nvidia-powerd.service
+Wants=nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${smi_bin} -lgc ${NVIDIA_MAX_GFX_CLK},${NVIDIA_MAX_GFX_CLK}
+${mem_start}
+ExecStop=-${smi_bin} -rgc
+${mem_stop}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+revert_nvidia_clock_lock() {
+  remove_service nvidia-clock-lock.service
+  run_root nvidia-smi -rgc >/dev/null 2>&1 || true
+  run_root nvidia-smi -rmc >/dev/null 2>&1 || true
+}
+
+# 12i. NVIDIA ECC
+applicable_nvidia_ecc() { [[ "$HAS_NVIDIA" == true && -n "$NVIDIA_ECC_CUR" ]]; }
+title_nvidia_ecc() { echo "NVIDIA ECC Memory Off (reclaim ~6-12% VRAM & bandwidth, reboot)"; }
+status_nvidia_ecc() { [[ "$NVIDIA_ECC_PEND" == "Disabled" ]]; }
+explain_nvidia_ecc() {
+  cat <<'EOF'
+Impact:
+  Disables ECC on workstation/datacenter NVIDIA GPUs ('nvidia-smi -e 0'). ECC
+  consumes roughly 6-12% of VRAM and some memory bandwidth; turning it off gives
+  models more room and slightly higher decode speed. Requires a reboot.
+  Trade-off: GPU memory errors are no longer corrected (fine for inference).
+EOF
+}
+apply_nvidia_ecc() {
+  if run_root nvidia-smi -e 0; then
+    refresh_nvidia_ecc
+    REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
+  else
+    echo -e "${C_YELLOW}Could not change ECC mode on this GPU.${C_RESET}"
+    return 1
+  fi
+}
+revert_nvidia_ecc() {
+  run_root nvidia-smi -e 1 && { refresh_nvidia_ecc; REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true; }
+}
+
+# 12j. AMD APU Unified Memory Limit
+amd_apu_gtt_pages() {
+  local kb reserve
+  kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+  reserve=$((4 * 1048576))
+  (( kb / 8 > reserve )) && reserve=$((kb / 8))
+  echo $(( (kb - reserve) / 4 ))
+}
+applicable_amd_apu_memory() {
+  [[ "$HAS_AMD" == true ]] || return 1
+  compgen -G "/sys/class/drm/card*/device/mem_info_gtt_total" >/dev/null 2>&1 || return 1
+  grep -iE "AMD|ATI|Radeon" <<<"$GPU_RAW" | grep -qiE "Strix|Phoenix|Hawk Point|Rembrandt|Barcelo|Cezanne|Renoir|Lucienne|Raphael|Granite Ridge|Mendocino|Krackan|Kraken|Picasso|Raven|Van Gogh|Vega Series|Vega Mobile|Radeon Graphics|Radeon [0-9]{3}M|Radeon 8[0-9]{2,3}S"
+}
+title_amd_apu_memory() { echo "AMD APU Unified Memory GPU Limit (ttm.pages_limit ~ $(( $(amd_apu_gtt_pages) * 4 / 1048576 )) GiB)"; }
+status_amd_apu_memory() { [[ -n "$(kernel_param_value ttm.pages_limit)" ]]; }
+explain_amd_apu_memory() {
+  cat <<EOF
+Impact:
+  Raises the amount of system RAM the GPU can address (GTT) from the default of
+  about half of RAM to ~$(( $(amd_apu_gtt_pages) * 4 / 1048576 )) GiB (all RAM minus a 4 GiB / 12.5% reserve) by adding
+  'ttm.pages_limit' and 'ttm.page_pool_size' to the bootloader kernel command line.
+  Lets large models fully offload to the integrated GPU. Requires a reboot.
+EOF
+}
+apply_amd_apu_memory() {
+  local pages
+  pages="$(amd_apu_gtt_pages)"
+  add_kernel_param "ttm.pages_limit=${pages}"
+  add_kernel_param "ttm.page_pool_size=${pages}"
+}
+revert_amd_apu_memory() {
+  local n v
+  for n in ttm.pages_limit ttm.page_pool_size; do
+    v="$(kernel_param_value "$n" || true)"
+    [[ -n "$v" ]] && remove_kernel_param "${n}=${v}"
+  done
+  REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
+}
+
+# 12k. NVMe Tuning
+applicable_nvme_tuning() { compgen -G "/sys/block/nvme*n*" >/dev/null 2>&1; }
+title_nvme_tuning() { echo "NVMe I/O Scheduler & Read-Ahead (faster model loading)"; }
+status_nvme_tuning() { [[ -f /etc/udev/rules.d/60-strata-nvme.rules ]]; }
+explain_nvme_tuning() {
+  cat <<'EOF'
+Impact:
+  Installs a udev rule setting every NVMe disk to I/O scheduler 'none' with a
+  4 MiB read-ahead (queue/read_ahead_kb=4096). Large sequential model reads and
+  mmap page-ins load noticeably faster than with the 128 KiB default.
+EOF
+}
+apply_nvme_tuning() {
+  run_root tee /etc/udev/rules.d/60-strata-nvme.rules >/dev/null <<'EOF'
+ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="nvme[0-9]*n[0-9]*", ENV{DEVTYPE}=="disk", ATTR{queue/scheduler}="none", ATTR{queue/read_ahead_kb}="4096"
+EOF
+  run_root udevadm control --reload >/dev/null 2>&1 || true
+  run_root sh -c 'for d in /sys/block/nvme*n*; do echo none > "$d/queue/scheduler" 2>/dev/null; echo 4096 > "$d/queue/read_ahead_kb" 2>/dev/null; done; true'
+}
+revert_nvme_tuning() {
+  run_root rm -f /etc/udev/rules.d/60-strata-nvme.rules
+  run_root udevadm control --reload >/dev/null 2>&1 || true
+  run_root sh -c 'for d in /sys/block/nvme*n*; do echo 128 > "$d/queue/read_ahead_kb" 2>/dev/null; done; true'
+}
+
+# 12l. Network Serving Tuning
+has_physical_nic_up() {
+  local n
+  for n in /sys/class/net/*; do
+    [[ "$(basename "$n")" == "lo" ]] && continue
+    [[ -e "$n/device" && "$(cat "$n/operstate" 2>/dev/null)" == "up" ]] && return 0
+  done
+  return 1
+}
+applicable_net_tuning() {
+  [[ -f /etc/sysctl.d/99-strata-net.conf ]] && return 0
+  [[ -e /proc/sys/net/core/somaxconn ]] && has_physical_nic_up
+}
+title_net_tuning() { echo "Network Serving Tuning (somaxconn, TCP Fast Open, BBR)"; }
+status_net_tuning() { [[ -f /etc/sysctl.d/99-strata-net.conf ]]; }
+explain_net_tuning() {
+  cat <<'EOF'
+Impact:
+  Raises net.core.somaxconn (4096), enables TCP Fast Open, disables TCP slow-start
+  after idle (keeps streaming token responses fast) and enables BBR congestion
+  control with the fq qdisc when the kernel supports it. Helps when Strata serves
+  many concurrent API clients over the network.
+EOF
+}
+apply_net_tuning() {
+  local opts=("net.core.somaxconn=4096" "net.ipv4.tcp_fastopen=3" "net.ipv4.tcp_slow_start_after_idle=0")
+  run_root modprobe tcp_bbr >/dev/null 2>&1 || true
+  if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+    opts+=("net.core.default_qdisc=fq" "net.ipv4.tcp_congestion_control=bbr")
+    echo "tcp_bbr" | run_root tee /etc/modules-load.d/strata-bbr.conf >/dev/null
+  fi
+  write_sysctl_with_prev /etc/sysctl.d/99-strata-net.conf "${opts[@]}"
+}
+revert_net_tuning() {
+  restore_sysctl_prev /etc/sysctl.d/99-strata-net.conf
+  run_root rm -f /etc/modules-load.d/strata-bbr.conf
+}
+
+# 12m. Ryzen APU Power Limits (ryzenadj)
+is_amd_mobile_apu_cpu() {
+  grep -qi "AuthenticAMD" /proc/cpuinfo 2>/dev/null || return 1
+  grep -m1 '^model name' /proc/cpuinfo 2>/dev/null | grep -qiE 'Ryzen AI|Radeon|Ryzen.*[0-9]{3,4}(U|HS|H|HX|G|GE)\b'
+}
+applicable_ryzenadj_tdp() {
+  [[ -f /etc/systemd/system/strata-ryzenadj.service ]] && return 0
+  is_amd_mobile_apu_cpu || return 1
+  command -v ryzenadj >/dev/null 2>&1 || pkg_available repo ryzenadj || pkg_available aur ryzenadj
+}
+title_ryzenadj_tdp() { echo "Ryzen APU Sustained Power Limits (STAPM/PPT via ryzenadj)"; }
+status_ryzenadj_tdp() { [[ -f /etc/systemd/system/strata-ryzenadj.service ]] && unit_enabled strata-ryzenadj.service; }
+explain_ryzenadj_tdp() {
+  cat <<'EOF'
+Impact:
+  Raises the Ryzen mobile/APU sustained (STAPM), slow and fast PPT power limits via
+  ryzenadj and re-applies them at boot and after resume. Many laptops and mini PCs
+  ship with limits far below what the cooling can handle, which throttles
+  sustained CPU/iGPU inference. You choose the target wattage (default: +25%).
+  Higher limits raise power draw and heat; the previous limits are saved and
+  restored on revert. Needs ryzen_smu or iomem=relaxed support from the kernel.
+EOF
+}
+apply_ryzenadj_tdp() {
+  command -v ryzenadj >/dev/null 2>&1 || prompt_install_repo_or_aur ryzenadj || return 0
+  local bin info stapm slow fast target in_w fast_t
+  bin="$(command -v ryzenadj)" || return 1
+  if ! info="$(run_root "$bin" -i 2>&1)"; then
+    echo -e "${C_YELLOW}ryzenadj cannot read this CPU (load the ryzen_smu module or boot with iomem=relaxed): ${info}${C_RESET}"
+    return 1
+  fi
+  stapm="$(awk -F'|' '/STAPM LIMIT/ {gsub(/ /,"",$3); print $3; exit}' <<<"$info")"
+  slow="$(awk -F'|' '/PPT LIMIT SLOW/ {gsub(/ /,"",$3); print $3; exit}' <<<"$info")"
+  fast="$(awk -F'|' '/PPT LIMIT FAST/ {gsub(/ /,"",$3); print $3; exit}' <<<"$info")"
+  if ! [[ "$slow" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    echo -e "${C_YELLOW}Could not read current power limits from ryzenadj.${C_RESET}"
+    return 1
+  fi
+  if [[ ! -f "$RYZENADJ_MARKER" ]]; then
+    [[ "$stapm" =~ ^[0-9]+(\.[0-9]+)?$ ]] || stapm=0
+    [[ "$fast" =~ ^[0-9]+(\.[0-9]+)?$ ]] || fast=0
+    awk -v a="$stapm" -v b="$fast" -v c="$slow" 'BEGIN {printf "%d %d %d\n", a*1000, b*1000, c*1000}' | run_root tee "$RYZENADJ_MARKER" >/dev/null
+  fi
+  target="$(awk -v s="$slow" 'BEGIN {printf "%d", s*1.25 + 0.5}')"
+  read -r -p "Sustained power limit in watts [default: ${target}]: " in_w
+  [[ -n "$in_w" ]] && target="$in_w"
+  if ! [[ "$target" =~ ^[0-9]+$ ]] || (( target < 5 || target > 200 )); then
+    echo -e "${C_RED}Power limit must be an integer between 5 and 200 W.${C_RESET}"
+    return 1
+  fi
+  fast_t="$(awk -v t="$target" 'BEGIN {printf "%d", t*1.15 + 0.5}')"
+  local prev_stapm=0 prev_fast=0 prev_slow=0 stop_args=""
+  [[ -r "$RYZENADJ_MARKER" ]] && read -r prev_stapm prev_fast prev_slow < "$RYZENADJ_MARKER"
+  (( ${prev_stapm:-0} > 0 )) && stop_args+=" --stapm-limit=${prev_stapm}"
+  (( ${prev_slow:-0} > 0 )) && stop_args+=" --slow-limit=${prev_slow}"
+  (( ${prev_fast:-0} > 0 )) && stop_args+=" --fast-limit=${prev_fast}"
+  install_service strata-ryzenadj.service <<EOF
+[Unit]
+Description=Raise Ryzen APU Power Limits for Strata
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${bin} --stapm-limit=$((target * 1000)) --slow-limit=$((target * 1000)) --fast-limit=$((fast_t * 1000))
+${stop_args:+ExecStop=-${bin}${stop_args}}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+revert_ryzenadj_tdp() {
+  remove_service strata-ryzenadj.service
+  run_root rm -f "$RYZENADJ_MARKER"
+}
+
+# 12n. Intel RAPL Power Limits
+RAPL_DIR="/sys/class/powercap/intel-rapl:0"
+rapl_val() { local v; v="$(cat "$1" 2>/dev/null || true)"; [[ "$v" =~ ^[0-9]+$ ]] && echo "$v" || echo 0; }
+applicable_intel_rapl() {
+  [[ -f /etc/systemd/system/strata-rapl.service ]] && return 0
+  grep -qi "GenuineIntel" /proc/cpuinfo 2>/dev/null || return 1
+  [[ -r "$RAPL_DIR/constraint_0_power_limit_uw" ]] || return 1
+  local max cur
+  max="$(rapl_val "$RAPL_DIR/constraint_0_max_power_uw")"
+  cur="$(rapl_val "$RAPL_DIR/constraint_0_power_limit_uw")"
+  (( max > 0 && max > cur ))
+}
+title_intel_rapl() {
+  echo "Intel CPU Power Limits to Platform Max (PL1 $(( $(rapl_val "$RAPL_DIR/constraint_0_power_limit_uw") / 1000000 ))W -> $(( $(rapl_val "$RAPL_DIR/constraint_0_max_power_uw") / 1000000 ))W)"
+}
+status_intel_rapl() { [[ -f /etc/systemd/system/strata-rapl.service ]] && unit_enabled strata-rapl.service; }
+explain_intel_rapl() {
+  cat <<'EOF'
+Impact:
+  Raises the Intel RAPL long-term (PL1) and short-term (PL2) package power limits
+  to the platform maximum via a systemd service, removing power-limit throttling
+  under sustained CPU load. Previous limits are saved and restored on revert.
+  Combine with thermald on laptops so thermal limits still protect the CPU.
+EOF
+}
+apply_intel_rapl() {
+  local c0_max c1_max c0_cur c1_cur
+  c0_max="$(rapl_val "$RAPL_DIR/constraint_0_max_power_uw")"
+  c1_max="$(rapl_val "$RAPL_DIR/constraint_1_max_power_uw")"
+  c0_cur="$(rapl_val "$RAPL_DIR/constraint_0_power_limit_uw")"
+  c1_cur="$(rapl_val "$RAPL_DIR/constraint_1_power_limit_uw")"
+  if [[ ! -f "$RAPL_MARKER" ]]; then
+    echo "${c0_cur} ${c1_cur}" | run_root tee "$RAPL_MARKER" >/dev/null
+  fi
+  if ! echo "$c0_max" | run_root tee "$RAPL_DIR/constraint_0_power_limit_uw" >/dev/null 2>&1; then
+    echo -e "${C_YELLOW}The firmware locks the RAPL power limits (BIOS setting); cannot change them.${C_RESET}"
+    run_root rm -f "$RAPL_MARKER"
+    return 1
+  fi
+  local c1_cmd=""
+  (( c1_max > 0 )) && c1_cmd="[ -w ${RAPL_DIR}/constraint_1_power_limit_uw ] && echo ${c1_max} > ${RAPL_DIR}/constraint_1_power_limit_uw; "
+  local p_c0=0 p_c1=0
+  [[ -r "$RAPL_MARKER" ]] && read -r p_c0 p_c1 < "$RAPL_MARKER"
+  install_service strata-rapl.service <<EOF
+[Unit]
+Description=Raise Intel RAPL Power Limits for Strata
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'echo ${c0_max} > ${RAPL_DIR}/constraint_0_power_limit_uw; ${c1_cmd}true'
+ExecStop=-/bin/sh -c '[ ${p_c0:-0} -gt 0 ] && echo ${p_c0:-0} > ${RAPL_DIR}/constraint_0_power_limit_uw; [ ${p_c1:-0} -gt 0 ] && echo ${p_c1:-0} > ${RAPL_DIR}/constraint_1_power_limit_uw; true'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+revert_intel_rapl() {
+  remove_service strata-rapl.service
+  if [[ -f "$RAPL_MARKER" ]]; then
+    local p_c0 p_c1
+    read -r p_c0 p_c1 < "$RAPL_MARKER"
+    (( p_c0 > 0 )) && echo "$p_c0" | run_root tee "$RAPL_DIR/constraint_0_power_limit_uw" >/dev/null 2>&1
+    (( p_c1 > 0 )) && echo "$p_c1" | run_root tee "$RAPL_DIR/constraint_1_power_limit_uw" >/dev/null 2>&1
+    run_root rm -f "$RAPL_MARKER"
+  fi
+}
+
+# 12o. Intel thermald
+applicable_intel_thermald() {
+  grep -qi "GenuineIntel" /proc/cpuinfo 2>/dev/null || return 1
+  unit_exists thermald.service || command -v thermald >/dev/null 2>&1 || pkg_available repo thermald
+}
+title_intel_thermald() { echo "Intel Thermal Daemon (thermald, avoids hard thermal throttling)"; }
+status_intel_thermald() { unit_enabled thermald.service && unit_active thermald.service; }
+explain_intel_thermald() { echo -e "Impact:\n  Installs/enables thermald, which uses RAPL/P-state/powerclamp cooling to hold\n  Intel CPUs just below thermal limits instead of hitting abrupt hardware throttling."; }
+apply_intel_thermald() {
+  command -v thermald >/dev/null 2>&1 || prompt_install_deps repo thermald || return 0
+  run_root systemctl enable --now thermald.service
+}
+revert_intel_thermald() { run_root systemctl disable --now thermald.service 2>/dev/null || true; }
+
+# 12p. tuned profile
+applicable_tuned_profile() {
+  [[ -f "$TUNED_MARKER" ]] && return 0
+  unit_active power-profiles-daemon.service && return 1
+  unit_active tlp.service && return 1
+  unit_exists tuned.service || command -v tuned-adm >/dev/null 2>&1 || pkg_available repo tuned
+}
+tuned_target_profile() {
+  if command -v tuned-adm >/dev/null 2>&1 && tuned-adm list 2>/dev/null | grep -q "accelerator-performance"; then
+    echo accelerator-performance
+  else
+    echo throughput-performance
+  fi
+}
+title_tuned_profile() { echo "tuned Profile (throughput-performance / accelerator-performance)"; }
+note_tuned_profile() { echo -e "${C_YELLOW}[!] Higher idle power, minimal gain${C_RESET}"; }
+status_tuned_profile() {
+  unit_active tuned.service || return 1
+  tuned-adm active 2>/dev/null | grep -qE "throughput-performance|accelerator-performance"
+}
+explain_tuned_profile() {
+  cat <<'EOF'
+Impact:
+  Installs/enables tuned and activates the 'throughput-performance' (or
+  'accelerator-performance' when available) profile: performance governor,
+  energy-performance bias, and larger dirty/readahead/scheduler settings.
+  Not offered when power-profiles-daemon or TLP manage power.
+EOF
+  echo -e "\n${C_YELLOW}[WARNING] These profiles keep the CPU at high clocks and raise idle power${C_RESET}"
+  echo -e "${C_YELLOW}          while adding little over the other tuning steps for GPU-bound inference.${C_RESET}"
+}
+apply_tuned_profile() {
+  command -v tuned-adm >/dev/null 2>&1 || prompt_install_deps repo tuned || return 0
+  run_root systemctl enable --now tuned.service || return 1
+  sleep 1
+  if [[ ! -f "$TUNED_MARKER" ]]; then
+    tuned-adm active 2>/dev/null | sed -nE 's/^Current active profile: *//p' | run_root tee "$TUNED_MARKER" >/dev/null
+  fi
+  run_root tuned-adm profile "$(tuned_target_profile)"
+}
+revert_tuned_profile() {
+  local prev=""
+  [[ -f "$TUNED_MARKER" ]] && prev="$(cat "$TUNED_MARKER" 2>/dev/null)"
+  if [[ -n "$prev" ]]; then run_root tuned-adm profile "$prev"; else run_root tuned-adm off 2>/dev/null || true; fi
+  run_root rm -f "$TUNED_MARKER"
+}
+
+# 12q. IOMMU passthrough
+gpu_pci_count() { echo "${DISCRETE_GPU_COUNT:-0}"; }
+applicable_iommu_pt() {
+  has_kernel_param "iommu=pt" && return 0
+  [[ -n "$(ls -A /sys/kernel/iommu_groups 2>/dev/null)" ]] && (( $(gpu_pci_count) >= 2 ))
+}
+title_iommu_pt() { echo "IOMMU Passthrough Mode (iommu=pt, lower multi-GPU DMA overhead)"; }
+status_iommu_pt() { has_kernel_param "iommu=pt" || has_kernel_param "iommu.passthrough=1"; }
+explain_iommu_pt() { echo -e "Impact:\n  Adds 'iommu=pt' to the kernel command line so host devices skip IOMMU address\n  translation (lower DMA overhead for multi-GPU transfers and fast NICs). VFIO\n  device passthrough keeps working. Requires a reboot."; }
+apply_iommu_pt() { add_kernel_param "iommu=pt"; }
+revert_iommu_pt() { remove_kernel_param "iommu=pt"; REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true; }
+
+# 12r. Intel compute stack
+intel_compute_pkgs() {
+  case "$DISTRO_FAMILY" in
+    arch)   echo "intel-compute-runtime level-zero-loader" ;;
+    fedora) echo "intel-compute-runtime oneapi-level-zero" ;;
+    debian) echo "intel-opencl-icd libze-intel-gpu1 libze1" ;;
+    *)      echo "" ;;
+  esac
+}
+applicable_intel_compute_stack() {
+  [[ "$HAS_INTEL_GPU" == true ]] || return 1
+  local pkgs p
+  pkgs="$(intel_compute_pkgs)"
+  [[ -n "$pkgs" ]] || return 1
+  for p in $pkgs; do pkg_available repo "$p" || return 1; done
+}
+title_intel_compute_stack() { echo "Intel GPU Compute Runtime (OpenCL / Level Zero for SYCL inference)"; }
+status_intel_compute_stack() {
+  local p
+  for p in $(intel_compute_pkgs); do pkg_installed "$p" || return 1; done
+}
+explain_intel_compute_stack() { echo -e "Impact:\n  Installs the Intel compute runtime and Level Zero loader ($(intel_compute_pkgs)).\n  Without them SYCL/OpenCL inference cannot use the Intel GPU and silently falls back to the CPU."; }
+apply_intel_compute_stack() { prompt_install_deps repo $(intel_compute_pkgs) || return 0; }
+revert_intel_compute_stack() { echo -e "${C_YELLOW}Compute runtime packages are shared libraries and are kept installed.${C_RESET}"; }
+
+# 12s. NVIDIA Jetson
+is_jetson() {
+  [[ -f /etc/nv_tegra_release ]] && return 0
+  [[ -r /proc/device-tree/model ]] && tr -d '\0' < /proc/device-tree/model | grep -qi "jetson"
+}
+jetson_maxn_id() {
+  local id
+  id="$(grep -oE 'POWER_MODEL ID=[0-9]+ NAME=MAXN[A-Za-z_]*' /etc/nvpmodel.conf 2>/dev/null | head -n1 | sed -E 's/POWER_MODEL ID=([0-9]+).*/\1/')"
+  echo "${id:-0}"
+}
+applicable_jetson_perf() { is_jetson && command -v nvpmodel >/dev/null 2>&1; }
+title_jetson_perf() { echo "NVIDIA Jetson MAXN Power Mode & Max Clocks (nvpmodel / jetson_clocks)"; }
+status_jetson_perf() { [[ -f /etc/systemd/system/strata-jetson-perf.service ]] && unit_enabled strata-jetson-perf.service; }
+explain_jetson_perf() { echo -e "Impact:\n  Switches the Jetson to its MAXN power model (nvpmodel) and pins CPU/GPU/EMC clocks\n  to maximum (jetson_clocks) at every boot. Clocks are restored on revert."; }
+apply_jetson_perf() {
+  local nv jc id
+  nv="$(command -v nvpmodel)"; jc="$(command -v jetson_clocks || echo /usr/bin/jetson_clocks)"; id="$(jetson_maxn_id)"
+  install_service strata-jetson-perf.service <<EOF
+[Unit]
+Description=Set Jetson MAXN Power Mode and Maximum Clocks for Strata
+After=nvpmodel.service multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=-${jc} --store
+ExecStart=${nv} -m ${id}
+ExecStart=-${jc}
+ExecStop=-${jc} --restore
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+revert_jetson_perf() { remove_service strata-jetson-perf.service; }
+
+# 12t. numactl interleave
+applicable_numactl_interleave() {
+  (( $(numa_node_count) > 1 )) || return 1
+  [[ -f "$NUMACTL_MARKER" ]] || command -v numactl >/dev/null 2>&1 || pkg_available repo numactl
+}
+title_numactl_interleave() { echo "NUMA Memory Interleaving for Strata (numactl --interleave=all)"; }
+status_numactl_interleave() { [[ -f "$NUMACTL_MARKER" ]] && command -v numactl >/dev/null 2>&1; }
+explain_numactl_interleave() {
+  cat <<'EOF'
+Impact:
+  Installs numactl and starts Strata (strata.service) under 'numactl --interleave=all',
+  spreading CPU-resident model weights across all NUMA nodes so memory bandwidth
+  from every socket is used. Helps CPU/offload inference on multi-socket servers;
+  restart strata.service after applying.
+EOF
+}
+apply_numactl_interleave() {
+  command -v numactl >/dev/null 2>&1 || prompt_install_deps repo numactl || return 0
+  echo "enabled" | run_root tee "$NUMACTL_MARKER" >/dev/null
+  if [[ -f /etc/systemd/system/strata.service ]] && ! grep -q numactl /etc/systemd/system/strata.service; then
+    run_root sed -i "s|^ExecStart=|ExecStart=$(command -v numactl) --interleave=all |" /etc/systemd/system/strata.service
+    run_root systemctl daemon-reload
+    echo -e "${C_YELLOW}Restart strata.service for the interleave policy to take effect.${C_RESET}"
+  fi
+}
+revert_numactl_interleave() {
+  run_root rm -f "$NUMACTL_MARKER"
+  if [[ -f /etc/systemd/system/strata.service ]]; then
+    run_root sed -i "s|^ExecStart=[^ ]*/numactl --interleave=all |ExecStart=|" /etc/systemd/system/strata.service
+    run_root systemctl daemon-reload
+  fi
+}
+
+# 12u. 1 GiB hugepages
+applicable_hugepages_1g() {
+  [[ -n "$(kernel_param_value hugepages || true)" ]] && return 0
+  grep -qw pdpe1gb /proc/cpuinfo 2>/dev/null || return 1
+  (( RAM_GB >= 64 )) && (( $(numa_node_count) > 1 ))
+}
+title_hugepages_1g() { echo "Reserve 1 GiB Hugepages ($(( RAM_GB / 4 )) GiB, multi-socket CPU inference)"; }
+note_hugepages_1g() { echo -e "${C_YELLOW}[!] Reserves RAM, minimal gain${C_RESET}"; }
+status_hugepages_1g() { [[ -n "$(kernel_param_value hugepages || true)" ]]; }
+explain_hugepages_1g() {
+  cat <<EOF
+Impact:
+  Reserves $(( RAM_GB / 4 )) GiB of 1 GiB hugepages at boot (default_hugepagesz=1G
+  hugepagesz=1G hugepages=$(( RAM_GB / 4 ))) for hugetlb-aware CPU inference. Requires a reboot.
+EOF
+  echo -e "\n${C_YELLOW}[WARNING] The reserved memory is permanently unavailable to the rest of the system${C_RESET}"
+  echo -e "${C_YELLOW}          and only helps workloads that explicitly use hugetlbfs.${C_RESET}"
+}
+apply_hugepages_1g() {
+  add_kernel_param "default_hugepagesz=1G"
+  add_kernel_param "hugepagesz=1G"
+  add_kernel_param "hugepages=$(( RAM_GB / 4 ))"
+}
+revert_hugepages_1g() {
+  local n v
+  for n in default_hugepagesz hugepagesz hugepages; do
+    v="$(kernel_param_value "$n" || true)"
+    [[ -n "$v" ]] && remove_kernel_param "${n}=${v}"
+  done
+  REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
+}
+
+# 12v. sched_ext scheduler
+scx_unit() {
+  local u
+  for u in scx.service scx_loader.service; do
+    if unit_exists "$u" || systemctl cat "$u" >/dev/null 2>&1; then
+      echo "$u"; return 0
+    fi
+  done
+  return 1
+}
+applicable_scx_scheduler() {
+  [[ -d /sys/kernel/sched_ext ]] || return 1
+  scx_unit >/dev/null 2>&1 || pkg_available repo scx-scheds
+}
+title_scx_scheduler() { echo "sched_ext BPF CPU Scheduler (scx, lower scheduling latency)"; }
+status_scx_scheduler() { [[ "$(cat /sys/kernel/sched_ext/state 2>/dev/null)" == "enabled" ]]; }
+explain_scx_scheduler() { echo -e "Impact:\n  Installs scx-scheds (if needed) and enables its service so a sched_ext BPF\n  scheduler (default: scx_bpfland) replaces the kernel CPU scheduler, improving\n  responsiveness of the API/server threads when CPU cores are saturated."; }
+apply_scx_scheduler() {
+  scx_unit >/dev/null 2>&1 || prompt_install_deps repo scx-scheds || return 0
+  local u
+  u="$(scx_unit)" || { echo -e "${C_YELLOW}No scx service found after installation.${C_RESET}"; return 1; }
+  run_root systemctl enable --now "$u"
+}
+revert_scx_scheduler() {
+  local u
+  u="$(scx_unit)" && run_root systemctl disable --now "$u" 2>/dev/null || true
+}
+
+# 12w. AMD X3D V-Cache Mode
+applicable_amd_x3d_mode() {
+  [[ -f /etc/systemd/system/strata-amd-x3d.service ]] && return 0
+  compgen -G "/sys/bus/platform/drivers/amd_x3d_vcache/*/amd_x3d_mode" >/dev/null 2>&1
+}
+title_amd_x3d_mode() { echo "AMD Ryzen X3D V-Cache CCD Mode (amd_x3d_vcache -> cache)"; }
+status_amd_x3d_mode() {
+  local f
+  for f in /sys/bus/platform/drivers/amd_x3d_vcache/*/amd_x3d_mode; do
+    [[ -r "$f" ]] && [[ "$(cat "$f" 2>/dev/null)" == "cache" ]] && return 0
+  done
+  return 1
+}
+explain_amd_x3d_mode() {
+  echo -e "Impact:\n  Sets amd_x3d_mode='cache' via systemd so dual-CCD Ryzen X3D processors\n  prefer the 3D V-Cache CCD for inference threads instead of migrating across CCDs."
+}
+apply_amd_x3d_mode() {
+  install_service strata-amd-x3d.service <<'EOF'
+[Unit]
+Description=Set AMD X3D V-Cache Mode to Cache for Strata
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'for f in /sys/bus/platform/drivers/amd_x3d_vcache/*/amd_x3d_mode; do [ -w "$f" ] && echo cache > "$f"; done; true'
+ExecStop=/bin/sh -c 'for f in /sys/bus/platform/drivers/amd_x3d_vcache/*/amd_x3d_mode; do [ -w "$f" ] && echo frequency > "$f"; done; true'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+revert_amd_x3d_mode() {
+  remove_service strata-amd-x3d.service
+  run_root sh -c 'for f in /sys/bus/platform/drivers/amd_x3d_vcache/*/amd_x3d_mode; do [ -w "$f" ] && echo frequency > "$f"; done; true' 2>/dev/null || true
+}
+
+# 12x. Intel Hybrid P-Core Pinning
+applicable_intel_pcore_pinning() {
+  [[ -f /etc/systemd/system/strata.service.d/10-pcore-affinity.conf ]] && return 0
+  [[ -r /sys/devices/cpu_core/cpus && -r /sys/devices/cpu_atom/cpus ]]
+}
+title_intel_pcore_pinning() {
+  local pcpus=""
+  [[ -r /sys/devices/cpu_core/cpus ]] && pcpus="$(cat /sys/devices/cpu_core/cpus 2>/dev/null || true)"
+  echo "Intel Hybrid P-Core Pinning for strata.service (CPUs ${pcpus:-P-cores})"
+}
+status_intel_pcore_pinning() { [[ -f /etc/systemd/system/strata.service.d/10-pcore-affinity.conf ]]; }
+explain_intel_pcore_pinning() {
+  echo -e "Impact:\n  Adds a systemd drop-in for strata.service (CPUAffinity=<P-cores>) so Strata\n  runs on Performance cores instead of getting scheduled onto Efficiency cores."
+}
+apply_intel_pcore_pinning() {
+  local pcpus
+  pcpus="$(cat /sys/devices/cpu_core/cpus 2>/dev/null || true)"
+  if [[ -z "$pcpus" ]]; then
+    echo -e "${C_YELLOW}Could not read P-core list from /sys/devices/cpu_core/cpus.${C_RESET}"
+    return 1
+  fi
+  run_root mkdir -p /etc/systemd/system/strata.service.d
+  run_root tee /etc/systemd/system/strata.service.d/10-pcore-affinity.conf >/dev/null <<EOF
+[Service]
+CPUAffinity=${pcpus}
+EOF
+  run_root systemctl daemon-reload
+  unit_active strata.service && echo -e "${C_YELLOW}Restart strata.service for P-core affinity to take effect.${C_RESET}" || true
+}
+revert_intel_pcore_pinning() {
+  run_root rm -f /etc/systemd/system/strata.service.d/10-pcore-affinity.conf
+  run_root rmdir /etc/systemd/system/strata.service.d 2>/dev/null || true
+  run_root systemctl daemon-reload
+}
+
 # 13. Strata Manager
 applicable_strata_manager() { return 0; }
 title_strata_manager() { echo "Strata: Install, Update, Launch & Systemd Service"; }
@@ -1176,7 +2401,7 @@ strata_service_installed() { [[ -f /etc/systemd/system/strata.service ]]; }
 check_strata_update_sync() {
   [[ -n "$STRATA_BIN" ]] || return 1
   local json_out parsed=""
-  json_out="$(run_as_user "$STRATA_BIN update --check --json 2>/dev/null" || true)"
+  json_out="$(run_as_user_exec "$STRATA_BIN" update --check --json 2>/dev/null || true)"
   if [[ -n "$json_out" ]] && command -v python3 >/dev/null 2>&1; then
     parsed="$(python3 -c '
 import json, sys
@@ -1205,7 +2430,7 @@ else:
 
   if [[ -z "$parsed" ]]; then
     local txt_out
-    txt_out="$(run_as_user "$STRATA_BIN update --check 2>/dev/null" || true)"
+    txt_out="$(run_as_user_exec "$STRATA_BIN" update --check 2>/dev/null || true)"
     if grep -qiE "update available|newer|out of date" <<< "$txt_out"; then
       parsed="1|new version available"
     else
@@ -1271,7 +2496,7 @@ wait_for_strata_model_live() {
       echo -e "${C_RED}strata.service is not active (check 'journalctl -u strata -n 50').${C_RESET}"
       return 1
     fi
-    json_out="$(run_as_user "$STRATA_BIN update --check --json 2>/dev/null" || true)"
+    json_out="$(run_as_user_exec "$STRATA_BIN" update --check --json 2>/dev/null || true)"
     if [[ -n "$json_out" ]] && command -v python3 >/dev/null 2>&1; then
       ready_profile="$(python3 -c '
 import json, sys
@@ -1325,12 +2550,12 @@ perform_strata_update() {
 
   echo -e "\n${C_CYAN}Running 'strata update --yes'...${C_RESET}"
   local rc=0
-  run_as_user "$STRATA_BIN update --yes" || rc=$?
+  run_as_user_exec "$STRATA_BIN" update --yes || rc=$?
 
   refresh_strata_bin
   if (( rc == 0 )); then
     echo -e "\n${C_GREEN}Strata update completed successfully!${C_RESET}"
-    echo -e "${C_DIM}Installed version: $(run_as_user "$STRATA_BIN --version 2>/dev/null" || echo unknown)${C_RESET}"
+    echo -e "${C_DIM}Installed version: $(run_as_user_exec "$STRATA_BIN" --version 2>/dev/null || echo unknown)${C_RESET}"
     check_strata_update_sync >/dev/null 2>&1 || true
   else
     echo -e "\n${C_RED}Strata update failed (exit code ${rc}).${C_RESET}"
@@ -1382,7 +2607,7 @@ EOF
 list_strata_presets() {
   local preset_dir="$TARGET_HOME/.config/strata/launch-presets" cli_out f
   if [[ -n "$STRATA_BIN" ]]; then
-    cli_out="$(run_as_user "$STRATA_BIN launch --list-presets 2>/dev/null" || true)"
+    cli_out="$(run_as_user_exec "$STRATA_BIN" launch --list-presets 2>/dev/null || true)"
     if [[ -n "$cli_out" ]]; then
       echo "$cli_out" | awk -F'  +' '{print $1}' | sed '/^$/d'
       return 0
@@ -1407,6 +2632,8 @@ install_strata_service_fn() {
   fi
   selected_preset="${presets[$((choice-1))]}"
   user_group="$(id -gn "$TARGET_USER")"
+  local numa_prefix=""
+  [[ -f "$NUMACTL_MARKER" ]] && command -v numactl >/dev/null 2>&1 && numa_prefix="$(command -v numactl) --interleave=all "
 
   install_service strata.service <<EOF
 [Unit]
@@ -1420,7 +2647,7 @@ RemainAfterExit=yes
 User=${TARGET_USER}
 Group=${user_group}
 WorkingDirectory=${TARGET_HOME}
-ExecStart=${STRATA_BIN} launch --preset "${selected_preset}" --no-tui --yes
+ExecStart=${numa_prefix}${STRATA_BIN} launch --preset "${selected_preset}" --no-tui --yes
 ExecStop=${STRATA_BIN} launch --stop --preset "${selected_preset}"
 LimitMEMLOCK=infinity
 TimeoutStartSec=0
@@ -1455,7 +2682,7 @@ apply_strata_manager() {
   [[ -n "$STRATA_BIN" ]] || return 0
 
   echo ""
-  confirm_yn "Launch Strata interactively now ('strata launch')? [y/N]: " "N" && run_as_user "$STRATA_BIN launch"
+  confirm_yn "Launch Strata interactively now ('strata launch')? [y/N]: " "N" && run_as_user_exec "$STRATA_BIN" launch
 
   echo ""
   if strata_service_installed; then
@@ -1596,36 +2823,47 @@ print_live_stats() {
 
   # GPU, VRAM, Power, and Temp (supports multiple NVIDIA and/or AMD GPUs)
   if [[ "$HAS_NVIDIA" == true ]] && command -v nvidia-smi >/dev/null 2>&1; then
-    local nv_lines nv_line
+    local nv_lines nv_parsed nv_line
     nv_lines="$(nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,power.draw,power.limit,temperature.gpu --format=csv,noheader,nounits 2>/dev/null || true)"
-    while IFS= read -r nv_line; do
-      [[ -n "$nv_line" ]] || continue
-      local g_u m_u m_t p_d p_l g_t
-      local g_pct="" v_pct="" v_used="" v_tot="" pw="" plw="" ppct="" gtmp=""
-      IFS=',' read -r g_u m_u m_t p_d p_l g_t <<< "$nv_line"
-      g_u="${g_u// /}"; m_u="${m_u// /}"; m_t="${m_t// /}"; p_d="${p_d// /}"; p_l="${p_l// /}"; g_t="${g_t// /}"
-      [[ "$g_u" =~ ^[0-9]+(\.[0-9]+)?$ ]] && g_pct="$(awk "BEGIN {printf \"%.0f\", $g_u}")"
-      [[ "$g_t" =~ ^[0-9]+(\.[0-9]+)?$ ]] && gtmp="$(awk "BEGIN {printf \"%.0f\", $g_t}")"
-      if [[ "$m_u" =~ ^[0-9]+(\.[0-9]+)?$ && "$m_t" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk "BEGIN {exit !($m_t > 0)}"; then
-        read -r v_pct v_used v_tot <<< "$(awk "BEGIN {printf \"%.0f %.1f %.1f\", ($m_u/$m_t)*100, $m_u/1024, $m_t/1024}")"
-      fi
-      if [[ "$p_d" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-        pw="$(awk "BEGIN {printf \"%.0f\", $p_d}")"
-        total_gpu_pwr_w=$(( ${total_gpu_pwr_w:-0} + pw ))
-        if [[ "$p_l" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk "BEGIN {exit !($p_l > 0)}"; then
-          plw="$(awk "BEGIN {printf \"%.0f\", $p_l}")"
-          ppct="$(awk "BEGIN {printf \"%.0f\", ($p_d/$p_l)*100}")"
-        fi
-      fi
-      gpu_pcts+=("$g_pct")
-      vram_pcts+=("$v_pct")
-      vram_useds+=("$v_used")
-      vram_tots+=("$v_tot")
-      pwr_ws+=("$pw")
-      pwr_lim_ws+=("$plw")
-      pwr_pcts+=("$ppct")
-      gpu_temps+=("$gtmp")
-    done <<< "$nv_lines"
+    if [[ -n "$nv_lines" ]]; then
+      nv_parsed="$(awk -F', *' '
+        function isnum(s) { return s ~ /^[0-9]+(\.[0-9]+)?$/ }
+        {
+          for (i=1; i<=6; i++) gsub(/ /, "", $i)
+          gp = isnum($1) ? sprintf("%.0f", $1) : ""
+          gt = isnum($6) ? sprintf("%.0f", $6) : ""
+          vp = ""; vu = ""; vt = ""
+          if (isnum($2) && isnum($3) && ($3 + 0) > 0) {
+            vp = sprintf("%.0f", ($2 / $3) * 100)
+            vu = sprintf("%.1f", $2 / 1024)
+            vt = sprintf("%.1f", $3 / 1024)
+          }
+          pw = ""; plw = ""; pp = ""
+          if (isnum($4)) {
+            pw = sprintf("%.0f", $4)
+            if (isnum($5) && ($5 + 0) > 0) {
+              plw = sprintf("%.0f", $5)
+              pp = sprintf("%.0f", ($4 / $5) * 100)
+            }
+          }
+          printf "%s|%s|%s|%s|%s|%s|%s|%s\n", gp, vp, vu, vt, pw, plw, pp, gt
+        }
+      ' <<< "$nv_lines")"
+      while IFS= read -r nv_line; do
+        [[ -n "$nv_line" ]] || continue
+        local g_pct="" v_pct="" v_used="" v_tot="" pw="" plw="" ppct="" gtmp=""
+        IFS='|' read -r g_pct v_pct v_used v_tot pw plw ppct gtmp <<< "$nv_line"
+        [[ -n "$pw" ]] && total_gpu_pwr_w=$(( ${total_gpu_pwr_w:-0} + pw ))
+        gpu_pcts+=("$g_pct")
+        vram_pcts+=("$v_pct")
+        vram_useds+=("$v_used")
+        vram_tots+=("$v_tot")
+        pwr_ws+=("$pw")
+        pwr_lim_ws+=("$plw")
+        pwr_pcts+=("$ppct")
+        gpu_temps+=("$gtmp")
+      done <<< "$nv_parsed"
+    fi
   fi
   if [[ "$HAS_AMD" == true ]]; then
     local card_dir
@@ -1680,7 +2918,7 @@ print_live_stats() {
     [[ -r "$hm_dir/name" ]] || continue
     hm_name="$(cat "$hm_dir/name" 2>/dev/null || true)"
     case "$hm_name" in
-      coretemp|k10temp|zenpower)
+      coretemp|k10temp|zenpower*)
         if [[ -z "$cpu_temp" && -r "$hm_dir/temp1_input" ]]; then
           local mc
           mc="$(cat "$hm_dir/temp1_input" 2>/dev/null || echo 0)"
@@ -1806,6 +3044,15 @@ build_sys_info_lines() {
   if [[ "$HAS_NVIDIA" == true && -n "$NVIDIA_CURRENT_PL" ]]; then
     SYS_INFO_LINES+=("$(printf "%bNVIDIA Power Limit: %sW (Default: %sW, Max: %sW)%b" "${C_DIM}" "$NVIDIA_CURRENT_PL" "$NVIDIA_DEFAULT_PL" "$NVIDIA_MAX_PL" "${C_RESET}")")
   fi
+  append_gpu_pcie_lines
+  [[ -n "$IS_VIRT" ]] && SYS_INFO_LINES+=("$(printf "%bVirt:   %s (hardware-specific steps hidden)%b" "${C_DIM}" "$IS_VIRT" "${C_RESET}")")
+  local rl pdl
+  for rl in "${RAM_HEALTH_LINES[@]}" "${GPU_TOPO_LINES[@]}"; do [[ -n "$rl" ]] && SYS_INFO_LINES+=("$rl"); done
+  pdl="$(power_daemon_conflict_line)"
+  [[ -n "$pdl" ]] && SYS_INFO_LINES+=("$pdl")
+  if grep -qiE "PowerEdge|ProLiant|ThinkSystem|Supermicro|PRIMERGY|SYS-[0-9]" <<<"${SYS_VENDOR} ${PRODUCT_NAME}"; then
+    SYS_INFO_LINES+=("$(printf "%bServer: set the BIOS/BMC system power profile to 'Performance' (not automated)%b" "${C_DIM}" "${C_RESET}")")
+  fi
 }
 
 pad_ansi_col() {
@@ -1824,8 +3071,22 @@ collect_strata_stats_lines() {
   STRATA_STAT_LINES=()
   STRATA_STAT_LINES+=("$(printf "%bStrata:%b" "${C_BOLD}" "${C_RESET}")")
   STRATA_STAT_LINES+=("$(printf "  %-8s %b%s%b" "Version:" "${C_DIM}" "${STRATA_VERSION:-Not installed}" "${C_RESET}")")
+  local svc_str=""
+  if strata_service_installed; then
+    if unit_active strata.service; then
+      svc_str="${C_GREEN}Installed (running via service)${C_RESET}"
+    elif [[ -n "$STRATA_RUNNING_PRESET" ]]; then
+      svc_str="${C_YELLOW}Installed (not running via service)${C_RESET}"
+    else
+      svc_str="${C_YELLOW}Installed (inactive)${C_RESET}"
+    fi
+  elif [[ -n "$STRATA_BIN" ]]; then
+    svc_str="${C_DIM}Not installed${C_RESET}"
+  fi
+
   if [[ -z "$STRATA_RUNNING_PRESET" ]]; then
     [[ -n "$STRATA_BIN" ]] && STRATA_STAT_LINES+=("$(printf "  %-8s %bNot serving%b" "Status:" "${C_DIM}" "${C_RESET}")")
+    [[ -n "$svc_str" ]] && STRATA_STAT_LINES+=("$(printf "  %-8s %b" "Service:" "$svc_str")")
     return 0
   fi
 
@@ -1869,6 +3130,7 @@ print(f"{model}|{live_s}|{avg_s}")
   STRATA_STAT_LINES+=("$(printf "  %-8s %s" "Preset:" "$preset_disp")")
   STRATA_STAT_LINES+=("$(printf "  %-8s %b%s%b" "Live:" "${C_CYAN}" "$live_str" "${C_RESET}")")
   STRATA_STAT_LINES+=("$(printf "  %-8s %b%s%b" "Avg:" "${C_GREEN}" "$avg_str" "${C_RESET}")")
+  [[ -n "$svc_str" ]] && STRATA_STAT_LINES+=("$(printf "  %-8s %b" "Service:" "$svc_str")")
 }
 
 print_stats_and_info_grid() {
@@ -1987,6 +3249,12 @@ read_step_action() {
         printf "\n"
         _act_out="__esc__"
         return 0
+      fi
+      if [[ "$esc_seq" == \[* || "$esc_seq" == O* ]] && [[ ! "$esc_seq" =~ [A-Za-z~]$ ]]; then
+        local _esc_ch="" _esc_n=0
+        while (( _esc_n++ < 8 )) && IFS= read -rsn1 -t 0.01 _esc_ch; do
+          [[ "$_esc_ch" =~ [A-Za-z~] ]] && break
+        done
       fi
     else
       buf+="$ch"
@@ -2115,6 +3383,12 @@ read_choice_with_live_stats() {
       elif [[ "$ch" == $'\e' ]]; then
         local esc_seq=""
         IFS= read -rsn2 -t 0.01 esc_seq || true
+        if [[ "$esc_seq" == \[* || "$esc_seq" == O* ]] && [[ ! "$esc_seq" =~ [A-Za-z~]$ ]]; then
+          local _esc_ch="" _esc_n=0
+          while (( _esc_n++ < 8 )) && IFS= read -rsn1 -t 0.01 _esc_ch; do
+            [[ "$_esc_ch" =~ [A-Za-z~] ]] && break
+          done
+        fi
         if (( footer_lines > 0 && ${#ACTIVE_STEPS[@]} > 0 )); then
           local old_idx="$INDEX_SELECTED" new_idx="$INDEX_SELECTED" total_steps="${#ACTIVE_STEPS[@]}"
           if [[ "$esc_seq" == "[A" || "$esc_seq" == "OA" ]]; then
@@ -2181,7 +3455,10 @@ format_index_row() {
   else
     note_txt="${C_DIM}-${C_RESET}"
   fi
-  title_txt="$(printf "%-74s" "$("title_${step}")")"
+  local raw_title
+  raw_title="$("title_${step}")"
+  (( ${#raw_title} > 74 )) && raw_title="${raw_title:0:71}..."
+  title_txt="$(printf "%-74s" "$raw_title")"
   if [[ "$selected" == true ]]; then
     ptr="${C_CYAN}>${C_RESET}"
     row_num="${C_CYAN}${C_BOLD}$(printf "%2d" "$num")${C_RESET}"
