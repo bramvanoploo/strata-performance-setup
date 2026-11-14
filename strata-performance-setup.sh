@@ -4988,7 +4988,11 @@ print_stats_and_info_grid() {
 
   print_live_stats "$inplace" || true
   local term_cols=120
-  [[ -t 1 ]] && term_cols="$(tput cols 2>/dev/null || echo 120)"
+  if [[ -t 1 ]]; then
+    term_cols="$(tput cols 2>/dev/null || echo 120)"
+  elif [[ -r /dev/tty ]]; then
+    term_cols="$(tput cols </dev/tty 2>/dev/null || echo 120)"
+  fi
 
   local out="" total_lines=0
   if (( term_cols >= 110 )); then
@@ -5011,20 +5015,20 @@ print_stats_and_info_grid() {
     for l in "${LIVE_STAT_LINES[@]}"; do
       [[ -n "$out" ]] && out+=$'\n'
       out+="${l}${eol}"
-      ((total_lines++))
+      total_lines=$((total_lines + 1))
     done
     out+=$'\n'"${eol}"
-    ((total_lines++))
+    total_lines=$((total_lines + 1))
     for l in "${SYS_INFO_LINES[@]}"; do
       out+=$'\n'"${l}${eol}"
-      ((total_lines++))
+      total_lines=$((total_lines + 1))
     done
   fi
   collect_strata_stats_lines
   collect_strata_bench_lines
   if (( ${#STRATA_STAT_LINES[@]} > 0 || ${#STRATA_BENCH_LINES[@]} > 0 )); then
     out+=$'\n'"${eol}"
-    ((total_lines++))
+    total_lines=$((total_lines + 1))
     if (( term_cols >= 110 )); then
       local n_sl="${#STRATA_STAT_LINES[@]}" n_bl="${#STRATA_BENCH_LINES[@]}"
       local max_sb=$(( n_sl > n_bl ? n_sl : n_bl ))
@@ -5036,19 +5040,19 @@ print_stats_and_info_grid() {
         (( r < n_sl )) && sl_s="${STRATA_STAT_LINES[$r]}"
         (( r < n_bl )) && bl_s="${STRATA_BENCH_LINES[$r]}"
         out+=$'\n'"$(pad_ansi_col "$sl_s" 56)${sep_sb}${bl_s}${eol}"
-        ((total_lines++))
+        total_lines=$((total_lines + 1))
       done
     else
       local sl
       for sl in "${STRATA_STAT_LINES[@]}"; do
         out+=$'\n'"${sl}${eol}"
-        ((total_lines++))
+        total_lines=$((total_lines + 1))
       done
       out+=$'\n'"${eol}"
-      ((total_lines++))
+      total_lines=$((total_lines + 1))
       for sl in "${STRATA_BENCH_LINES[@]}"; do
         out+=$'\n'"${sl}${eol}"
-        ((total_lines++))
+        total_lines=$((total_lines + 1))
       done
     fi
   fi
@@ -5088,6 +5092,24 @@ print_header() {
   echo ""
 }
 
+_can_live_stats() {
+  local lines_up="${1:-0}" term_lines="${2:-40}"
+  (( lines_up > 0 && (lines_up + 1 <= term_lines || (lines_up + 1 - term_lines) < LIVE_STATS_COUNT) ))
+}
+
+_render_live_stats_inplace() {
+  local lines_up="$1" term_lines="$2" stats_block="$3"
+  local up="$lines_up" block="$stats_block"
+  if (( lines_up + 1 > term_lines )); then
+    local skip=$(( lines_up + 1 - term_lines ))
+    up=$(( term_lines - 1 ))
+    (( up > 0 )) || return 0
+    block="$(awk -v s="$((skip + 1))" 'NR >= s' <<< "$stats_block")"
+    [[ -n "$block" ]] || return 0
+  fi
+  printf "\033[?2026h\033[?25l\033[s\033[%dA\r%s\033[u\033[?25h\033[?2026l" "$up" "$block"
+}
+
 read_line_with_live_stats() {
   local -n _line_out="$1"
   local prompt_str="${2:-Choose: }"
@@ -5100,7 +5122,7 @@ read_line_with_live_stats() {
 
   local term_lines=40 can_live=false
   term_lines="$(tput lines 2>/dev/null || echo 40)"
-  (( lines_up > 0 && lines_up + 1 <= term_lines )) && can_live=true
+  _can_live_stats "$lines_up" "$term_lines" && can_live=true
 
   local tmp_file="" sampler_pid=""
   if [[ "$can_live" == true ]]; then
@@ -5214,7 +5236,7 @@ read_line_with_live_stats() {
         fi
       elif [[ -n "$tmp_file" && -s "$tmp_file" ]]; then
         stats_block="$(<"$tmp_file")"
-        printf "\033[?2026h\033[?25l\033[s\033[%dA\r%s\033[u\033[?25h\033[?2026l" "$lines_up" "$stats_block"
+        _render_live_stats_inplace "$lines_up" "$term_lines" "$stats_block"
       fi
     else
       _cleanup_line_live; trap - INT TERM; printf "\n"; exit 0
@@ -5232,7 +5254,7 @@ read_step_action() {
 
   local term_lines=40 can_live=false
   term_lines="$(tput lines 2>/dev/null || echo 40)"
-  (( lines_up > 0 && lines_up + 1 <= term_lines )) && can_live=true
+  _can_live_stats "$lines_up" "$term_lines" && can_live=true
 
   local tmp_file="" sampler_pid=""
   if [[ "$can_live" == true ]]; then
@@ -5325,7 +5347,7 @@ read_step_action() {
         fi
       elif [[ -n "$tmp_file" && -s "$tmp_file" ]]; then
         stats_block="$(<"$tmp_file")"
-        printf "\033[?2026h\033[?25l\033[s\033[%dA\r%s\033[u\033[?25h\033[?2026l" "$lines_up" "$stats_block"
+        _render_live_stats_inplace "$lines_up" "$term_lines" "$stats_block"
       fi
     else
       _restore_step_tty
@@ -5420,7 +5442,7 @@ read_choice_with_live_stats() {
   fi
 
   term_lines="$(tput lines 2>/dev/null || echo 40)"
-  (( lines_up > 0 && lines_up + 1 <= term_lines )) && can_live=true
+  _can_live_stats "$lines_up" "$term_lines" && can_live=true
 
   local tmp_file="" sampler_pid=""
   local cur_running_url="$STRATA_RUNNING_URL" cur_svc_active="0"
@@ -5571,7 +5593,7 @@ read_choice_with_live_stats() {
       else
         if [[ -n "$tmp_file" && -s "$tmp_file" ]]; then
           stats_block="$(<"$tmp_file")"
-          printf "\033[?2026h\033[?25l\033[s\033[%dA\r%s\033[u\033[?25h\033[?2026l" "$lines_up" "$stats_block"
+          _render_live_stats_inplace "$lines_up" "$term_lines" "$stats_block"
         fi
         if [[ "$new_running_url" != "$cur_running_url" || "$new_svc_active" != "$cur_svc_active" ]]; then
           cur_running_url="$new_running_url"
