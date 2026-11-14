@@ -40,7 +40,10 @@ RYZENADJ_MARKER="/etc/strata-ryzenadj.prev" RAPL_MARKER="/etc/strata-rapl.prev" 
 HEADLESS_MARKER="/etc/strata-headless.prev" PSTATE_MARKER="/etc/strata-pstate.prev" GPU_GROUPS_MARKER="/etc/strata-gpu-groups.added"
 REBOOT_REQUIRED=false REBOOT_PROMPT_PENDING=false
 PREV_CPU_TOTAL="" PREV_CPU_IDLE="" PREV_RAPL_UJ="" PREV_RAPL_US="" LIVE_STATS_COUNT=0 POST_HEADER_LINES=0
-declare -a LIVE_STAT_LINES=() SYS_INFO_LINES=() STRATA_STAT_LINES=()
+declare -a LIVE_STAT_LINES=() SYS_INFO_LINES=() STRATA_STAT_LINES=() STRATA_BENCH_LINES=()
+STRATA_BENCH_CACHE_KEY=""
+STRATA_BENCH_HISTORY_FILE="$TARGET_HOME/.local/share/strata-performance-setup/bench-history.json"
+BENCH_POWER_SAMPLER_PID=""
 STRATA_UPDATE_AVAILABLE=false STRATA_UPDATE_SUMMARY="" STRATA_UPDATE_CACHE_FILE="" STRATA_POLLER_PID=""
 UNIT_FILES_CACHE=""
 declare -A PKG_AVAIL_CACHE PKG_INST_CACHE
@@ -480,7 +483,10 @@ for line in sys.stdin:
   fi
 }
 
-detect_environment() {
+PLATFORM_BASICS_DONE=false
+detect_platform_basics() {
+  [[ "$PLATFORM_BASICS_DONE" == true ]] && return 0
+  PLATFORM_BASICS_DONE=true
   UNIT_FILES_CACHE="$(systemctl list-unit-files --no-legend --no-pager 2>/dev/null || true)"
   IS_VIRT="$(systemd-detect-virt 2>/dev/null || true)"
   [[ "$IS_VIRT" == "none" ]] && IS_VIRT=""
@@ -509,6 +515,40 @@ detect_environment() {
       AUR_HELPER="paru"
     fi
   fi
+}
+
+ensure_script_tools() {
+  [[ "$DISTRO_FAMILY" != "unknown" ]] || return 0
+  [[ -t 0 ]] || return 0
+  local missing_cmds=() missing_pkgs=()
+  if ! command -v lspci >/dev/null 2>&1; then
+    missing_cmds+=("lspci"); missing_pkgs+=("pciutils")
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    missing_cmds+=("curl"); missing_pkgs+=("curl")
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    missing_cmds+=("python3")
+    case "$DISTRO_FAMILY" in
+      arch) missing_pkgs+=("python") ;;
+      *)    missing_pkgs+=("python3") ;;
+    esac
+  fi
+  if [[ -z "$IS_VIRT" ]] && ! command -v dmidecode >/dev/null 2>&1; then
+    missing_cmds+=("dmidecode"); missing_pkgs+=("dmidecode")
+  fi
+  [[ ${#missing_pkgs[@]} -eq 0 ]] && return 0
+
+  echo -e "${C_YELLOW}Missing tools needed by this script (${missing_cmds[*]}): ${C_BOLD}${missing_pkgs[*]}${C_RESET}"
+  if confirm_yn "Install missing script tools now? [Y/n]: " "Y"; then
+    pkg_install "${missing_pkgs[@]}" || echo -e "${C_YELLOW}Warning: Failed to install some tools; hardware detection or live stats may be incomplete.${C_RESET}"
+  else
+    echo -e "${C_DIM}Skipped installing missing script tools.${C_RESET}"
+  fi
+}
+
+detect_environment() {
+  detect_platform_basics
 
   if command -v nvidia-smi >/dev/null 2>&1; then
     local nv_q
@@ -784,22 +824,32 @@ append_gpu_pcie_lines() {
 # Step Registry
 # ------------------------------------------------------------------------------
 ALL_STEPS=(
-  base_tools prevent_sleep headless_target msi_cooling acpi_platform_profile
-  asus_perf dell_thermal lenovo_legion system76_perf tuxedo_perf
-  cpu_performance ryzenadj_tdp intel_rapl intel_thermald amd_x3d_mode intel_pcore_pinning cstate_limit tuned_profile memlock_realtime pcie_aspm iommu_pt gpu_groups
-  nvidia_persistenced nvidia_powerd nvidia_power_limit nvidia_clock_lock nvidia_ecc lact_overclock gpu_unlock
-  amd_gpu_perf amd_apu_memory intel_gpu_perf intel_compute_stack jetson_perf
-  sysctl_tuning nvme_tuning net_tuning zram_swap irq_balance numa_balancing numactl_interleave hugepages_1g scx_scheduler strata_manager
+  gpu_unlock amd_apu_memory
+  gpu_groups intel_compute_stack lact_overclock jetson_perf
+  nvidia_power_limit amd_gpu_perf intel_gpu_perf ryzenadj_tdp nvidia_ecc
+  headless_target numactl_interleave amd_x3d_mode intel_rapl msi_cooling lenovo_legion
+  asus_perf dell_thermal system76_perf tuxedo_perf acpi_platform_profile intel_pcore_pinning zram_swap numa_balancing
+  sysctl_tuning memlock_realtime nvme_tuning
+  nvidia_persistenced nvidia_powerd intel_thermald iommu_pt scx_scheduler
+  net_tuning irq_balance
+  prevent_sleep hugepages_1g
+  cpu_performance cstate_limit pcie_aspm nvidia_clock_lock tuned_profile
+  strata_manager
 )
 ACTIVE_STEPS=()
 
 VM_HIDDEN_STEPS=" msi_cooling acpi_platform_profile asus_perf dell_thermal lenovo_legion system76_perf tuxedo_perf cpu_performance cstate_limit pcie_aspm ryzenadj_tdp intel_rapl intel_thermald amd_x3d_mode intel_pcore_pinning tuned_profile jetson_perf "
 build_active_steps() {
-  ACTIVE_STEPS=()
-  local step
+  local step candidates=() pts
   for step in "${ALL_STEPS[@]}"; do
     [[ -n "$IS_VIRT" && "$VM_HIDDEN_STEPS" == *" $step "* ]] && continue
-    "applicable_${step}" && ACTIVE_STEPS+=("$step")
+    "applicable_${step}" && candidates+=("$step")
+  done
+  ACTIVE_STEPS=()
+  for (( pts = 10; pts >= 0; pts-- )); do
+    for step in "${candidates[@]}"; do
+      (( ${STEP_GAIN_PTS[$step]:-0} == pts )) && ACTIVE_STEPS+=("$step")
+    done
   done
 }
 
@@ -817,7 +867,6 @@ run_recommended_batch() {
     if [[ "$mode" == "apply" ]]; then
       "status_${step}" || targets+=("$step")
     else
-      [[ "$step" == "base_tools" ]] && continue
       "status_${step}" && targets+=("$step")
     fi
   done
@@ -864,28 +913,7 @@ run_recommended_batch() {
   pause_prompt
 }
 
-# 1. Base Tools
-applicable_base_tools() { return 0; }
-title_base_tools() { echo "Base Diagnostic & System Tools (curl, pciutils, lm_sensors)"; }
-status_base_tools() { command -v curl >/dev/null 2>&1 && command -v lspci >/dev/null 2>&1 && command -v sensors >/dev/null 2>&1; }
-explain_base_tools() {
-  cat <<'EOF'
-Impact:
-  Installs curl, pciutils (lspci), and lm_sensors for downloading Strata and
-  monitoring GPU, PCIe, and chassis temperatures under sustained AI load.
-EOF
-}
-apply_base_tools() {
-  case "$DISTRO_FAMILY" in
-    arch|fedora) prompt_install_deps repo curl pciutils lm_sensors || return 0 ;;
-    debian)      prompt_install_deps repo curl pciutils lm-sensors || return 0 ;;
-    suse)        prompt_install_deps repo curl pciutils sensors || return 0 ;;
-  esac
-  command -v sensors-detect >/dev/null 2>&1 && run_root sensors-detect --auto >/dev/null 2>&1 || true
-}
-revert_base_tools() { echo -e "${C_YELLOW}Base tools are shared system utilities and are kept installed.${C_RESET}"; }
-
-# 2. Prevent Sleep
+# 1. Prevent Sleep
 applicable_prevent_sleep() { return 0; }
 title_prevent_sleep() { echo "Disable System Sleep & Lid-Close Suspend (Server Uptime)"; }
 status_prevent_sleep() { [[ "$(systemctl is-enabled sleep.target 2>/dev/null || true)" == "masked" ]]; }
@@ -1090,7 +1118,7 @@ revert_tuxedo_perf() { run_root systemctl disable --now tccd.service 2>/dev/null
 # 4. CPU Performance
 applicable_cpu_performance() { [[ -d /sys/devices/system/cpu/cpu0/cpufreq ]] || command -v powerprofilesctl >/dev/null 2>&1; }
 title_cpu_performance() { echo "CPU Performance Profile & Governor (performance)"; }
-note_cpu_performance() { echo -e "${C_YELLOW}[!] Higher idle power, minimal gain${C_RESET}"; }
+note_cpu_performance() { echo -e "${C_YELLOW}[!]${C_RESET}"; }
 status_cpu_performance() {
   local gov ppd
   gov="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || true)"
@@ -1185,7 +1213,7 @@ revert_memlock_realtime() { run_root rm -f /etc/security/limits.d/99-strata-meml
 # 6. PCIe ASPM
 applicable_pcie_aspm() { [[ "$HAS_ASPM" == true ]] && grep -q "performance" /sys/module/pcie_aspm/parameters/policy 2>/dev/null; }
 title_pcie_aspm() { echo "PCIe ASPM Performance Policy (Low-Latency GPU Transfers)"; }
-note_pcie_aspm() { echo -e "${C_YELLOW}[!] Higher idle power, minimal gain${C_RESET}"; }
+note_pcie_aspm() { echo -e "${C_YELLOW}[!]${C_RESET}"; }
 status_pcie_aspm() { grep -q "\[performance\]" /sys/module/pcie_aspm/parameters/policy 2>/dev/null || has_kernel_param "pcie_aspm.policy=performance"; }
 explain_pcie_aspm() {
   cat <<'EOF'
@@ -1369,7 +1397,6 @@ applicable_gpu_unlock() {
   pkg_installed gpu-unlock-dkms || pkg_available repo gpu-unlock-dkms || pkg_available aur gpu-unlock-dkms
 }
 title_gpu_unlock() { echo "NVIDIA GPU Unlock Module & Kernel Param (gpu-unlock-dkms)"; }
-note_gpu_unlock() { echo -e "${C_BGREEN}[*] Big performance gains possible!${C_RESET}"; }
 status_gpu_unlock() { has_kernel_param "gpu_unlock.targets=all" && (lsmod | grep -q gpu_unlock || pkg_installed gpu-unlock-dkms); }
 explain_gpu_unlock() {
   cat <<'EOF'
@@ -1692,7 +1719,7 @@ applicable_cstate_limit() {
   return 1
 }
 title_cstate_limit() { echo "CPU Deep C-State Limit (lowest wake-up latency, C1 only)"; }
-note_cstate_limit() { echo -e "${C_YELLOW}[!] Higher idle power, minimal gain${C_RESET}"; }
+note_cstate_limit() { echo -e "${C_YELLOW}[!]${C_RESET}"; }
 status_cstate_limit() { cstate_limit_service_installed && unit_enabled strata-cstate-limit.service; }
 explain_cstate_limit() {
   cat <<'EOF'
@@ -1773,7 +1800,7 @@ revert_gpu_groups() {
 # 12h. NVIDIA Clock Lock
 applicable_nvidia_clock_lock() { [[ "$HAS_NVIDIA" == true && -n "$NVIDIA_MAX_GFX_CLK" ]]; }
 title_nvidia_clock_lock() { echo "NVIDIA Lock GPU Clocks at Maximum (${NVIDIA_MAX_GFX_CLK} MHz core)"; }
-note_nvidia_clock_lock() { echo -e "${C_YELLOW}[!] Higher idle power, minimal gain${C_RESET}"; }
+note_nvidia_clock_lock() { echo -e "${C_YELLOW}[!]${C_RESET}"; }
 status_nvidia_clock_lock() { [[ -f /etc/systemd/system/nvidia-clock-lock.service ]] && unit_enabled nvidia-clock-lock.service; }
 explain_nvidia_clock_lock() {
   cat <<EOF
@@ -2123,7 +2150,7 @@ tuned_target_profile() {
   fi
 }
 title_tuned_profile() { echo "tuned Profile (throughput-performance / accelerator-performance)"; }
-note_tuned_profile() { echo -e "${C_YELLOW}[!] Higher idle power, minimal gain${C_RESET}"; }
+note_tuned_profile() { echo -e "${C_YELLOW}[!]${C_RESET}"; }
 status_tuned_profile() {
   unit_active tuned.service || return 1
   tuned-adm active 2>/dev/null | grep -qE "throughput-performance|accelerator-performance"
@@ -2595,7 +2622,8 @@ explain_strata_manager() {
   cat <<'EOF'
 Impact:
   Installs Strata (Niko1221/Strata), checks for updates ('strata update'),
-  runs 'strata launch', and installs/uninstalls strata.service using a saved preset.
+  runs 'strata launch', benchmarks running instances ('strata bench run'),
+  and installs/uninstalls strata.service using a saved preset.
 EOF
   local hw_warns=""
   hw_warns="$(format_strata_hw_warnings)"
@@ -2659,10 +2687,524 @@ WantedBy=multi-user.target
 EOF
   echo -e "${C_GREEN}strata.service installed and started with preset '${selected_preset}'.${C_RESET}"
 }
+format_avg_power_str() {
+  local sys_w="${1:-}" gpu_w="${2:-}" cpu_w="${3:-}"
+  local parts=()
+  [[ -n "$gpu_w" ]] && parts+=("GPU ${gpu_w}W")
+  [[ -n "$cpu_w" ]] && parts+=("CPU ${cpu_w}W")
+  local detail=""
+  if (( ${#parts[@]} > 0 )); then
+    local i
+    for ((i=0; i<${#parts[@]}; i++)); do
+      (( i > 0 )) && detail+=", "
+      detail+="${parts[$i]}"
+    done
+  fi
+  if [[ -n "$sys_w" ]]; then
+    [[ -n "$detail" ]] && echo "Sys ${sys_w}W (${detail})" || echo "Sys ${sys_w}W"
+  elif [[ -n "$detail" ]]; then
+    echo "$detail"
+  fi
+}
+
+find_latest_results_json() {
+  local min_mtime="${1:-0}" newest="" d f fm
+  local search_dirs=("$PWD/bench/results" "$PWD/bench-results" "$TARGET_HOME/bench/results" "$TARGET_HOME/bench-results" "$TARGET_HOME/.local/share/strata/bench-results" "$TARGET_HOME/.config/strata/bench-results")
+  for d in "${search_dirs[@]}"; do
+    [[ -d "$d" ]] || continue
+    for f in "$d"/*/results.json "$d"/results.json; do
+      [[ -r "$f" ]] || continue
+      if (( min_mtime > 0 )); then
+        fm="$(stat -c '%Y' "$f" 2>/dev/null || echo 0)"
+        (( fm >= min_mtime )) || continue
+      fi
+      if [[ -z "$newest" || "$f" -nt "$newest" ]]; then
+        newest="$f"
+      fi
+    done
+  done
+  [[ -n "$newest" ]] && printf "%s" "$newest"
+}
+
+start_bench_power_sampler() {
+  local out_file="$1"
+  (
+    local n=0 gpu_sum="0" cpu_sum="0" sys_sum="0" gpu_n=0 cpu_n=0 sys_n=0
+    local prev_uj="" prev_us="" rapl_f="/sys/class/powercap/intel-rapl:0/energy_uj" rapl_mode="none"
+    if [[ -r "$rapl_f" ]]; then
+      rapl_mode="direct"
+    elif [[ -e "$rapl_f" ]] && sudo -n true >/dev/null 2>&1; then
+      rapl_mode="sudo"
+    fi
+    local stop=false
+    trap 'stop=true' TERM INT USR1
+    while [[ "$stop" == false ]]; do
+      local gw="0" has_g=false
+      if [[ "$HAS_NVIDIA" == true ]] && command -v nvidia-smi >/dev/null 2>&1; then
+        local nv_p
+        nv_p="$(nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits 2>/dev/null | awk '{if($1~/^[0-9]+(\.[0-9]+)?$/){s+=$1; c++}} END{if(c>0) printf "%.2f", s}')"
+        if [[ -n "$nv_p" ]]; then gw="$nv_p"; has_g=true; fi
+      fi
+      if [[ "$HAS_AMD" == true ]]; then
+        local card_dir hwmon_dir pa
+        for card_dir in /sys/class/drm/card*/device; do
+          for hwmon_dir in "$card_dir"/hwmon/hwmon*; do
+            if [[ -r "$hwmon_dir/power1_average" ]]; then
+              pa="$(cat "$hwmon_dir/power1_average" 2>/dev/null || echo 0)"
+              if [[ "$pa" =~ ^[0-9]+$ ]] && (( pa > 0 )); then
+                gw="$(awk -v a="$gw" -v b="$pa" 'BEGIN{printf "%.2f", a + b/1000000.0}')"
+                has_g=true
+                break
+              fi
+            fi
+          done
+        done
+      fi
+      if [[ "$has_g" == true ]]; then
+        gpu_sum="$(awk -v a="$gpu_sum" -v b="$gw" 'BEGIN{printf "%.2f", a + b}')"
+        ((gpu_n++))
+      fi
+
+      if [[ "$rapl_mode" != "none" ]]; then
+        local uj us
+        if [[ "$rapl_mode" == "direct" ]]; then
+          uj="$(cat "$rapl_f" 2>/dev/null || true)"
+        else
+          uj="$(sudo -n cat "$rapl_f" 2>/dev/null || true)"
+        fi
+        us="$(date +%s%6N 2>/dev/null || true)"
+        if [[ "$uj" =~ ^[0-9]+$ && "$us" =~ ^[0-9]+$ ]]; then
+          if [[ -n "$prev_uj" && -n "$prev_us" ]]; then
+            local de=$((uj - prev_uj)) dt=$((us - prev_us))
+            if (( de >= 0 && dt > 0 )); then
+              cpu_sum="$(awk -v a="$cpu_sum" -v de="$de" -v dt="$dt" 'BEGIN{printf "%.2f", a + (de/dt)}')"
+              ((cpu_n++))
+            fi
+          fi
+          prev_uj="$uj"; prev_us="$us"
+        fi
+      fi
+
+      local sw="" hm_dir hm_name pf uw
+      for hm_dir in /sys/class/hwmon/hwmon*; do
+        [[ -r "$hm_dir/name" ]] || continue
+        hm_name="$(cat "$hm_dir/name" 2>/dev/null || true)"
+        case "$hm_name" in
+          corsair-psu|acpi_power_meter|power_meter)
+            for pf in "$hm_dir"/power1_input "$hm_dir"/power1_average; do
+              if [[ -r "$pf" ]]; then
+                uw="$(cat "$pf" 2>/dev/null || echo 0)"
+                [[ "$uw" =~ ^[0-9]+$ ]] && (( uw > 0 )) && { sw="$(awk -v u="$uw" 'BEGIN{printf "%.2f", u/1000000.0}')"; break 2; }
+              fi
+            done
+            ;;
+        esac
+      done
+      if [[ -z "$sw" ]]; then
+        local bat_d bat_st cur_ua volt_uv
+        for bat_d in /sys/class/power_supply/BAT*; do
+          [[ -d "$bat_d" ]] || continue
+          if [[ -r "$bat_d/power_now" ]]; then
+            uw="$(cat "$bat_d/power_now" 2>/dev/null || echo 0)"
+            [[ "$uw" =~ ^[0-9]+$ ]] && (( uw > 0 )) && { sw="$(awk -v u="$uw" 'BEGIN{printf "%.2f", u/1000000.0}')"; break; }
+          elif [[ -r "$bat_d/current_now" && -r "$bat_d/voltage_now" ]]; then
+            bat_st="$(cat "$bat_d/status" 2>/dev/null || true)"
+            cur_ua="$(cat "$bat_d/current_now" 2>/dev/null || echo 0)"
+            volt_uv="$(cat "$bat_d/voltage_now" 2>/dev/null || echo 0)"
+            if [[ "$bat_st" == "Discharging" && "$cur_ua" =~ ^[0-9]+$ && "$volt_uv" =~ ^[0-9]+$ ]] && (( cur_ua > 0 && volt_uv > 0 )); then
+              sw="$(awk -v c="$cur_ua" -v v="$volt_uv" 'BEGIN{printf "%.2f", (c/1000000.0)*(v/1000000.0)}')"
+              break
+            fi
+          fi
+        done
+      fi
+      if [[ -n "$sw" ]]; then
+        sys_sum="$(awk -v a="$sys_sum" -v b="$sw" 'BEGIN{printf "%.2f", a + b}')"
+        ((sys_n++))
+      fi
+
+      ((n++))
+      sleep 1 &
+      wait $! 2>/dev/null || true
+    done
+
+    local avg_g="" avg_c="" avg_s=""
+    (( gpu_n > 0 )) && avg_g="$(awk -v s="$gpu_sum" -v c="$gpu_n" 'BEGIN{printf "%.1f", s/c}')"
+    (( cpu_n > 0 )) && avg_c="$(awk -v s="$cpu_sum" -v c="$cpu_n" 'BEGIN{printf "%.1f", s/c}')"
+    if (( sys_n > 0 )); then
+      avg_s="$(awk -v s="$sys_sum" -v c="$sys_n" 'BEGIN{printf "%.1f", s/c}')"
+    elif [[ -n "$avg_g" && -n "$avg_c" ]]; then
+      avg_s="$(awk -v g="$avg_g" -v c="$avg_c" 'BEGIN{printf "~%.1f", g+c}')"
+    fi
+    printf "%s|%s|%s|%d\n" "$avg_s" "$avg_g" "$avg_c" "$n" > "$out_file"
+  ) &
+  BENCH_POWER_SAMPLER_PID=$!
+}
+
+stop_bench_power_sampler() {
+  if [[ -n "$BENCH_POWER_SAMPLER_PID" ]]; then
+    kill -TERM "$BENCH_POWER_SAMPLER_PID" 2>/dev/null || true
+    wait "$BENCH_POWER_SAMPLER_PID" 2>/dev/null || true
+    BENCH_POWER_SAMPLER_PID=""
+  fi
+}
+
+save_bench_history_entry() {
+  local results_file="$1" mode="$2" avg_sys="$3" avg_gpu="$4" avg_cpu="$5" samples="$6" active_csv="$7" applicable_csv="$8"
+  command -v python3 >/dev/null 2>&1 || return 0
+  local hist_dir
+  hist_dir="$(dirname "$STRATA_BENCH_HISTORY_FILE")"
+  run_as_user_exec mkdir -p "$hist_dir" 2>/dev/null || mkdir -p "$hist_dir"
+  local tmp_file
+  tmp_file="$(mktemp "${STRATA_BENCH_HISTORY_FILE}.tmp.XXXXXX" 2>/dev/null || echo "")"
+  [[ -n "$tmp_file" ]] || return 1
+
+  python3 - "$STRATA_BENCH_HISTORY_FILE" "$tmp_file" "$results_file" "$mode" "${STRATA_RUNNING_PRESET:-}" "${STRATA_RUNNING_URL:-}" "$avg_sys" "$avg_gpu" "$avg_cpu" "${samples:-0}" "$active_csv" "$applicable_csv" <<'PY'
+import datetime, json, os, statistics, sys
+
+(
+    hist_path, tmp_path, res_path, mode, preset, url,
+    avg_sys, avg_gpu, avg_cpu, samples_s, active_csv, applicable_csv
+) = sys.argv[1:13]
+
+history = []
+if os.path.exists(hist_path):
+    try:
+        with open(hist_path) as f:
+            loaded = json.load(f)
+            if isinstance(loaded, list):
+                history = loaded
+    except Exception:
+        history = []
+
+res_data = {}
+if res_path and os.path.exists(res_path):
+    try:
+        with open(res_path) as f:
+            res_data = json.load(f)
+    except Exception:
+        res_data = {}
+
+run = res_data.get("run") or {}
+ts = run.get("timestamp") or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+cfg = res_data.get("configuration") or {}
+prof = cfg.get("profile") or preset or ""
+proto = res_data.get("protocol_id") or res_data.get("format") or ""
+tag = prof or ("standard-v1" if "standard" in proto else proto) or mode
+
+mdl = res_data.get("model") or {}
+m_name = mdl.get("name") or ""
+m_quant = mdl.get("quantization") or ""
+model_s = f"{m_name} ({m_quant})" if (m_name and m_quant) else (m_name or m_quant or "Unknown")
+
+sums = res_data.get("summaries") or {}
+reqs = res_data.get("requests") or []
+
+dec = sums.get("median_decode_tok_s")
+if dec is None:
+    dec = sums.get("decode_tps")
+if dec is None:
+    vals = [r.get("decode_tok_s") for r in reqs if isinstance(r, dict) and isinstance(r.get("decode_tok_s"), (int, float))]
+    if vals:
+        dec = statistics.median(vals)
+
+pre = sums.get("median_prefill_tok_s")
+if pre is None:
+    pre = sums.get("prompt_tps")
+if pre is None:
+    vals = [r.get("prefill_tok_s") for r in reqs if isinstance(r, dict) and isinstance(r.get("prefill_tok_s"), (int, float))]
+    if vals:
+        pre = statistics.median(vals)
+
+tot_r = sums.get("total_requests")
+fail_r = sums.get("failed_requests")
+if tot_r is None and reqs:
+    tot_r = len(reqs)
+    fail_r = sum(1 for r in reqs if isinstance(r, dict) and r.get("status") not in (None, "ok"))
+
+qual = res_data.get("quality") or {}
+entry = {
+    "id": run.get("id") or ts,
+    "timestamp": ts,
+    "mode": mode,
+    "tag": tag,
+    "preset": preset,
+    "url": url,
+    "results_file": res_path,
+    "model": model_s,
+    "decode_tok_s": round(dec, 2) if isinstance(dec, (int, float)) else None,
+    "prefill_tok_s": round(pre, 2) if isinstance(pre, (int, float)) else None,
+    "total_requests": tot_r if isinstance(tot_r, int) else None,
+    "failed_requests": fail_r if isinstance(fail_r, int) else 0,
+    "sanity_checks_passed": qual.get("sanity_checks_passed"),
+    "sanity_checks_total": qual.get("sanity_checks_total"),
+    "avg_power": {
+        "sys_w": avg_sys,
+        "gpu_w": avg_gpu,
+        "cpu_w": avg_cpu,
+        "samples": int(samples_s) if samples_s.isdigit() else 0,
+    },
+    "active_steps": [s for s in active_csv.split(",") if s],
+    "applicable_steps": [s for s in applicable_csv.split(",") if s],
+}
+history.append(entry)
+with open(tmp_path, "w") as f:
+    json.dump(history, f, indent=2)
+os.replace(tmp_path, hist_path)
+PY
+  if [[ $EUID -eq 0 && "$TARGET_USER" != "root" ]]; then
+    chown -R "$TARGET_USER:$(id -gn "$TARGET_USER")" "$hist_dir" 2>/dev/null || true
+  fi
+}
+
+count_bench_history() {
+  [[ -r "$STRATA_BENCH_HISTORY_FILE" ]] && command -v python3 >/dev/null 2>&1 || { echo 0; return 0; }
+  python3 - "$STRATA_BENCH_HISTORY_FILE" <<'PY' 2>/dev/null || echo 0
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+    print(len(d) if isinstance(d, list) else 0)
+except Exception:
+    print(0)
+PY
+}
+
+apply_bench_history_config() {
+  local target_csv="$1"
+  build_active_steps
+  local -A target_map=()
+  local st
+  IFS=',' read -ra _tarr <<< "$target_csv"
+  for st in "${_tarr[@]}"; do
+    [[ -n "$st" ]] && target_map["$st"]=1
+  done
+
+  local to_apply=() to_revert=()
+  for st in "${ACTIVE_STEPS[@]}"; do
+    [[ "$st" == "strata_manager" ]] && continue
+    local cur_applied=false
+    "status_${st}" && cur_applied=true
+    if [[ -n "${target_map[$st]+x}" ]]; then
+      [[ "$cur_applied" == false ]] && to_apply+=("$st")
+    else
+      [[ "$cur_applied" == true ]] && to_revert+=("$st")
+    fi
+  done
+
+  if (( ${#to_apply[@]} == 0 && ${#to_revert[@]} == 0 )); then
+    echo -e "\n${C_GREEN}System already matches this benchmark's active options.${C_RESET}"
+    return 0
+  fi
+
+  if (( ${#to_apply[@]} > 0 )); then
+    echo -e "\n${C_GREEN}Options to APPLY (${#to_apply[@]}):${C_RESET}"
+    for st in "${to_apply[@]}"; do echo "  + $("title_${st}")"; done
+  fi
+  if (( ${#to_revert[@]} > 0 )); then
+    echo -e "\n${C_RED}Options to REVERT (${#to_revert[@]}):${C_RESET}"
+    for st in "${to_revert[@]}"; do echo "  - $("title_${st}")"; done
+  fi
+
+  echo ""
+  confirm_yn "Apply and revert options to match this benchmark configuration? [y/N]: " "N" || return 0
+
+  for st in "${to_revert[@]}"; do
+    echo -e "\n${C_BOLD}${C_RED}>>> Reverting: $("title_${st}")${C_RESET}"
+    "revert_${st}" || echo -e "${C_YELLOW}Step '${st}' exited with a warning.${C_RESET}"
+  done
+  for st in "${to_apply[@]}"; do
+    echo -e "\n${C_BOLD}${C_CYAN}>>> Applying: $("title_${st}")${C_RESET}"
+    "apply_${st}" || echo -e "${C_YELLOW}Step '${st}' exited with a warning or was skipped.${C_RESET}"
+  done
+  echo -e "\n${C_GREEN}Finished restoring benchmark configuration.${C_RESET}"
+  prompt_reboot_if_needed
+}
+
+show_benchmark_history() {
+  while true; do
+    print_header
+    echo -e "${C_BOLD}Strata Benchmark History & Coupled Configurations${C_RESET}"
+    echo -e "${C_DIM}----------------------------------------------------------------------${C_RESET}"
+    if [[ ! -r "$STRATA_BENCH_HISTORY_FILE" ]] || ! command -v python3 >/dev/null 2>&1; then
+      echo -e "${C_DIM}No coupled benchmark history found yet.${C_RESET}"
+      echo -e "${C_DIM}Run a benchmark from the Strata step ([t]) to record results, power, and active options.${C_RESET}"
+      pause_prompt
+      return 0
+    fi
+
+    local rows=()
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && rows+=("$line")
+    done < <(python3 - "$STRATA_BENCH_HISTORY_FILE" <<'PY' 2>/dev/null || true
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+if not isinstance(d, list):
+    sys.exit(0)
+for idx, e in enumerate(reversed(d)):
+    ts = (e.get("timestamp") or "").replace("T", " ")
+    if ts.endswith("Z"):
+        ts = ts[:-1] + " UTC"
+    if len(ts) > 20 and " UTC" in ts:
+        ts = ts[:16] + " UTC"
+    tag = e.get("tag") or e.get("mode") or ""
+    model = e.get("model") or "Unknown"
+    dec = e.get("decode_tok_s")
+    pre = e.get("prefill_tok_s")
+    dec_s = f"{dec:.1f}" if isinstance(dec, (int, float)) else "—"
+    pre_s = f"{pre:.1f}" if isinstance(pre, (int, float)) else "—"
+    pwr = e.get("avg_power") or {}
+    sw = pwr.get("sys_w") or ""
+    gw = pwr.get("gpu_w") or ""
+    cw = pwr.get("cpu_w") or ""
+    act = ",".join(e.get("active_steps") or [])
+    act_n = len(e.get("active_steps") or [])
+    tot_r = e.get("total_requests")
+    fail_r = e.get("failed_requests") or 0
+    req_s = f"{tot_r - fail_r}/{tot_r} ok" if isinstance(tot_r, int) and tot_r > 0 else ""
+    qp = e.get("sanity_checks_passed")
+    qt = e.get("sanity_checks_total")
+    qual_s = f"Sanity {qp}/{qt}" if isinstance(qp, int) and isinstance(qt, int) and qt > 0 else ""
+    print("|".join([str(idx), ts, tag, model, dec_s, pre_s, sw, gw, cw, str(act_n), act, req_s, qual_s]))
+PY
+)
+    if (( ${#rows[@]} == 0 )); then
+      echo -e "${C_DIM}No coupled benchmark history found yet.${C_RESET}"
+      pause_prompt
+      return 0
+    fi
+
+    local r idx ts tag model dec_s pre_s sw gw cw act_n act_csv req_s qual_s pwr_s
+    for r in "${rows[@]}"; do
+      IFS='|' read -r idx ts tag model dec_s pre_s sw gw cw act_n act_csv req_s qual_s <<< "$r"
+      pwr_s="$(format_avg_power_str "$sw" "$gw" "$cw")"
+      [[ -z "$pwr_s" ]] && pwr_s="n/a"
+      printf "  ${C_BOLD}[%d]${C_RESET} %s (%s) | %s\n" "$((idx + 1))" "$ts" "$tag" "$model"
+      printf "      Decode: ${C_GREEN}%s tok/s${C_RESET} | Prefill: ${C_CYAN}%s tok/s${C_RESET} | Avg Power: ${C_YELLOW}%s${C_RESET} | Opts: %s active\n" "$dec_s" "$pre_s" "$pwr_s" "$act_n"
+    done
+
+    echo ""
+    echo -e "  ${C_DIM}Enter a number [1-${#rows[@]}] to inspect/restore its options, or [b/Enter] to go back:${C_RESET}"
+    local h_choice
+    read -r -p "Choose: " h_choice
+    case "$h_choice" in
+      ""|b|B|q|Q) return 0 ;;
+      *)
+        if ! [[ "$h_choice" =~ ^[0-9]+$ ]] || (( h_choice < 1 || h_choice > ${#rows[@]} )); then
+          echo -e "${C_RED}Invalid selection '${h_choice}'.${C_RESET}"; sleep 1
+          continue
+        fi
+        IFS='|' read -r idx ts tag model dec_s pre_s sw gw cw act_n act_csv req_s qual_s <<< "${rows[$((h_choice - 1))]}"
+        pwr_s="$(format_avg_power_str "$sw" "$gw" "$cw")"
+        [[ -z "$pwr_s" ]] && pwr_s="n/a"
+        echo ""
+        echo -e "${C_BOLD}Benchmark #${h_choice}: ${ts} (${tag})${C_RESET}"
+        echo "  Model:         $model"
+        echo "  Throughput:    Decode ${dec_s} tok/s | Prefill ${pre_s} tok/s"
+        echo "  Avg Power:     $pwr_s"
+        [[ -n "$req_s$qual_s" ]] && echo "  Checks:        ${req_s}${req_s:+${qual_s:+ | }}${qual_s}"
+        echo -e "  Active Opts (${act_n}):"
+        if [[ -z "$act_csv" ]]; then
+          echo "    (none)"
+        else
+          local _s
+          IFS=',' read -ra _slist <<< "$act_csv"
+          for _s in "${_slist[@]}"; do
+            if declare -F "title_${_s}" >/dev/null 2>&1; then
+              echo "    * $("title_${_s}")"
+            else
+              echo "    * $_s"
+            fi
+          done
+        fi
+        apply_bench_history_config "$act_csv"
+        pause_prompt
+        ;;
+    esac
+  done
+}
+
+run_strata_benchmark() {
+  refresh_strata_bin
+  refresh_strata_running
+  if [[ -z "$STRATA_BIN" || -z "$STRATA_RUNNING_URL" ]]; then
+    echo -e "${C_YELLOW}Strata must be installed and running to run a benchmark.${C_RESET}"
+    return 1
+  fi
+
+  echo -e "${C_BOLD}Strata Benchmark${C_RESET}"
+  echo -e "${C_DIM}Target: ${STRATA_RUNNING_PRESET:-active} (${STRATA_RUNNING_URL})${C_RESET}"
+  echo "  1) Quick local benchmark (strata bench run --url ${STRATA_RUNNING_URL} --skip-model-hash)"
+  echo "  2) Standard protocol benchmark (strata bench run --url ${STRATA_RUNNING_URL})"
+  echo "  3) Cancel"
+  local b_choice mode="" bench_args=()
+  read -r -p "Choose [1-3]: " b_choice
+  case "$b_choice" in
+    1)
+      mode="quick"
+      bench_args=(bench run --url "$STRATA_RUNNING_URL" --skip-model-hash)
+      ;;
+    2)
+      mode="standard"
+      bench_args=(bench run --url "$STRATA_RUNNING_URL")
+      ;;
+    3|"")
+      echo -e "${C_DIM}Benchmark cancelled.${C_RESET}"
+      return 0
+      ;;
+    *)
+      echo -e "${C_RED}Invalid selection '${b_choice}'. Cancelled.${C_RESET}"
+      return 1
+      ;;
+  esac
+
+  build_active_steps
+  local active_csv="" applicable_csv="" st
+  for st in "${ACTIVE_STEPS[@]}"; do
+    [[ "$st" == "strata_manager" ]] && continue
+    applicable_csv+="${applicable_csv:+,}${st}"
+    if "status_${st}"; then
+      active_csv+="${active_csv:+,}${st}"
+    fi
+  done
+
+  local pwr_file start_epoch rc=0
+  pwr_file="$(mktemp /tmp/strata-bench-pwr.XXXXXX 2>/dev/null || echo "")"
+  start_epoch="$(date +%s)"
+  [[ -n "$pwr_file" ]] && start_bench_power_sampler "$pwr_file"
+
+  echo -e "\n${C_CYAN}Running: ${STRATA_BIN} ${bench_args[*]}${C_RESET}\n"
+  run_as_user_exec "$STRATA_BIN" "${bench_args[@]}" || rc=$?
+
+  stop_bench_power_sampler
+  local avg_sys="" avg_gpu="" avg_cpu="" samples="0"
+  if [[ -n "$pwr_file" && -r "$pwr_file" ]]; then
+    IFS='|' read -r avg_sys avg_gpu avg_cpu samples < "$pwr_file"
+    rm -f "$pwr_file" 2>/dev/null || true
+  fi
+
+  local res_file=""
+  res_file="$(find_latest_results_json "$((start_epoch - 2))")"
+  if (( rc != 0 )) && [[ -z "$res_file" ]]; then
+    echo -e "\n${C_RED}Benchmark exited with code ${rc} and produced no results file.${C_RESET}"
+    return "$rc"
+  fi
+
+  save_bench_history_entry "$res_file" "$mode" "$avg_sys" "$avg_gpu" "$avg_cpu" "$samples" "$active_csv" "$applicable_csv"
+  STRATA_BENCH_CACHE_KEY=""
+  local pwr_disp
+  pwr_disp="$(format_avg_power_str "$avg_sys" "$avg_gpu" "$avg_cpu")"
+  echo -e "\n${C_GREEN}Benchmark saved to coupled host history.${C_RESET}"
+  [[ -n "$pwr_disp" ]] && echo -e "  Average Power: ${C_YELLOW}${pwr_disp}${C_RESET} (${samples}s)"
+  return "$rc"
+}
+
 apply_strata_manager() {
   refresh_strata_bin
   if [[ -z "$STRATA_BIN" ]]; then
     if confirm_yn "Strata is not installed. Install Strata now? [Y/n]: " "Y"; then
+      command -v curl >/dev/null 2>&1 || prompt_install_deps repo curl || return 0
       run_as_user "curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh | sh"
       refresh_strata_bin
       [[ -n "$STRATA_BIN" && -z "$STRATA_POLLER_PID" ]] && start_strata_update_poller
@@ -2705,6 +3247,12 @@ apply_strata_manager() {
     else
       echo -e "${C_DIM}No saved presets found yet; run 'strata launch' to create one first.${C_RESET}"
     fi
+  fi
+
+  refresh_strata_running
+  if [[ -n "$STRATA_BIN" && -n "$STRATA_RUNNING_URL" ]]; then
+    echo ""
+    confirm_yn "Strata is running (${STRATA_RUNNING_PRESET:-active} at ${STRATA_RUNNING_URL}). Run Strata benchmark now? [y/N]: " "N" && run_strata_benchmark
   fi
 }
 revert_strata_manager() {
@@ -2951,12 +3499,20 @@ print_live_stats() {
     done
   fi
   if [[ -z "$sys_pwr_w" ]]; then
-    local bat_p
-    for bat_p in /sys/class/power_supply/BAT*/power_now; do
-      if [[ -r "$bat_p" ]]; then
-        local uw
-        uw="$(cat "$bat_p" 2>/dev/null || echo 0)"
-        (( uw > 0 )) && { sys_pwr_w=$((uw / 1000000)); break; }
+    local bat_d bat_st cur_ua volt_uv uw
+    for bat_d in /sys/class/power_supply/BAT*; do
+      [[ -d "$bat_d" ]] || continue
+      if [[ -r "$bat_d/power_now" ]]; then
+        uw="$(cat "$bat_d/power_now" 2>/dev/null || echo 0)"
+        [[ "$uw" =~ ^[0-9]+$ ]] && (( uw > 0 )) && { sys_pwr_w=$((uw / 1000000)); break; }
+      elif [[ -r "$bat_d/current_now" && -r "$bat_d/voltage_now" ]]; then
+        bat_st="$(cat "$bat_d/status" 2>/dev/null || true)"
+        cur_ua="$(cat "$bat_d/current_now" 2>/dev/null || echo 0)"
+        volt_uv="$(cat "$bat_d/voltage_now" 2>/dev/null || echo 0)"
+        if [[ "$bat_st" == "Discharging" && "$cur_ua" =~ ^[0-9]+$ && "$volt_uv" =~ ^[0-9]+$ ]] && (( cur_ua > 0 && volt_uv > 0 )); then
+          sys_pwr_w="$(awk -v c="$cur_ua" -v v="$volt_uv" 'BEGIN{printf "%.0f", (c/1000000.0)*(v/1000000.0)}')"
+          break
+        fi
       fi
     done
   fi
@@ -3013,7 +3569,11 @@ print_live_stats() {
       fi
     fi
   done
-  [[ -n "$cpu_pwr_w" ]] && pwr_parts+=("CPU ${cpu_pwr_w}W")
+  if [[ -n "$cpu_pwr_w" ]]; then
+    pwr_parts+=("CPU ${cpu_pwr_w}W")
+  elif [[ -e "$rapl_file" && "$rapl_can_read" == false ]]; then
+    pwr_parts+=("$(printf "%bCPU/Sys n/a (sudo needed for RAPL)%b" "${C_DIM}" "${C_RESET}")")
+  fi
   if [[ -n "$sys_pwr_w" ]]; then
     pwr_parts+=("Sys ${sys_pwr_w}W")
   elif [[ -n "$cpu_pwr_w" && -n "$total_gpu_pwr_w" ]]; then
@@ -3133,6 +3693,162 @@ print(f"{model}|{live_s}|{avg_s}")
   [[ -n "$svc_str" ]] && STRATA_STAT_LINES+=("$(printf "  %-8s %b" "Service:" "$svc_str")")
 }
 
+collect_strata_bench_lines() {
+  local newest="" hist_mtime="0"
+  newest="$(find_latest_results_json 0)"
+  [[ -r "$STRATA_BENCH_HISTORY_FILE" ]] && hist_mtime="$(stat -c '%Y' "$STRATA_BENCH_HISTORY_FILE" 2>/dev/null || echo 0)"
+
+  if [[ -z "$newest" && "$hist_mtime" == "0" ]]; then
+    STRATA_BENCH_CACHE_KEY=""
+    STRATA_BENCH_LINES=()
+    STRATA_BENCH_LINES+=("$(printf "%bLatest Benchmark:%b" "${C_BOLD}" "${C_RESET}")")
+    STRATA_BENCH_LINES+=("$(printf "  %-8s %bNo benchmark history found%b" "Status:" "${C_DIM}" "${C_RESET}")")
+    if [[ -n "$STRATA_BIN" ]]; then
+      STRATA_BENCH_LINES+=("$(printf "  %-8s %b'strata bench run' (or Strata step -> [t])%b" "Run:" "${C_DIM}" "${C_RESET}")")
+    fi
+    return 0
+  fi
+
+  local mtime="0" cache_key
+  [[ -n "$newest" ]] && mtime="$(stat -c '%Y' "$newest" 2>/dev/null || echo 0)"
+  cache_key="${newest}:${mtime}:${hist_mtime}"
+  if [[ "$cache_key" == "$STRATA_BENCH_CACHE_KEY" && ${#STRATA_BENCH_LINES[@]} -gt 0 ]]; then
+    return 0
+  fi
+
+  local parsed=""
+  if command -v python3 >/dev/null 2>&1; then
+    parsed="$(python3 - "$newest" "$STRATA_BENCH_HISTORY_FILE" <<'PY' 2>/dev/null || true
+import json, os, statistics, sys
+
+res_path, hist_path = sys.argv[1], sys.argv[2]
+
+hist_entry = None
+if hist_path and os.path.exists(hist_path):
+    try:
+        with open(hist_path) as f:
+            hl = json.load(f)
+        if isinstance(hl, list) and hl:
+            if res_path:
+                for e in reversed(hl):
+                    if isinstance(e, dict) and e.get("results_file") == res_path:
+                        hist_entry = e
+                        break
+            if hist_entry is None and not res_path:
+                hist_entry = hl[-1]
+    except Exception:
+        pass
+
+if res_path and os.path.exists(res_path):
+    with open(res_path) as f:
+        d = json.load(f)
+    run = d.get("run") or {}
+    ts = (run.get("timestamp") or "").replace("T", " ")
+    if ts.endswith("Z"):
+        ts = ts[:-1] + " UTC"
+    if len(ts) > 20 and " UTC" in ts:
+        ts = ts[:16] + " UTC"
+
+    cfg = d.get("configuration") or {}
+    prof = cfg.get("profile") or ""
+    proto = d.get("protocol_id") or d.get("format") or ""
+    tag = prof or ("standard-v1" if "standard" in proto else proto)
+
+    mdl = d.get("model") or {}
+    m_name = mdl.get("name") or ""
+    m_quant = mdl.get("quantization") or ""
+    model_s = f"{m_name} ({m_quant})" if (m_name and m_quant) else (m_name or m_quant or "Unknown")
+
+    sums = d.get("summaries") or {}
+    reqs = d.get("requests") or []
+    dec = sums.get("median_decode_tok_s")
+    if dec is None:
+        dec = sums.get("decode_tps")
+    if dec is None:
+        vals = [r.get("decode_tok_s") for r in reqs if isinstance(r, dict) and isinstance(r.get("decode_tok_s"), (int, float))]
+        if vals:
+            dec = statistics.median(vals)
+    pre = sums.get("median_prefill_tok_s")
+    if pre is None:
+        pre = sums.get("prompt_tps")
+    if pre is None:
+        vals = [r.get("prefill_tok_s") for r in reqs if isinstance(r, dict) and isinstance(r.get("prefill_tok_s"), (int, float))]
+        if vals:
+            pre = statistics.median(vals)
+
+    dec_s = f"{dec:.1f} tok/s" if isinstance(dec, (int, float)) else "—"
+    pre_s = f"{pre:.1f} tok/s" if isinstance(pre, (int, float)) else "—"
+
+    tot_r = sums.get("total_requests")
+    fail_r = sums.get("failed_requests")
+    if tot_r is None and reqs:
+        tot_r = len(reqs)
+        fail_r = sum(1 for r in reqs if isinstance(r, dict) and r.get("status") not in (None, "ok"))
+    req_s = ""
+    if isinstance(tot_r, int) and tot_r > 0:
+        ok_r = tot_r - (fail_r if isinstance(fail_r, int) else 0)
+        req_s = f"{ok_r}/{tot_r} ok"
+
+    qual = d.get("quality") or {}
+    q_pass = qual.get("sanity_checks_passed")
+    q_tot = qual.get("sanity_checks_total")
+    qual_s = f"Sanity: {q_pass}/{q_tot}" if isinstance(q_pass, int) and isinstance(q_tot, int) and q_tot > 0 else ""
+elif hist_entry:
+    ts = (hist_entry.get("timestamp") or "").replace("T", " ")
+    if ts.endswith("Z"):
+        ts = ts[:-1] + " UTC"
+    if len(ts) > 20 and " UTC" in ts:
+        ts = ts[:16] + " UTC"
+    tag = hist_entry.get("tag") or hist_entry.get("mode") or ""
+    model_s = hist_entry.get("model") or "Unknown"
+    dec = hist_entry.get("decode_tok_s")
+    pre = hist_entry.get("prefill_tok_s")
+    dec_s = f"{dec:.1f} tok/s" if isinstance(dec, (int, float)) else "—"
+    pre_s = f"{pre:.1f} tok/s" if isinstance(pre, (int, float)) else "—"
+    tot_r = hist_entry.get("total_requests")
+    fail_r = hist_entry.get("failed_requests") or 0
+    req_s = f"{tot_r - fail_r}/{tot_r} ok" if isinstance(tot_r, int) and tot_r > 0 else ""
+    qp = hist_entry.get("sanity_checks_passed")
+    qt = hist_entry.get("sanity_checks_total")
+    qual_s = f"Sanity: {qp}/{qt}" if isinstance(qp, int) and isinstance(qt, int) and qt > 0 else ""
+else:
+    sys.exit(0)
+
+pwr = (hist_entry or {}).get("avg_power") or {}
+sw = pwr.get("sys_w") or ""
+gw = pwr.get("gpu_w") or ""
+cw = pwr.get("cpu_w") or ""
+print("|".join([ts, tag, model_s, dec_s, pre_s, req_s, qual_s, sw, gw, cw]))
+PY
+)"
+  fi
+
+  STRATA_BENCH_CACHE_KEY="$cache_key"
+  STRATA_BENCH_LINES=()
+  STRATA_BENCH_LINES+=("$(printf "%bLatest Benchmark:%b" "${C_BOLD}" "${C_RESET}")")
+  if [[ -z "$parsed" ]]; then
+    STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b" "File:" "${C_DIM}" "${newest:-None}" "${C_RESET}")")
+    return 0
+  fi
+
+  local b_ts b_tag b_model b_dec b_pre b_req b_qual b_sw b_gw b_cw b_pwr
+  IFS='|' read -r b_ts b_tag b_model b_dec b_pre b_req b_qual b_sw b_gw b_cw <<< "$parsed"
+  local date_disp="${b_ts:-Unknown}"
+  [[ -n "$b_tag" ]] && date_disp+=" (${b_tag})"
+  STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b" "Date:" "${C_DIM}" "$date_disp" "${C_RESET}")")
+  STRATA_BENCH_LINES+=("$(printf "  %-8s %s" "Model:" "$b_model")")
+  STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b | Prefill: %b%s%b" "Decode:" "${C_GREEN}" "$b_dec" "${C_RESET}" "${C_CYAN}" "$b_pre" "${C_RESET}")")
+  b_pwr="$(format_avg_power_str "$b_sw" "$b_gw" "$b_cw")"
+  [[ -n "$b_pwr" ]] && STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b" "Power:" "${C_YELLOW}" "$b_pwr" "${C_RESET}")")
+  local summary_tail=""
+  [[ -n "$b_req" ]] && summary_tail="Reqs: ${b_req}"
+  if [[ -n "$b_qual" ]]; then
+    [[ -n "$summary_tail" ]] && summary_tail+=" | "
+    summary_tail+="$b_qual"
+  fi
+  [[ -n "$summary_tail" ]] && STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b" "Checks:" "${C_DIM}" "$summary_tail" "${C_RESET}")")
+}
+
 print_stats_and_info_grid() {
   local inplace="${1:-false}" eol=""
   [[ "$inplace" == true ]] && eol=$'\033[K'
@@ -3172,14 +3888,36 @@ print_stats_and_info_grid() {
     done
   fi
   collect_strata_stats_lines
-  if (( ${#STRATA_STAT_LINES[@]} > 0 )); then
+  collect_strata_bench_lines
+  if (( ${#STRATA_STAT_LINES[@]} > 0 || ${#STRATA_BENCH_LINES[@]} > 0 )); then
     out+=$'\n'"${eol}"
     ((total_lines++))
-    local sl
-    for sl in "${STRATA_STAT_LINES[@]}"; do
-      out+=$'\n'"${sl}${eol}"
+    if (( term_cols >= 110 )); then
+      local n_sl="${#STRATA_STAT_LINES[@]}" n_bl="${#STRATA_BENCH_LINES[@]}"
+      local max_sb=$(( n_sl > n_bl ? n_sl : n_bl ))
+      local r sl_s bl_s sep_sb
+      sep_sb="$(printf "  %b│%b  " "${C_DIM}" "${C_RESET}")"
+      for ((r=0; r<max_sb; r++)); do
+        sl_s=""
+        bl_s=""
+        (( r < n_sl )) && sl_s="${STRATA_STAT_LINES[$r]}"
+        (( r < n_bl )) && bl_s="${STRATA_BENCH_LINES[$r]}"
+        out+=$'\n'"$(pad_ansi_col "$sl_s" 56)${sep_sb}${bl_s}${eol}"
+        ((total_lines++))
+      done
+    else
+      local sl
+      for sl in "${STRATA_STAT_LINES[@]}"; do
+        out+=$'\n'"${sl}${eol}"
+        ((total_lines++))
+      done
+      out+=$'\n'"${eol}"
       ((total_lines++))
-    done
+      for sl in "${STRATA_BENCH_LINES[@]}"; do
+        out+=$'\n'"${sl}${eol}"
+        ((total_lines++))
+      done
+    fi
   fi
   LIVE_STATS_COUNT="$total_lines"
   printf "%s\n" "$out"
@@ -3279,6 +4017,8 @@ run_step_view() {
 
     if [[ "$step" == "strata_manager" ]]; then
       echo -e "  ${C_GREEN}[a]${C_RESET} Open Strata Install / Update / Launch / Service menu"
+      [[ -n "$STRATA_BIN" && -n "$STRATA_RUNNING_URL" ]] && echo -e "  ${C_CYAN}[t]${C_RESET} Run Strata benchmark ('strata bench run')"
+      echo -e "  ${C_BOLD}[h]${C_RESET} Benchmark history & restore coupled options"
       strata_service_installed && echo -e "  ${C_RED}[r]${C_RESET} Uninstall strata.service"
     else
       if [[ "$applied" == true ]]; then
@@ -3298,6 +4038,20 @@ run_step_view() {
           echo ""; perform_strata_update; pause_prompt
         else
           echo -e "${C_YELLOW}No Strata update available.${C_RESET}"; sleep 1
+        fi
+        ;;
+      t|T)
+        if [[ "$step" == "strata_manager" && -n "$STRATA_BIN" && -n "$STRATA_RUNNING_URL" ]]; then
+          echo ""; run_strata_benchmark; pause_prompt
+        else
+          echo -e "${C_YELLOW}Invalid action '${action}'.${C_RESET}"; sleep 1
+        fi
+        ;;
+      h|H)
+        if [[ "$step" == "strata_manager" ]]; then
+          show_benchmark_history
+        else
+          echo -e "${C_YELLOW}Invalid action '${action}'.${C_RESET}"; sleep 1
         fi
         ;;
       a|A)
@@ -3444,17 +4198,80 @@ read_choice_with_live_stats() {
 
 INDEX_SELECTED=0
 
+# Relative performance/utility rating per step on a 10-point scale (0 = no rating/stars, 1 = 0.5 stars, 10 = 5.0 stars).
+declare -A STEP_GAIN_PTS=(
+  [gpu_unlock]=10
+  [amd_apu_memory]=10
+  [gpu_groups]=9
+  [intel_compute_stack]=9
+  [lact_overclock]=9
+  [jetson_perf]=9
+  [nvidia_power_limit]=8
+  [amd_gpu_perf]=8
+  [intel_gpu_perf]=8
+  [ryzenadj_tdp]=8
+  [nvidia_ecc]=8
+  [headless_target]=7
+  [numactl_interleave]=7
+  [amd_x3d_mode]=7
+  [intel_rapl]=7
+  [msi_cooling]=7
+  [lenovo_legion]=7
+  [asus_perf]=6
+  [dell_thermal]=6
+  [system76_perf]=6
+  [tuxedo_perf]=6
+  [acpi_platform_profile]=6
+  [intel_pcore_pinning]=6
+  [zram_swap]=6
+  [numa_balancing]=6
+  [sysctl_tuning]=5
+  [memlock_realtime]=5
+  [nvme_tuning]=5
+  [nvidia_persistenced]=4
+  [nvidia_powerd]=4
+  [intel_thermald]=4
+  [iommu_pt]=4
+  [scx_scheduler]=4
+  [net_tuning]=3
+  [irq_balance]=3
+  [prevent_sleep]=2
+  [hugepages_1g]=2
+  [cpu_performance]=1
+  [cstate_limit]=1
+  [pcie_aspm]=1
+  [nvidia_clock_lock]=1
+  [tuned_profile]=1
+  [strata_manager]=0
+)
+
+render_gain_stars() {
+  local pts="${1:-0}"
+  if (( pts <= 0 )); then
+    printf "         "
+    return 0
+  fi
+  (( pts > 10 )) && pts=10
+  local full=$(( pts / 2 )) half=$(( pts % 2 )) empty=$(( 5 - pts / 2 - pts % 2 ))
+  local filled_str="" empty_str="" i
+  for ((i=0; i<full; i++)); do filled_str+="★"; done
+  (( half == 1 )) && filled_str+="½"
+  for ((i=0; i<empty; i++)); do empty_str+="☆"; done
+  printf "%b%s%b%b%s%b    " "${C_YELLOW}" "$filled_str" "${C_RESET}" "${C_DIM}" "$empty_str" "${C_RESET}"
+}
+
 format_index_row() {
   local idx="$1" selected="${2:-false}"
   local step="${ACTIVE_STEPS[$idx]}"
   local num=$(( idx + 1 ))
-  local badge note_txt title_txt ptr row_num
+  local badge note_txt title_txt gain_txt ptr row_num
   "status_${step}" && badge="${C_GREEN}[APPLIED]    ${C_RESET}" || badge="${C_YELLOW}[NOT APPLIED]${C_RESET}"
   if declare -F "note_${step}" >/dev/null 2>&1; then
     note_txt="$("note_${step}")"
   else
     note_txt="${C_DIM}-${C_RESET}"
   fi
+  gain_txt="$(render_gain_stars "${STEP_GAIN_PTS[$step]:-0}")"
   local raw_title
   raw_title="$("title_${step}")"
   (( ${#raw_title} > 74 )) && raw_title="${raw_title:0:71}..."
@@ -3467,7 +4284,7 @@ format_index_row() {
     ptr=" "
     row_num="$(printf "%2d" "$num")"
   fi
-  printf "%b %b  | %b | %b | %b" "$ptr" "$row_num" "$badge" "$title_txt" "$note_txt"
+  printf "%b %b  | %b | %b | %b | %b" "$ptr" "$row_num" "$badge" "$title_txt" "$gain_txt" "$note_txt"
 }
 
 show_index() {
@@ -3490,8 +4307,8 @@ show_index() {
     fi
 
     body+="$(echo -e "${C_BOLD}Optimization Index (Applicable to this machine):${C_RESET}")"$'\n\n'
-    body+="$(printf "  ${C_BOLD}%-3s | %-13s | %-74s | %s${C_RESET}" "#" "Status" "Optimization" "Notes")"$'\n'
-    body+="$(printf "  %s" "----+---------------+----------------------------------------------------------------------------+------------------------------------")"$'\n'
+    body+="$(printf "  ${C_BOLD}%-3s | %-13s | %-74s | %-9s | %s${C_RESET}" "#" "Status" "Optimization" "Potential" "")"$'\n'
+    body+="$(printf "  %s" "----+---------------+----------------------------------------------------------------------------+-----------+-----")"$'\n'
     local idx
     for (( idx = 0; idx < ${#ACTIVE_STEPS[@]}; idx++ )); do
       if (( idx == INDEX_SELECTED )); then
@@ -3500,11 +4317,17 @@ show_index() {
         body+="$(format_index_row "$idx" false)"$'\n'
       fi
     done
+    body+=$'\n'"$(echo -e "  ${C_YELLOW}[!]${C_RESET} ${C_DIM}Higher idle power, minimal gain${C_RESET}")"$'\n'
 
-    local footer_lines=8
+    local footer_lines=8 hist_count
+    hist_count="$(count_bench_history)"
     body+=$'\n'"$(echo -e "  ${C_BOLD}[w]${C_RESET} Start guided wizard from Step 1")"$'\n'
     if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
       body+="$(echo -e "  ${C_BGREEN}[u]${C_RESET} Install Strata update (${STRATA_UPDATE_SUMMARY})")"$'\n'
+      ((footer_lines++))
+    fi
+    if (( hist_count > 0 )); then
+      body+="$(echo -e "  ${C_CYAN}[h]${C_RESET} Benchmark history & restore coupled options (${hist_count})")"$'\n'
       ((footer_lines++))
     fi
     body+="$(echo -e "  ${C_GREEN}[a]${C_RESET} Apply all recommended optimizations (excludes Strata & high-idle-power options)")"$'\n'
@@ -3533,6 +4356,7 @@ show_index() {
           echo -e "${C_YELLOW}No Strata update available.${C_RESET}"; sleep 1
         fi
         ;;
+      h|H) show_benchmark_history ;;
       w|W) run_step_view 0 "wizard" ;;
       a|A) run_recommended_batch "apply" ;;
       x|X) run_recommended_batch "revert" ;;
@@ -3553,6 +4377,12 @@ show_index() {
 }
 
 trap 'stop_strata_update_poller' EXIT
+if [[ $EUID -ne 0 && -t 0 ]] && command -v sudo >/dev/null 2>&1 && ! sudo -n true >/dev/null 2>&1; then
+  echo -e "${C_DIM}Sudo access is used for hardware sensors (RAPL CPU power, DMI RAM info) and applying optimizations.${C_RESET}"
+  sudo -v || true
+fi
+detect_platform_basics
+ensure_script_tools
 detect_environment
 start_strata_update_poller
 show_index
