@@ -41,6 +41,7 @@ RYZENADJ_MARKER="/etc/strata-ryzenadj.prev" RAPL_MARKER="/etc/strata-rapl.prev" 
 HEADLESS_MARKER="/etc/strata-headless.prev" PSTATE_MARKER="/etc/strata-pstate.prev" GPU_GROUPS_MARKER="/etc/strata-gpu-groups.added"
 REBOOT_REQUIRED=false REBOOT_PROMPT_PENDING=false
 PREV_CPU_TOTAL="" PREV_CPU_IDLE="" PREV_RAPL_UJ="" PREV_RAPL_US="" LIVE_STATS_COUNT=0 POST_HEADER_LINES=0
+TERM_COLS_CACHED=120 LIVE_COMPACT_SYS="" LIVE_COMPACT_STRATA=""
 declare -a LIVE_STAT_LINES=() SYS_INFO_LINES=() STRATA_STAT_LINES=() STRATA_BENCH_LINES=()
 STRATA_BENCH_CACHE_KEY=""
 BENCH_HISTORY_COUNT_KEY="" BENCH_HISTORY_COUNT_CACHE=0
@@ -4542,6 +4543,32 @@ print_live_stats() {
     done
     LIVE_STAT_LINES+=("$(printf "  %-8s %s" "Power:" "$pwr_line")")
   fi
+
+  local _cparts=()
+  [[ -n "$cpu_pct" ]] && _cparts+=("CPU ${cpu_pct}%${cpu_temp:+ (${cpu_temp}°C)}")
+  [[ -n "$ram_pct" ]] && _cparts+=("RAM ${ram_pct}%")
+  for ((gi=0; gi<gpu_count; gi++)); do
+    local _gl="GPU"; (( gpu_count > 1 )) && _gl="GPU${gi}"
+    [[ -n "${gpu_pcts[$gi]}" ]] && _cparts+=("${_gl} ${gpu_pcts[$gi]}%${gpu_temps[$gi]:+ (${gpu_temps[$gi]}°C)}")
+  done
+  local _cpwr=()
+  [[ -n "$total_gpu_pwr_w" ]] && _cpwr+=("GPU ${total_gpu_pwr_w}W")
+  [[ -n "$cpu_pwr_w" ]] && _cpwr+=("CPU ${cpu_pwr_w}W")
+  [[ -n "$sys_pwr_w" ]] && _cpwr+=("Sys ${sys_pwr_w}W")
+  if (( ${#_cpwr[@]} > 0 )); then
+    local _ps="" _pi=0
+    for ((_pi=0; _pi<${#_cpwr[@]}; _pi++)); do
+      (( _pi > 0 )) && _ps+="/"
+      _ps+="${_cpwr[$_pi]}"
+    done
+    _cparts+=("Pwr ${_ps}")
+  fi
+  LIVE_COMPACT_SYS=""
+  local _ci=0
+  for ((_ci=0; _ci<${#_cparts[@]}; _ci++)); do
+    (( _ci > 0 )) && LIVE_COMPACT_SYS+=" | "
+    LIVE_COMPACT_SYS+="${_cparts[$_ci]}"
+  done
 }
 
 build_sys_info_lines() {
@@ -4603,6 +4630,8 @@ collect_strata_stats_lines() {
   fi
 
   if [[ -z "$STRATA_RUNNING_PRESET" ]]; then
+    LIVE_COMPACT_STRATA=""
+    [[ -n "$STRATA_BIN" ]] && LIVE_COMPACT_STRATA="Strata: idle"
     [[ -n "$STRATA_BIN" ]] && STRATA_STAT_LINES+=("$(printf "  %-8s %bNot serving%b" "Status:" "${C_DIM}" "${C_RESET}")")
     [[ -n "$svc_str" ]] && STRATA_STAT_LINES+=("$(printf "  %-8s %b" "Service:" "$svc_str")")
     return 0
@@ -4651,6 +4680,7 @@ print(f"{model}|{live_s}|{avg_s}")
   STRATA_STAT_LINES+=("$(printf "  %-8s %b%s%b" "Live:" "${C_CYAN}" "$live_str" "${C_RESET}")")
   STRATA_STAT_LINES+=("$(printf "  %-8s %b%s%b" "Avg:" "${C_GREEN}" "$avg_str" "${C_RESET}")")
   [[ -n "$svc_str" ]] && STRATA_STAT_LINES+=("$(printf "  %-8s %b" "Service:" "$svc_str")")
+  LIVE_COMPACT_STRATA="Strata: ${live_str}"
 }
 
 format_pct_delta() {
@@ -4987,11 +5017,10 @@ print_stats_and_info_grid() {
   [[ "$inplace" == true ]] && eol=$'\033[K'
 
   print_live_stats "$inplace" || true
-  local term_cols=120
+  local term_cols="${TERM_COLS_CACHED:-120}"
   if [[ -t 1 ]]; then
     term_cols="$(tput cols 2>/dev/null || echo 120)"
-  elif [[ -r /dev/tty ]]; then
-    term_cols="$(tput cols </dev/tty 2>/dev/null || echo 120)"
+    TERM_COLS_CACHED="$term_cols"
   fi
 
   local out="" total_lines=0
@@ -5060,7 +5089,19 @@ print_stats_and_info_grid() {
   printf "%s\n" "$out"
 }
 
+format_stats_toggle_row() {
+  local selected="${1:-false}"
+  local ptr=" " tag="[STATS]" title="View Live System, Strata & Benchmark Statistics" sub="(CPU / RAM / GPU / Power / Live tok/s)"
+  if [[ "$selected" == true ]]; then
+    ptr="${C_CYAN}>${C_RESET}"
+    printf "%b %b%s%b  %b%s%b  %b%s%b" "$ptr" "${C_BGREEN}${C_BOLD}" "$tag" "${C_RESET}" "${C_CYAN}${C_BOLD}" "$title" "${C_RESET}" "${C_CYAN}" "$sub" "${C_RESET}"
+  else
+    printf "%b %b%s%b  %b%s%b  %b%s%b" "$ptr" "${C_YELLOW}${C_BOLD}" "$tag" "${C_RESET}" "${C_BOLD}" "$title" "${C_RESET}" "${C_DIM}" "$sub" "${C_RESET}"
+  fi
+}
+
 print_header() {
+  local show_toggle="${1:-false}"
   clear 2>/dev/null || true
   local _rule_w=120 _hdr_eq="" _hdr_rule=""
   [[ -t 1 ]] && _rule_w="$(tput cols 2>/dev/null || echo 120)"
@@ -5077,10 +5118,21 @@ print_header() {
   load_strata_update_state
   refresh_strata_running
   build_sys_info_lines
-  print_stats_and_info_grid false
+  if [[ "$show_toggle" == true ]]; then
+    LIVE_STATS_COUNT=0
+    LIVE_STAT_LINES=()
+    echo ""
+    local _tgl_sel=false
+    (( INDEX_SELECTED == 0 )) && _tgl_sel=true
+    printf "%s\n" "$(format_stats_toggle_row "$_tgl_sel")"
+    echo ""
+    POST_HEADER_LINES=3
+  else
+    print_stats_and_info_grid false
+    POST_HEADER_LINES=2
+  fi
   printf -v _hdr_rule "%*s" "$_rule_w" ""
   echo -e "${C_DIM}${_hdr_rule// /─}${C_RESET}"
-  POST_HEADER_LINES=2
   if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
     echo -e "\n${C_BGREEN}[UPDATE AVAILABLE]${C_RESET} ${C_CYAN}Strata update ready (${STRATA_UPDATE_SUMMARY}). Press [u] to install & restart service.${C_RESET}"
     ((POST_HEADER_LINES += 2))
@@ -5094,7 +5146,30 @@ print_header() {
 
 _can_live_stats() {
   local lines_up="${1:-0}" term_lines="${2:-40}"
-  (( lines_up > 0 && (lines_up + 1 <= term_lines || (lines_up + 1 - term_lines) < LIVE_STATS_COUNT) ))
+  (( lines_up > 0 && (lines_up + 1 <= term_lines || (lines_up + 1 - term_lines) < ${#LIVE_STAT_LINES[@]}) ))
+}
+
+format_compact_live_bar() {
+  local max_w="${TERM_COLS_CACHED:-120}"
+  local txt=""
+  [[ -n "$LIVE_COMPACT_SYS" ]] && txt="$LIVE_COMPACT_SYS"
+  if [[ -n "$LIVE_COMPACT_STRATA" ]]; then
+    [[ -n "$txt" ]] && txt+=" | "
+    txt+="$LIVE_COMPACT_STRATA"
+  fi
+  [[ -n "$txt" ]] || return 0
+  local prefix="  [Live] "
+  local avail=$(( max_w - ${#prefix} - 1 ))
+  if (( avail > 10 && ${#txt} > avail )); then
+    txt="${txt:0:$((avail - 3))}..."
+  fi
+  printf "%b%s%b%s%b" "${C_CYAN}${C_BOLD}" "  [Live] " "${C_RESET}${C_DIM}" "$txt" "${C_RESET}"
+}
+
+_render_live_bar_inplace() {
+  local bar_line="$1"
+  [[ -n "$bar_line" ]] || return 0
+  printf "\033[?2026h\033[?25l\033[s\033[1A\r\033[2K%s\033[u\033[?25h\033[?2026l" "$bar_line"
 }
 
 _render_live_stats_inplace() {
@@ -5120,31 +5195,42 @@ read_line_with_live_stats() {
     return 0
   fi
 
-  local term_lines=40 can_live=false
+  local term_lines=40 compact_bar=false
   term_lines="$(tput lines 2>/dev/null || echo 40)"
-  _can_live_stats "$lines_up" "$term_lines" && can_live=true
+  if ! _can_live_stats "$lines_up" "$term_lines"; then
+    compact_bar=true
+    local _bar0
+    _bar0="$(format_compact_live_bar)"
+    if [[ -n "$_bar0" ]]; then
+      printf "%s\n" "$_bar0"
+      local _hi
+      for (( _hi = 0; _hi < ${#HIST_HDR_LINES[@]}; _hi++ )); do
+        HIST_HDR_LINES[$_hi]=$(( HIST_HDR_LINES[_hi] + 1 ))
+      done
+    fi
+  fi
 
   local tmp_file="" sampler_pid=""
-  if [[ "$can_live" == true ]]; then
-    tmp_file="$(mktemp /tmp/strata-stats.XXXXXX 2>/dev/null || echo "")"
-    if [[ -n "$tmp_file" ]]; then
-      (
-        trap 'exit 0' TERM INT
-        while true; do
-          sleep 1 &
-          wait $! 2>/dev/null || exit 0
-          refresh_strata_running
-          if print_stats_and_info_grid true > "${tmp_file}.tmp" 2>/dev/null; then
-            printf "%s\n" "$LIVE_STATS_COUNT" > "${tmp_file}.meta.tmp" 2>/dev/null || true
-            mv -f "${tmp_file}.meta.tmp" "${tmp_file}.meta" 2>/dev/null || true
-            mv -f "${tmp_file}.tmp" "$tmp_file" 2>/dev/null || true
-          fi
-        done
-      ) &
-      sampler_pid=$!
-      ACTIVE_SAMPLER_PID="$sampler_pid"
-      ACTIVE_SAMPLER_TMP="$tmp_file"
-    fi
+  tmp_file="$(mktemp /tmp/strata-stats.XXXXXX 2>/dev/null || echo "")"
+  if [[ -n "$tmp_file" ]]; then
+    (
+      trap 'exit 0' TERM INT
+      while true; do
+        sleep 1 &
+        wait $! 2>/dev/null || exit 0
+        refresh_strata_running
+        if print_stats_and_info_grid true > "${tmp_file}.tmp" 2>/dev/null; then
+          format_compact_live_bar > "${tmp_file}.bar.tmp" 2>/dev/null || true
+          mv -f "${tmp_file}.bar.tmp" "${tmp_file}.bar" 2>/dev/null || true
+          printf "%s\n" "$LIVE_STATS_COUNT" > "${tmp_file}.meta.tmp" 2>/dev/null || true
+          mv -f "${tmp_file}.meta.tmp" "${tmp_file}.meta" 2>/dev/null || true
+          mv -f "${tmp_file}.tmp" "$tmp_file" 2>/dev/null || true
+        fi
+      done
+    ) &
+    sampler_pid=$!
+    ACTIVE_SAMPLER_PID="$sampler_pid"
+    ACTIVE_SAMPLER_TMP="$tmp_file"
   fi
 
   local saved_tty=""
@@ -5152,7 +5238,7 @@ read_line_with_live_stats() {
   stty -echo 2>/dev/null || true
   _cleanup_line_live() {
     [[ -n "$sampler_pid" ]] && { kill "$sampler_pid" 2>/dev/null || true; wait "$sampler_pid" 2>/dev/null || true; sampler_pid=""; }
-    [[ -n "$tmp_file" ]] && { rm -f "$tmp_file" "${tmp_file}.tmp" "${tmp_file}.meta" "${tmp_file}.meta.tmp" 2>/dev/null || true; tmp_file=""; }
+    [[ -n "$tmp_file" ]] && { rm -f "$tmp_file" "${tmp_file}.tmp" "${tmp_file}.bar" "${tmp_file}.bar.tmp" "${tmp_file}.meta" "${tmp_file}.meta.tmp" 2>/dev/null || true; tmp_file=""; }
     ACTIVE_SAMPLER_PID="" ACTIVE_SAMPLER_TMP=""
     if [[ -n "$saved_tty" ]]; then
       stty "$saved_tty" 2>/dev/null || stty echo 2>/dev/null || true
@@ -5229,7 +5315,9 @@ read_line_with_live_stats() {
       fi
       new_lines="$LIVE_STATS_COUNT"
       [[ -n "$tmp_file" && -s "${tmp_file}.meta" ]] && read -r new_lines < "${tmp_file}.meta" || true
-      if [[ "$new_lines" =~ ^[0-9]+$ ]] && (( new_lines != LIVE_STATS_COUNT )); then
+      if [[ "$compact_bar" == true ]]; then
+        [[ -n "$tmp_file" && -s "${tmp_file}.bar" ]] && _render_live_bar_inplace "$(<"${tmp_file}.bar")"
+      elif [[ "$new_lines" =~ ^[0-9]+$ ]] && (( new_lines != LIVE_STATS_COUNT )); then
         if [[ -z "$buf" ]]; then
           _cleanup_line_live; trap - INT TERM; printf "\n"
           _line_out="__refresh__"; return 0
@@ -5252,31 +5340,42 @@ read_step_action() {
     return 0
   fi
 
-  local term_lines=40 can_live=false
+  local term_lines=40 compact_bar=false
   term_lines="$(tput lines 2>/dev/null || echo 40)"
-  _can_live_stats "$lines_up" "$term_lines" && can_live=true
+  if ! _can_live_stats "$lines_up" "$term_lines"; then
+    compact_bar=true
+    local _bar0
+    _bar0="$(format_compact_live_bar)"
+    if [[ -n "$_bar0" ]]; then
+      printf "%s\n" "$_bar0"
+      local _hi
+      for (( _hi = 0; _hi < ${#HIST_HDR_LINES[@]}; _hi++ )); do
+        HIST_HDR_LINES[$_hi]=$(( HIST_HDR_LINES[_hi] + 1 ))
+      done
+    fi
+  fi
 
   local tmp_file="" sampler_pid=""
-  if [[ "$can_live" == true ]]; then
-    tmp_file="$(mktemp /tmp/strata-stats.XXXXXX 2>/dev/null || echo "")"
-    if [[ -n "$tmp_file" ]]; then
-      (
-        trap 'exit 0' TERM INT
-        while true; do
-          sleep 1 &
-          wait $! 2>/dev/null || exit 0
-          refresh_strata_running
-          if print_stats_and_info_grid true > "${tmp_file}.tmp" 2>/dev/null; then
-            printf "%s\n" "$LIVE_STATS_COUNT" > "${tmp_file}.meta.tmp" 2>/dev/null || true
-            mv -f "${tmp_file}.meta.tmp" "${tmp_file}.meta" 2>/dev/null || true
-            mv -f "${tmp_file}.tmp" "$tmp_file" 2>/dev/null || true
-          fi
-        done
-      ) &
-      sampler_pid=$!
-      ACTIVE_SAMPLER_PID="$sampler_pid"
-      ACTIVE_SAMPLER_TMP="$tmp_file"
-    fi
+  tmp_file="$(mktemp /tmp/strata-stats.XXXXXX 2>/dev/null || echo "")"
+  if [[ -n "$tmp_file" ]]; then
+    (
+      trap 'exit 0' TERM INT
+      while true; do
+        sleep 1 &
+        wait $! 2>/dev/null || exit 0
+        refresh_strata_running
+        if print_stats_and_info_grid true > "${tmp_file}.tmp" 2>/dev/null; then
+          format_compact_live_bar > "${tmp_file}.bar.tmp" 2>/dev/null || true
+          mv -f "${tmp_file}.bar.tmp" "${tmp_file}.bar" 2>/dev/null || true
+          printf "%s\n" "$LIVE_STATS_COUNT" > "${tmp_file}.meta.tmp" 2>/dev/null || true
+          mv -f "${tmp_file}.meta.tmp" "${tmp_file}.meta" 2>/dev/null || true
+          mv -f "${tmp_file}.tmp" "$tmp_file" 2>/dev/null || true
+        fi
+      done
+    ) &
+    sampler_pid=$!
+    ACTIVE_SAMPLER_PID="$sampler_pid"
+    ACTIVE_SAMPLER_TMP="$tmp_file"
   fi
 
   local saved_tty=""
@@ -5284,7 +5383,7 @@ read_step_action() {
   stty -echo 2>/dev/null || true
   _restore_step_tty() {
     [[ -n "$sampler_pid" ]] && { kill "$sampler_pid" 2>/dev/null || true; wait "$sampler_pid" 2>/dev/null || true; sampler_pid=""; }
-    [[ -n "$tmp_file" ]] && { rm -f "$tmp_file" "${tmp_file}.tmp" "${tmp_file}.meta" "${tmp_file}.meta.tmp" 2>/dev/null || true; tmp_file=""; }
+    [[ -n "$tmp_file" ]] && { rm -f "$tmp_file" "${tmp_file}.tmp" "${tmp_file}.bar" "${tmp_file}.bar.tmp" "${tmp_file}.meta" "${tmp_file}.meta.tmp" 2>/dev/null || true; tmp_file=""; }
     ACTIVE_SAMPLER_PID="" ACTIVE_SAMPLER_TMP=""
     if [[ -n "$saved_tty" ]]; then
       stty "$saved_tty" 2>/dev/null || stty echo 2>/dev/null || true
@@ -5340,7 +5439,9 @@ read_step_action() {
       fi
       new_lines="$LIVE_STATS_COUNT"
       [[ -n "$tmp_file" && -s "${tmp_file}.meta" ]] && read -r new_lines < "${tmp_file}.meta" || true
-      if [[ "$new_lines" =~ ^[0-9]+$ ]] && (( new_lines != LIVE_STATS_COUNT )); then
+      if [[ "$compact_bar" == true ]]; then
+        [[ -n "$tmp_file" && -s "${tmp_file}.bar" ]] && _render_live_bar_inplace "$(<"${tmp_file}.bar")"
+      elif [[ "$new_lines" =~ ^[0-9]+$ ]] && (( new_lines != LIVE_STATS_COUNT )); then
         if [[ -z "$buf" ]]; then
           _restore_step_tty; trap - INT TERM; printf "\n"
           _act_out="__refresh__"; return 0
@@ -5435,41 +5536,18 @@ read_choice_with_live_stats() {
   local -n _out_var="$1"
   local lines_up="$2"
   local footer_lines="${3:-0}"
-  local term_lines=40 can_live=false
+  local toggle_up="${4:-0}"
+  local term_lines=40
   if [[ ! -t 1 || ! -t 0 ]]; then
     read -r -p "Choice: " _out_var || exit 0
     return 0
   fi
 
   term_lines="$(tput lines 2>/dev/null || echo 40)"
-  _can_live_stats "$lines_up" "$term_lines" && can_live=true
 
   local tmp_file="" sampler_pid=""
   local cur_running_url="$STRATA_RUNNING_URL" cur_svc_active="0"
   unit_active strata.service && cur_svc_active="1"
-  if [[ "$can_live" == true ]]; then
-    tmp_file="$(mktemp /tmp/strata-stats.XXXXXX 2>/dev/null || echo "")"
-    if [[ -n "$tmp_file" ]]; then
-      (
-        trap 'exit 0' TERM INT
-        while true; do
-          sleep 1 &
-          wait $! 2>/dev/null || exit 0
-          refresh_strata_running
-          if print_stats_and_info_grid true > "${tmp_file}.tmp" 2>/dev/null; then
-            local _svc_now="0"
-            unit_active strata.service && _svc_now="1"
-            printf "%s|%s|%s\n" "$LIVE_STATS_COUNT" "$STRATA_RUNNING_URL" "$_svc_now" > "${tmp_file}.meta.tmp" 2>/dev/null || true
-            mv -f "${tmp_file}.meta.tmp" "${tmp_file}.meta" 2>/dev/null || true
-            mv -f "${tmp_file}.tmp" "$tmp_file" 2>/dev/null || true
-          fi
-        done
-      ) &
-      sampler_pid=$!
-      ACTIVE_SAMPLER_PID="$sampler_pid"
-      ACTIVE_SAMPLER_TMP="$tmp_file"
-    fi
-  fi
 
   local saved_tty=""
   saved_tty="$(stty -g 2>/dev/null || true)"
@@ -5477,7 +5555,7 @@ read_choice_with_live_stats() {
 
   _cleanup_live_sampler() {
     [[ -n "$sampler_pid" ]] && { kill "$sampler_pid" 2>/dev/null || true; wait "$sampler_pid" 2>/dev/null || true; sampler_pid=""; }
-    [[ -n "$tmp_file" ]] && { rm -f "$tmp_file" "${tmp_file}.tmp" "${tmp_file}.meta" "${tmp_file}.meta.tmp" 2>/dev/null || true; tmp_file=""; }
+    [[ -n "$tmp_file" ]] && { rm -f "$tmp_file" "${tmp_file}.tmp" "${tmp_file}.bar" "${tmp_file}.bar.tmp" "${tmp_file}.meta" "${tmp_file}.meta.tmp" 2>/dev/null || true; tmp_file=""; }
     ACTIVE_SAMPLER_PID="" ACTIVE_SAMPLER_TMP=""
     if [[ -n "$saved_tty" ]]; then
       stty "$saved_tty" 2>/dev/null || stty echo 2>/dev/null || true
@@ -5521,7 +5599,7 @@ read_choice_with_live_stats() {
           done
         fi
         local n_opt="${#ACTIVE_STEPS[@]}" n_str="${#ACTIVE_STRATA_OPTIONS[@]}"
-        local total_rows=$(( n_opt + n_str ))
+        local total_rows=$(( 1 + n_opt + n_str ))
         if (( footer_lines > 0 && total_rows > 0 )); then
           local old_idx="$INDEX_SELECTED" new_idx="$INDEX_SELECTED"
           if [[ "$esc_seq" == "[A" || "$esc_seq" == "OA" ]]; then
@@ -5532,8 +5610,8 @@ read_choice_with_live_stats() {
           if (( new_idx != old_idx )); then
             INDEX_SELECTED="$new_idx"
             local old_up new_up
-            old_up="$(index_row_up_offset "$old_idx" "$n_opt" "$n_str" "$footer_lines")"
-            new_up="$(index_row_up_offset "$new_idx" "$n_opt" "$n_str" "$footer_lines")"
+            old_up="$(index_row_up_offset "$old_idx" "$n_opt" "$n_str" "$footer_lines" "$toggle_up")"
+            new_up="$(index_row_up_offset "$new_idx" "$n_opt" "$n_str" "$footer_lines" "$toggle_up")"
             if (( old_up < term_lines && new_up < term_lines )); then
               local old_row new_row
               old_row="$(render_any_index_row "$old_idx" false)"
@@ -5595,7 +5673,8 @@ read_choice_with_live_stats() {
           stats_block="$(<"$tmp_file")"
           _render_live_stats_inplace "$lines_up" "$term_lines" "$stats_block"
         fi
-        if [[ "$new_running_url" != "$cur_running_url" || "$new_svc_active" != "$cur_svc_active" ]]; then
+      fi
+      if [[ "$new_running_url" != "$cur_running_url" || "$new_svc_active" != "$cur_svc_active" ]]; then
           cur_running_url="$new_running_url"
           cur_svc_active="$new_svc_active"
           STRATA_RUNNING_URL="$new_running_url"
@@ -5603,8 +5682,8 @@ read_choice_with_live_stats() {
           if (( footer_lines > 0 && n_str > 0 )); then
             for (( s_i = 0; s_i < n_str; s_i++ )); do
               if [[ "${ACTIVE_STRATA_OPTIONS[$s_i]}" == "service" || "${ACTIVE_STRATA_OPTIONS[$s_i]}" == "benchmark" ]]; then
-                abs_i=$(( n_opt + s_i ))
-                row_up="$(index_row_up_offset "$abs_i" "$n_opt" "$n_str" "$footer_lines")"
+                abs_i=$(( 1 + n_opt + s_i ))
+                row_up="$(index_row_up_offset "$abs_i" "$n_opt" "$n_str" "$footer_lines" "$toggle_up")"
                 if (( row_up > 0 && row_up < term_lines )); then
                   is_sel=false
                   (( abs_i == INDEX_SELECTED )) && is_sel=true
@@ -5615,7 +5694,6 @@ read_choice_with_live_stats() {
             done
           fi
         fi
-      fi
     else
       _cleanup_live_sampler
       trap - INT TERM
@@ -5736,22 +5814,51 @@ format_strata_row() {
 render_any_index_row() {
   local idx="$1" selected="${2:-false}"
   local n_opt="${#ACTIVE_STEPS[@]}"
-  if (( idx < n_opt )); then
-    format_index_row "$idx" "$selected"
+  if (( idx == 0 )); then
+    format_stats_toggle_row "$selected"
+  elif (( idx <= n_opt )); then
+    format_index_row "$((idx - 1))" "$selected"
   else
-    format_strata_row "$((idx - n_opt))" "$selected"
+    format_strata_row "$((idx - 1 - n_opt))" "$selected"
   fi
 }
 
 index_row_up_offset() {
-  local idx="$1" n_opt="$2" n_str="$3" footer_menu_lines="$4"
-  if (( idx < n_opt )); then
+  local idx="$1" n_opt="$2" n_str="$3" footer_menu_lines="$4" toggle_up="${5:-0}"
+  if (( idx == 0 )); then
+    echo "$toggle_up"
+  elif (( idx <= n_opt )); then
+    local o_idx=$(( idx - 1 ))
     # Below opt table: blank + legend + blank + Strata title + header + sep (6 lines) + n_str rows + footer_menu_lines
-    echo $(( (n_opt - idx) + 6 + n_str + footer_menu_lines ))
+    echo $(( (n_opt - o_idx) + 6 + n_str + footer_menu_lines ))
   else
-    local s_idx=$(( idx - n_opt ))
+    local s_idx=$(( idx - 1 - n_opt ))
     echo $(( (n_str - s_idx) + footer_menu_lines ))
   fi
+}
+
+show_stats_page() {
+  while true; do
+    print_header false
+    local body=""
+    body+="$(echo -e "  ${C_DIM}Live-updating every 1s. Press ${C_BOLD}[i / b / Enter / Esc]${C_RESET}${C_DIM} to return to Index, or ${C_BOLD}[q]${C_RESET}${C_DIM} to Quit.${C_RESET}")"$'\n\n'
+    printf "%s" "$body"
+    local body_lines lines_up action=""
+    body_lines="$(printf "%s" "$body" | wc -l)"
+    lines_up=$(( LIVE_STATS_COUNT + POST_HEADER_LINES + body_lines ))
+    read_step_action action "$lines_up"
+    case "$action" in
+      __refresh__) ;;
+      __esc__|""|b|B|i|I) return 0 ;;
+      q|Q) exit 0 ;;
+      u|U)
+        if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
+          echo ""; perform_strata_update; pause_prompt
+        fi
+        ;;
+      *) ;;
+    esac
+  done
 }
 
 show_index() {
@@ -5759,7 +5866,7 @@ show_index() {
     refresh_strata_bin
     build_active_steps
     build_strata_options
-    local total_rows=$(( ${#ACTIVE_STEPS[@]} + ${#ACTIVE_STRATA_OPTIONS[@]} ))
+    local total_rows=$(( 1 + ${#ACTIVE_STEPS[@]} + ${#ACTIVE_STRATA_OPTIONS[@]} ))
     if (( total_rows == 0 )); then
       INDEX_SELECTED=0
     elif (( INDEX_SELECTED >= total_rows )); then
@@ -5767,7 +5874,7 @@ show_index() {
     elif (( INDEX_SELECTED < 0 )); then
       INDEX_SELECTED=0
     fi
-    print_header
+    print_header true
 
     local body="" hw_warns=""
     hw_warns="$(format_strata_hw_warnings)"
@@ -5781,7 +5888,7 @@ show_index() {
     body+="$(printf "  %s" "----+---------------+----------------------------------------------------------------------------+-----------+-----")"$'\n'
     local idx
     for (( idx = 0; idx < ${#ACTIVE_STEPS[@]}; idx++ )); do
-      if (( idx == INDEX_SELECTED )); then
+      if (( idx + 1 == INDEX_SELECTED )); then
         body+="$(format_index_row "$idx" true)"$'\n'
       else
         body+="$(format_index_row "$idx" false)"$'\n'
@@ -5794,7 +5901,7 @@ show_index() {
     body+="$(printf "  %s" "----+-----------------+-------------------------------------------------------")"$'\n'
     local s_idx abs_idx
     for (( s_idx = 0; s_idx < ${#ACTIVE_STRATA_OPTIONS[@]}; s_idx++ )); do
-      abs_idx=$(( ${#ACTIVE_STEPS[@]} + s_idx ))
+      abs_idx=$(( 1 + ${#ACTIVE_STEPS[@]} + s_idx ))
       if (( abs_idx == INDEX_SELECTED )); then
         body+="$(format_strata_row "$s_idx" true)"$'\n'
       else
@@ -5821,18 +5928,20 @@ show_index() {
     body+="$(echo -e "  ${C_BOLD}[q]${C_RESET} Quit")"$'\n\n'
 
     printf "%s" "$body"
-    local body_lines lines_up
+    local body_lines toggle_up
     body_lines="$(printf "%s" "$body" | wc -l)"
-    lines_up=$(( LIVE_STATS_COUNT + POST_HEADER_LINES + body_lines ))
-    read_choice_with_live_stats choice "$lines_up" "$footer_lines"
+    toggle_up=$(( 1 + POST_HEADER_LINES + body_lines ))
+    read_choice_with_live_stats choice 0 "$footer_lines" "$toggle_up"
 
     case "$choice" in
       __refresh__) ;;
       "")
-        if (( INDEX_SELECTED < ${#ACTIVE_STEPS[@]} )); then
-          run_step_view "$INDEX_SELECTED" "single"
+        if (( INDEX_SELECTED == 0 )); then
+          show_stats_page
+        elif (( INDEX_SELECTED <= ${#ACTIVE_STEPS[@]} )); then
+          run_step_view $(( INDEX_SELECTED - 1 )) "single"
         else
-          local sel_s=$(( INDEX_SELECTED - ${#ACTIVE_STEPS[@]} ))
+          local sel_s=$(( INDEX_SELECTED - 1 - ${#ACTIVE_STEPS[@]} ))
           (( sel_s >= 0 && sel_s < ${#ACTIVE_STRATA_OPTIONS[@]} )) && run_strata_option "${ACTIVE_STRATA_OPTIONS[$sel_s]}"
         fi
         ;;
