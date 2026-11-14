@@ -344,10 +344,11 @@ add_kernel_param() {
 }
 
 remove_kernel_param() {
-  local param="$1"
+  local param="$1" changed=false
   if _file_has_kparam "$param" /etc/default/limine; then
     _remove_kparam_from_file "$param" /etc/default/limine
     command -v limine-mkinitcpio >/dev/null 2>&1 && run_root limine-mkinitcpio || true
+    changed=true
   fi
   if _file_has_kparam "$param" /etc/default/grub; then
     _remove_kparam_from_file "$param" /etc/default/grub
@@ -356,20 +357,29 @@ remove_kernel_param() {
     elif command -v grub2-mkconfig >/dev/null 2>&1; then
       run_root grub2-mkconfig -o /boot/grub2/grub.cfg || true
     fi
+    changed=true
   fi
   if _file_has_kparam "$param" /etc/kernel/cmdline; then
     _remove_kparam_from_file "$param" /etc/kernel/cmdline
     command -v bootctl >/dev/null 2>&1 && run_root bootctl update >/dev/null 2>&1 || true
+    changed=true
   fi
   if [[ "$DISTRO_FAMILY" == "fedora" || "$DISTRO_FAMILY" == "suse" ]] && command -v grubby >/dev/null 2>&1; then
-    run_root grubby --update-kernel=ALL --remove-args="$param" >/dev/null 2>&1 || true
+    run_root grubby --update-kernel=ALL --remove-args="$param" >/dev/null 2>&1 && changed=true || true
   fi
   local ef
   for ef in /boot/loader/entries/*.conf /efi/loader/entries/*.conf /boot/efi/loader/entries/*.conf; do
-    [[ -f "$ef" ]] && _file_has_kparam "$param" "$ef" && _remove_kparam_from_file "$param" "$ef"
+    if [[ -f "$ef" ]] && _file_has_kparam "$param" "$ef"; then
+      _remove_kparam_from_file "$param" "$ef"
+      changed=true
+    fi
   done
   if _file_has_kparam "$param" /boot/refind_linux.conf; then
     _remove_kparam_from_file "$param" /boot/refind_linux.conf
+    changed=true
+  fi
+  if [[ "$changed" == true ]]; then
+    REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
   fi
 }
 
@@ -378,7 +388,7 @@ pause_prompt() { echo ""; read -r -p "Press [Enter] to continue..." _; }
 prompt_reboot_if_needed() {
   [[ "$REBOOT_PROMPT_PENDING" == true ]] || return 0
   REBOOT_PROMPT_PENDING=false
-  echo -e "\n${C_YELLOW}[REBOOT REQUIRED] One or more applied optimizations require a reboot to take effect.${C_RESET}"
+  echo -e "\n${C_YELLOW}[REBOOT REQUIRED] A reboot is required to activate all changes.${C_RESET}"
   if confirm_yn "Reboot this system now? [y/N]: " "N"; then
     run_root systemctl reboot
     exit 0
@@ -834,7 +844,6 @@ ALL_STEPS=(
   net_tuning irq_balance
   prevent_sleep hugepages_1g
   cpu_performance cstate_limit pcie_aspm nvidia_clock_lock tuned_profile
-  strata_manager
 )
 ACTIVE_STEPS=()
 
@@ -846,16 +855,16 @@ build_active_steps() {
     "applicable_${step}" && candidates+=("$step")
   done
   ACTIVE_STEPS=()
-  for (( pts = 10; pts >= 0; pts-- )); do
+  for (( pts = 10; pts >= 1; pts-- )); do
     for step in "${candidates[@]}"; do
-      (( ${STEP_GAIN_PTS[$step]:-0} == pts )) && ACTIVE_STEPS+=("$step")
+      (( ${STEP_GAIN_PTS[$step]:-1} == pts )) && ACTIVE_STEPS+=("$step")
     done
   done
 }
 
 is_recommended_step() {
   case "$1" in
-    cpu_performance|pcie_aspm|cstate_limit|nvidia_clock_lock|tuned_profile|hugepages_1g|strata_manager) return 1 ;;
+    cpu_performance|pcie_aspm|cstate_limit|nvidia_clock_lock|tuned_profile|hugepages_1g) return 1 ;;
     *) return 0 ;;
   esac
 }
@@ -909,7 +918,7 @@ run_recommended_batch() {
     "${mode}_${step}" || echo -e "${C_YELLOW}Step '${step}' exited with a warning or was skipped.${C_RESET}"
   done
   echo -e "\n${C_GREEN}Finished ${mode}ing recommended optimizations.${C_RESET}"
-  [[ "$mode" == "apply" ]] && prompt_reboot_if_needed
+  prompt_reboot_if_needed
   pause_prompt
 }
 
@@ -1703,6 +1712,7 @@ revert_headless_target() {
   [[ -n "$prev" ]] || prev="graphical.target"
   run_root systemctl set-default "$prev"
   run_root rm -f "$HEADLESS_MARKER"
+  REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
   echo -e "${C_GREEN}Default target restored to ${prev} (applies on next boot).${C_RESET}"
 }
 
@@ -2341,9 +2351,28 @@ apply_scx_scheduler() {
   scx_unit >/dev/null 2>&1 || prompt_install_deps repo scx-scheds || return 0
   local u
   u="$(scx_unit)" || { echo -e "${C_YELLOW}No scx service found after installation.${C_RESET}"; return 1; }
-  run_root systemctl enable --now "$u"
+  if [[ "$u" == "scx_loader.service" ]] && command -v scxctl >/dev/null 2>&1; then
+    run_root mkdir -p /etc/systemd/system/scx_loader.service.d
+    run_root tee /etc/systemd/system/scx_loader.service.d/strata.conf >/dev/null <<'EOF'
+[Service]
+ExecStartPost=-/usr/bin/scxctl start -s bpfland
+EOF
+    run_root systemctl daemon-reload
+    run_root systemctl enable --now "$u"
+    if [[ "$(cat /sys/kernel/sched_ext/state 2>/dev/null)" != "enabled" ]]; then
+      run_root scxctl start -s bpfland
+    fi
+  else
+    run_root systemctl enable --now "$u"
+  fi
 }
 revert_scx_scheduler() {
+  command -v scxctl >/dev/null 2>&1 && run_root scxctl stop 2>/dev/null || true
+  if [[ -f /etc/systemd/system/scx_loader.service.d/strata.conf ]]; then
+    run_root rm -f /etc/systemd/system/scx_loader.service.d/strata.conf
+    run_root rmdir /etc/systemd/system/scx_loader.service.d 2>/dev/null || true
+    run_root systemctl daemon-reload
+  fi
   local u
   u="$(scx_unit)" && run_root systemctl disable --now "$u" 2>/dev/null || true
 }
@@ -2885,44 +2914,103 @@ if res_path and os.path.exists(res_path):
     except Exception:
         res_data = {}
 
-run = res_data.get("run") or {}
-ts = run.get("timestamp") or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-cfg = res_data.get("configuration") or {}
-prof = cfg.get("profile") or preset or ""
-proto = res_data.get("protocol_id") or res_data.get("format") or ""
+if not isinstance(res_data, dict):
+    res_data = {}
+
+run = res_data.get("run") if isinstance(res_data.get("run"), dict) else {}
+ts = run.get("started_at") or run.get("timestamp") or res_data.get("timestamp") or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+cfg = res_data.get("configuration") if isinstance(res_data.get("configuration"), dict) else {}
+proto_d = res_data.get("protocol") if isinstance(res_data.get("protocol"), dict) else {}
+prof = proto_d.get("profile") or cfg.get("profile") or preset or ""
+proto = proto_d.get("id") or res_data.get("protocol_id") or res_data.get("format") or ""
 tag = prof or ("standard-v1" if "standard" in proto else proto) or mode
 
-mdl = res_data.get("model") or {}
-m_name = mdl.get("name") or ""
-m_quant = mdl.get("quantization") or ""
-model_s = f"{m_name} ({m_quant})" if (m_name and m_quant) else (m_name or m_quant or "Unknown")
+mdl = res_data.get("model")
+if isinstance(mdl, dict):
+    m_name = mdl.get("name") or mdl.get("id") or ""
+    m_quant = mdl.get("quantization") or ""
+    if m_name and m_quant and m_quant.lower() not in m_name.lower():
+        model_s = f"{m_name} ({m_quant})"
+    else:
+        model_s = m_name or m_quant or "Unknown"
+elif isinstance(mdl, str) and mdl:
+    model_s = mdl
+else:
+    model_s = "Unknown"
 
-sums = res_data.get("summaries") or {}
-reqs = res_data.get("requests") or []
+sums_raw = res_data.get("summaries") if "summaries" in res_data else res_data.get("summary")
+reqs = res_data.get("requests") if isinstance(res_data.get("requests"), list) else []
 
-dec = sums.get("median_decode_tok_s")
-if dec is None:
-    dec = sums.get("decode_tps")
+dec = None
+pre = None
+tot_r = None
+fail_r = 0
+
+if isinstance(sums_raw, list):
+    perf_dec = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("phase") == "performance" and s.get("metric") == "decode_tps" and isinstance(s.get("median"), (int, float))]
+    all_dec = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("metric") == "decode_tps" and isinstance(s.get("median"), (int, float))]
+    perf_pre = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("phase") == "performance" and s.get("metric") == "prompt_tps" and isinstance(s.get("median"), (int, float))]
+    all_pre = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("metric") == "prompt_tps" and isinstance(s.get("median"), (int, float))]
+    if perf_dec:
+        dec = statistics.median(perf_dec)
+    elif all_dec:
+        dec = statistics.median(all_dec)
+    if perf_pre:
+        pre = statistics.median(perf_pre)
+    elif all_pre:
+        pre = statistics.median(all_pre)
+elif isinstance(sums_raw, dict):
+    dec = sums_raw.get("median_decode_tok_s") or sums_raw.get("decode_tps") or sums_raw.get("decode_tok_s")
+    pre = sums_raw.get("median_prefill_tok_s") or sums_raw.get("prompt_tps") or sums_raw.get("prefill_tok_s")
+    tot_r = sums_raw.get("total_requests")
+    fail_r = sums_raw.get("failed_requests") if isinstance(sums_raw.get("failed_requests"), int) else 0
+
 if dec is None:
     vals = [r.get("decode_tok_s") for r in reqs if isinstance(r, dict) and isinstance(r.get("decode_tok_s"), (int, float))]
     if vals:
         dec = statistics.median(vals)
-
-pre = sums.get("median_prefill_tok_s")
-if pre is None:
-    pre = sums.get("prompt_tps")
 if pre is None:
     vals = [r.get("prefill_tok_s") for r in reqs if isinstance(r, dict) and isinstance(r.get("prefill_tok_s"), (int, float))]
     if vals:
         pre = statistics.median(vals)
 
-tot_r = sums.get("total_requests")
-fail_r = sums.get("failed_requests")
-if tot_r is None and reqs:
-    tot_r = len(reqs)
-    fail_r = sum(1 for r in reqs if isinstance(r, dict) and r.get("status") not in (None, "ok"))
+perf_reqs = [r for r in reqs if isinstance(r, dict) and r.get("phase") == "performance"]
+req_pool = perf_reqs if perf_reqs else [r for r in reqs if isinstance(r, dict) and r.get("phase") != "warmup"]
+avg_dec_vals = []
+avg_pre_vals = []
+for r in req_pool:
+    m = r.get("metrics") if isinstance(r.get("metrics"), dict) else {}
+    dv = m.get("decode_tps") if isinstance(m.get("decode_tps"), (int, float)) else r.get("decode_tok_s")
+    pv = m.get("prompt_tps") if isinstance(m.get("prompt_tps"), (int, float)) else r.get("prefill_tok_s")
+    if dv is None:
+        tk = r.get("tokens") if isinstance(r.get("tokens"), dict) else {}
+        tm = r.get("timings") if isinstance(r.get("timings"), dict) else {}
+        if isinstance(tk.get("decode_tokens"), (int, float)) and isinstance(tm.get("decode_s"), (int, float)) and tm["decode_s"] > 0:
+            dv = tk["decode_tokens"] / tm["decode_s"]
+    if pv is None:
+        tk = r.get("tokens") if isinstance(r.get("tokens"), dict) else {}
+        tm = r.get("timings") if isinstance(r.get("timings"), dict) else {}
+        rtok = tk.get("read_tokens") if isinstance(tk.get("read_tokens"), (int, float)) else tk.get("input_tokens")
+        if isinstance(rtok, (int, float)) and isinstance(tm.get("prompt_s"), (int, float)) and tm["prompt_s"] > 0:
+            pv = rtok / tm["prompt_s"]
+    if isinstance(dv, (int, float)):
+        avg_dec_vals.append(dv)
+    if isinstance(pv, (int, float)):
+        avg_pre_vals.append(pv)
+avg_dec = statistics.mean(avg_dec_vals) if avg_dec_vals else None
+avg_pre = statistics.mean(avg_pre_vals) if avg_pre_vals else None
 
-qual = res_data.get("quality") or {}
+rcounts = res_data.get("request_counts") if isinstance(res_data.get("request_counts"), dict) else {}
+if not isinstance(tot_r, int) and rcounts:
+    tot_r = sum(v.get("attempted", 0) for v in rcounts.values() if isinstance(v, dict) and isinstance(v.get("attempted"), int))
+    fail_r = sum(v.get("failed", 0) for v in rcounts.values() if isinstance(v, dict) and isinstance(v.get("failed"), int))
+if not isinstance(tot_r, int) and reqs:
+    tot_r = len(reqs)
+    fail_r = sum(1 for r in reqs if isinstance(r, dict) and r.get("status") not in (None, "ok", "completed"))
+
+qual = res_data.get("quality") if isinstance(res_data.get("quality"), dict) else {}
+qp = qual.get("sanity_checks_passed") if qual.get("sanity_checks_passed") is not None else qual.get("passed")
+qt = qual.get("sanity_checks_total") if qual.get("sanity_checks_total") is not None else qual.get("total")
 entry = {
     "id": run.get("id") or ts,
     "timestamp": ts,
@@ -2934,10 +3022,12 @@ entry = {
     "model": model_s,
     "decode_tok_s": round(dec, 2) if isinstance(dec, (int, float)) else None,
     "prefill_tok_s": round(pre, 2) if isinstance(pre, (int, float)) else None,
+    "avg_decode_tok_s": round(avg_dec, 2) if isinstance(avg_dec, (int, float)) else None,
+    "avg_prefill_tok_s": round(avg_pre, 2) if isinstance(avg_pre, (int, float)) else None,
     "total_requests": tot_r if isinstance(tot_r, int) else None,
     "failed_requests": fail_r if isinstance(fail_r, int) else 0,
-    "sanity_checks_passed": qual.get("sanity_checks_passed"),
-    "sanity_checks_total": qual.get("sanity_checks_total"),
+    "sanity_checks_passed": qp,
+    "sanity_checks_total": qt,
     "avg_power": {
         "sys_w": avg_sys,
         "gpu_w": avg_gpu,
@@ -2958,15 +3048,38 @@ PY
 }
 
 count_bench_history() {
-  [[ -r "$STRATA_BENCH_HISTORY_FILE" ]] && command -v python3 >/dev/null 2>&1 || { echo 0; return 0; }
-  python3 - "$STRATA_BENCH_HISTORY_FILE" <<'PY' 2>/dev/null || echo 0
-import json, sys
-try:
-    with open(sys.argv[1]) as f:
-        d = json.load(f)
-    print(len(d) if isinstance(d, list) else 0)
-except Exception:
-    print(0)
+  command -v python3 >/dev/null 2>&1 || { echo 0; return 0; }
+  python3 - "$STRATA_BENCH_HISTORY_FILE" "$PWD/bench/results" "$PWD/bench-results" "$TARGET_HOME/bench/results" "$TARGET_HOME/bench-results" "$TARGET_HOME/.local/share/strata/bench-results" "$TARGET_HOME/.config/strata/bench-results" <<'PY' 2>/dev/null || echo 0
+import glob, json, os, sys
+hist_path = sys.argv[1]
+search_dirs = sys.argv[2:]
+seen = set()
+count = 0
+if hist_path and os.path.exists(hist_path):
+    try:
+        with open(hist_path) as f:
+            d = json.load(f)
+        if isinstance(d, list):
+            for e in d:
+                if not isinstance(e, dict):
+                    continue
+                rf = e.get("results_file") or ""
+                key = os.path.realpath(rf) if rf else f"hist:{e.get('id') or e.get('timestamp') or count}"
+                if key not in seen:
+                    seen.add(key)
+                    count += 1
+    except Exception:
+        pass
+for sd in search_dirs:
+    if not os.path.isdir(sd):
+        continue
+    for pat in (os.path.join(sd, "*", "results.json"), os.path.join(sd, "results.json")):
+        for p in glob.glob(pat):
+            rp = os.path.realpath(p)
+            if rp not in seen:
+                seen.add(rp)
+                count += 1
+print(count)
 PY
 }
 
@@ -3007,7 +3120,43 @@ apply_bench_history_config() {
   fi
 
   echo ""
-  confirm_yn "Apply and revert options to match this benchmark configuration? [y/N]: " "N" || return 0
+  local _ans="" _ch=""
+  printf "%s" "Apply and revert options to match this benchmark configuration? [y] Apply / [N/c/Esc] Cancel: "
+  while true; do
+    IFS= read -rsn1 _ch || { echo ""; echo -e "${C_YELLOW}Cancelled. No changes were made.${C_RESET}"; return 2; }
+    if [[ -z "$_ch" ]]; then
+      echo ""
+      break
+    elif [[ "$_ch" == $'\e' ]]; then
+      local _esc=""
+      IFS= read -rsn2 -t 0.01 _esc || true
+      if [[ -z "$_esc" ]]; then
+        echo ""
+        echo -e "${C_YELLOW}Cancelled. No changes were made.${C_RESET}"
+        return 2
+      fi
+    elif [[ "$_ch" == $'\177' || "$_ch" == $'\b' ]]; then
+      if [[ -n "$_ans" ]]; then
+        _ans="${_ans%?}"
+        printf "\b \b"
+      fi
+    else
+      _ans+="$_ch"
+      printf "%s" "$_ch"
+    fi
+  done
+  [[ -z "$_ans" ]] && _ans="N"
+  case "$_ans" in
+    y|Y|yes|YES|Yes) ;;
+    n|N|no|NO|No|c|C|cancel|CANCEL|Cancel|b|B|q|Q)
+      echo -e "${C_YELLOW}Cancelled. No changes were made.${C_RESET}"
+      return 2
+      ;;
+    *)
+      echo -e "${C_RED}Invalid input '${_ans}'. Cancelled.${C_RESET}"
+      return 2
+      ;;
+  esac
 
   for st in "${to_revert[@]}"; do
     echo -e "\n${C_BOLD}${C_RED}>>> Reverting: $("title_${st}")${C_RESET}"
@@ -3021,14 +3170,15 @@ apply_bench_history_config() {
   prompt_reboot_if_needed
 }
 
+HIST_SELECTED=0
+
 show_benchmark_history() {
   while true; do
     print_header
-    echo -e "${C_BOLD}Strata Benchmark History & Coupled Configurations${C_RESET}"
-    echo -e "${C_DIM}----------------------------------------------------------------------${C_RESET}"
-    if [[ ! -r "$STRATA_BENCH_HISTORY_FILE" ]] || ! command -v python3 >/dev/null 2>&1; then
-      echo -e "${C_DIM}No coupled benchmark history found yet.${C_RESET}"
-      echo -e "${C_DIM}Run a benchmark from the Strata step ([t]) to record results, power, and active options.${C_RESET}"
+    if ! command -v python3 >/dev/null 2>&1; then
+      echo -e "${C_BOLD}Strata Benchmark History & Coupled Configurations${C_RESET}"
+      echo -e "${C_DIM}----------------------------------------------------------------------${C_RESET}"
+      echo -e "${C_DIM}python3 is required to parse benchmark results.${C_RESET}"
       pause_prompt
       return 0
     fi
@@ -3036,66 +3186,348 @@ show_benchmark_history() {
     local rows=()
     while IFS= read -r line; do
       [[ -n "$line" ]] && rows+=("$line")
-    done < <(python3 - "$STRATA_BENCH_HISTORY_FILE" <<'PY' 2>/dev/null || true
-import json, sys
-with open(sys.argv[1]) as f:
-    d = json.load(f)
-if not isinstance(d, list):
-    sys.exit(0)
-for idx, e in enumerate(reversed(d)):
-    ts = (e.get("timestamp") or "").replace("T", " ")
+    done < <(python3 - "$STRATA_BENCH_HISTORY_FILE" "$PWD/bench/results" "$PWD/bench-results" "$TARGET_HOME/bench/results" "$TARGET_HOME/bench-results" "$TARGET_HOME/.local/share/strata/bench-results" "$TARGET_HOME/.config/strata/bench-results" <<'PY' 2>/dev/null || true
+import datetime, glob, json, os, statistics, sys
+
+hist_path = sys.argv[1]
+search_dirs = sys.argv[2:]
+
+def fmt_ts(ts):
+    ts = (ts or "").replace("T", " ")
     if ts.endswith("Z"):
         ts = ts[:-1] + " UTC"
     if len(ts) > 20 and " UTC" in ts:
         ts = ts[:16] + " UTC"
-    tag = e.get("tag") or e.get("mode") or ""
-    model = e.get("model") or "Unknown"
-    dec = e.get("decode_tok_s")
-    pre = e.get("prefill_tok_s")
+    return ts
+
+def parse_results(path, he):
+    try:
+        with open(path) as f:
+            d = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    run = d.get("run") if isinstance(d.get("run"), dict) else {}
+    ts = fmt_ts(run.get("started_at") or run.get("timestamp") or d.get("timestamp") or "")
+    if not ts:
+        try:
+            ts = datetime.datetime.fromtimestamp(os.path.getmtime(path), tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        except Exception:
+            ts = "Unknown"
+    cfg = d.get("configuration") if isinstance(d.get("configuration"), dict) else {}
+    proto_d = d.get("protocol") if isinstance(d.get("protocol"), dict) else {}
+    prof = proto_d.get("profile") or cfg.get("profile") or ""
+    proto = proto_d.get("id") or d.get("protocol_id") or d.get("format") or ""
+    tag = prof or ("standard-v1" if "standard" in proto else proto) or (he.get("tag") if he else "") or "cli"
+    mdl = d.get("model")
+    if isinstance(mdl, dict):
+        m_name = mdl.get("name") or mdl.get("id") or ""
+        m_quant = mdl.get("quantization") or ""
+        if m_name and m_quant and m_quant.lower() not in m_name.lower():
+            model = f"{m_name} ({m_quant})"
+        else:
+            model = m_name or m_quant or "Unknown"
+    elif isinstance(mdl, str) and mdl:
+        model = mdl
+    else:
+        model = (he.get("model") if he else None) or "Unknown"
+    sums_raw = d.get("summaries") if "summaries" in d else d.get("summary")
+    reqs = d.get("requests") if isinstance(d.get("requests"), list) else []
+    dec = None
+    pre = None
+    tot_r = None
+    fail_r = 0
+    if isinstance(sums_raw, list):
+        perf_dec = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("phase") == "performance" and s.get("metric") == "decode_tps" and isinstance(s.get("median"), (int, float))]
+        all_dec = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("metric") == "decode_tps" and isinstance(s.get("median"), (int, float))]
+        perf_pre = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("phase") == "performance" and s.get("metric") == "prompt_tps" and isinstance(s.get("median"), (int, float))]
+        all_pre = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("metric") == "prompt_tps" and isinstance(s.get("median"), (int, float))]
+        if perf_dec:
+            dec = statistics.median(perf_dec)
+        elif all_dec:
+            dec = statistics.median(all_dec)
+        if perf_pre:
+            pre = statistics.median(perf_pre)
+        elif all_pre:
+            pre = statistics.median(all_pre)
+    elif isinstance(sums_raw, dict):
+        dec = sums_raw.get("median_decode_tok_s") or sums_raw.get("decode_tps") or sums_raw.get("decode_tok_s")
+        pre = sums_raw.get("median_prefill_tok_s") or sums_raw.get("prompt_tps") or sums_raw.get("prefill_tok_s")
+        tot_r = sums_raw.get("total_requests")
+        fail_r = sums_raw.get("failed_requests") if isinstance(sums_raw.get("failed_requests"), int) else 0
+    if dec is None:
+        vals = [r.get("decode_tok_s") for r in reqs if isinstance(r, dict) and isinstance(r.get("decode_tok_s"), (int, float))]
+        if vals:
+            dec = statistics.median(vals)
+    if pre is None:
+        vals = [r.get("prefill_tok_s") for r in reqs if isinstance(r, dict) and isinstance(r.get("prefill_tok_s"), (int, float))]
+        if vals:
+            pre = statistics.median(vals)
+    perf_reqs = [r for r in reqs if isinstance(r, dict) and r.get("phase") == "performance"]
+    req_pool = perf_reqs if perf_reqs else [r for r in reqs if isinstance(r, dict) and r.get("phase") != "warmup"]
+    avg_dec_vals = []
+    avg_pre_vals = []
+    for r in req_pool:
+        m = r.get("metrics") if isinstance(r.get("metrics"), dict) else {}
+        dv = m.get("decode_tps") if isinstance(m.get("decode_tps"), (int, float)) else r.get("decode_tok_s")
+        pv = m.get("prompt_tps") if isinstance(m.get("prompt_tps"), (int, float)) else r.get("prefill_tok_s")
+        if dv is None:
+            tk = r.get("tokens") if isinstance(r.get("tokens"), dict) else {}
+            tm = r.get("timings") if isinstance(r.get("timings"), dict) else {}
+            if isinstance(tk.get("decode_tokens"), (int, float)) and isinstance(tm.get("decode_s"), (int, float)) and tm["decode_s"] > 0:
+                dv = tk["decode_tokens"] / tm["decode_s"]
+        if pv is None:
+            tk = r.get("tokens") if isinstance(r.get("tokens"), dict) else {}
+            tm = r.get("timings") if isinstance(r.get("timings"), dict) else {}
+            rtok = tk.get("read_tokens") if isinstance(tk.get("read_tokens"), (int, float)) else tk.get("input_tokens")
+            if isinstance(rtok, (int, float)) and isinstance(tm.get("prompt_s"), (int, float)) and tm["prompt_s"] > 0:
+                pv = rtok / tm["prompt_s"]
+        if isinstance(dv, (int, float)):
+            avg_dec_vals.append(dv)
+        if isinstance(pv, (int, float)):
+            avg_pre_vals.append(pv)
+    avg_dec = statistics.mean(avg_dec_vals) if avg_dec_vals else (he.get("avg_decode_tok_s") if he else None)
+    avg_pre = statistics.mean(avg_pre_vals) if avg_pre_vals else (he.get("avg_prefill_tok_s") if he else None)
     dec_s = f"{dec:.1f}" if isinstance(dec, (int, float)) else "—"
     pre_s = f"{pre:.1f}" if isinstance(pre, (int, float)) else "—"
-    pwr = e.get("avg_power") or {}
-    sw = pwr.get("sys_w") or ""
-    gw = pwr.get("gpu_w") or ""
-    cw = pwr.get("cpu_w") or ""
-    act = ",".join(e.get("active_steps") or [])
-    act_n = len(e.get("active_steps") or [])
-    tot_r = e.get("total_requests")
-    fail_r = e.get("failed_requests") or 0
+    avg_dec_s = f"{avg_dec:.1f}" if isinstance(avg_dec, (int, float)) else ""
+    avg_pre_s = f"{avg_pre:.1f}" if isinstance(avg_pre, (int, float)) else ""
+    req_d = run.get("required_duration_s")
+    opt_d = run.get("optional_duration_s")
+    dur_s = ""
+    if isinstance(req_d, (int, float)):
+        tot_d = req_d + (opt_d if isinstance(opt_d, (int, float)) else 0.0)
+        dur_s = f"{tot_d:.1f}s"
+    rcounts = d.get("request_counts") if isinstance(d.get("request_counts"), dict) else {}
+    if not isinstance(tot_r, int) and rcounts:
+        tot_r = sum(v.get("attempted", 0) for v in rcounts.values() if isinstance(v, dict) and isinstance(v.get("attempted"), int))
+        fail_r = sum(v.get("failed", 0) for v in rcounts.values() if isinstance(v, dict) and isinstance(v.get("failed"), int))
+    if not isinstance(tot_r, int) and reqs:
+        tot_r = len(reqs)
+        fail_r = sum(1 for r in reqs if isinstance(r, dict) and r.get("status") not in (None, "ok", "completed"))
     req_s = f"{tot_r - fail_r}/{tot_r} ok" if isinstance(tot_r, int) and tot_r > 0 else ""
-    qp = e.get("sanity_checks_passed")
-    qt = e.get("sanity_checks_total")
+    qual = d.get("quality") if isinstance(d.get("quality"), dict) else {}
+    qp = qual.get("sanity_checks_passed") if qual.get("sanity_checks_passed") is not None else qual.get("passed")
+    qt = qual.get("sanity_checks_total") if qual.get("sanity_checks_total") is not None else qual.get("total")
     qual_s = f"Sanity {qp}/{qt}" if isinstance(qp, int) and isinstance(qt, int) and qt > 0 else ""
-    print("|".join([str(idx), ts, tag, model, dec_s, pre_s, sw, gw, cw, str(act_n), act, req_s, qual_s]))
+    pwr = (he.get("avg_power") if isinstance((he or {}).get("avg_power"), dict) else {})
+    sw, gw, cw = str(pwr.get("sys_w") or ""), str(pwr.get("gpu_w") or ""), str(pwr.get("cpu_w") or "")
+    has_opts = "1" if (he is not None and "active_steps" in he) else "0"
+    act_list = (he.get("active_steps") if isinstance((he or {}).get("active_steps"), list) else [])
+    act = ",".join(act_list)
+    act_n = str(len(act_list)) if has_opts == "1" else "untracked"
+    return [ts, tag, model, dec_s, pre_s, sw, gw, cw, act_n, act, req_s, qual_s, has_opts, avg_dec_s, avg_pre_s, dur_s]
+
+hist_list = []
+hist_by_file = {}
+if hist_path and os.path.exists(hist_path):
+    try:
+        with open(hist_path) as f:
+            loaded = json.load(f)
+        if isinstance(loaded, list):
+            hist_list = [e for e in loaded if isinstance(e, dict)]
+            for e in hist_list:
+                rf = e.get("results_file")
+                if rf:
+                    hist_by_file[rf] = e
+                    hist_by_file[os.path.realpath(rf)] = e
+    except Exception:
+        pass
+
+out_rows = []
+seen = set()
+for e in reversed(hist_list):
+    rf = e.get("results_file") or ""
+    rp = os.path.realpath(rf) if rf else f"hist:{e.get('id') or e.get('timestamp') or len(out_rows)}"
+    if rp in seen:
+        continue
+    seen.add(rp)
+    if rf and os.path.exists(rf):
+        row = parse_results(rf, e)
+        if row:
+            out_rows.append(row)
+            continue
+    ts = fmt_ts(e.get("timestamp"))
+    tag = e.get("tag") or e.get("mode") or ""
+    model = e.get("model") or "Unknown"
+    dec, pre = e.get("decode_tok_s"), e.get("prefill_tok_s")
+    dec_s = f"{dec:.1f}" if isinstance(dec, (int, float)) else "—"
+    pre_s = f"{pre:.1f}" if isinstance(pre, (int, float)) else "—"
+    pwr = e.get("avg_power") if isinstance(e.get("avg_power"), dict) else {}
+    sw, gw, cw = str(pwr.get("sys_w") or ""), str(pwr.get("gpu_w") or ""), str(pwr.get("cpu_w") or "")
+    act_list = e.get("active_steps") if isinstance(e.get("active_steps"), list) else []
+    act = ",".join(act_list)
+    tot_r = e.get("total_requests")
+    fail_r = e.get("failed_requests") if isinstance(e.get("failed_requests"), int) else 0
+    req_s = f"{tot_r - fail_r}/{tot_r} ok" if isinstance(tot_r, int) and tot_r > 0 else ""
+    qp, qt = e.get("sanity_checks_passed"), e.get("sanity_checks_total")
+    qual_s = f"Sanity {qp}/{qt}" if isinstance(qp, int) and isinstance(qt, int) and qt > 0 else ""
+    avg_dec_h = e.get("avg_decode_tok_s")
+    avg_dec_hs = f"{avg_dec_h:.1f}" if isinstance(avg_dec_h, (int, float)) else ""
+    avg_pre_h = e.get("avg_prefill_tok_s")
+    avg_pre_hs = f"{avg_pre_h:.1f}" if isinstance(avg_pre_h, (int, float)) else ""
+    out_rows.append([ts, tag, model, dec_s, pre_s, sw, gw, cw, str(len(act_list)), act, req_s, qual_s, "1", avg_dec_hs, avg_pre_hs, ""])
+
+found_files = []
+for sd in search_dirs:
+    if not os.path.isdir(sd):
+        continue
+    for pat in (os.path.join(sd, "*", "results.json"), os.path.join(sd, "results.json")):
+        for p in glob.glob(pat):
+            try:
+                found_files.append((os.path.getmtime(p), os.path.realpath(p), p))
+            except Exception:
+                pass
+found_files.sort(reverse=True)
+for _, rp, p in found_files:
+    if rp in seen:
+        continue
+    seen.add(rp)
+    row = parse_results(p, hist_by_file.get(rp) or hist_by_file.get(p))
+    if row:
+        out_rows.append(row)
+
+for idx, cols in enumerate(out_rows):
+    print("|".join([str(idx)] + cols))
 PY
 )
     if (( ${#rows[@]} == 0 )); then
-      echo -e "${C_DIM}No coupled benchmark history found yet.${C_RESET}"
+      echo -e "${C_DIM}No benchmark results found yet.${C_RESET}"
+      echo -e "${C_DIM}Run a benchmark from Strata Options (Run Strata Benchmark) to record results, power, and active options.${C_RESET}"
       pause_prompt
       return 0
     fi
 
-    local r idx ts tag model dec_s pre_s sw gw cw act_n act_csv req_s qual_s pwr_s
+    (( HIST_SELECTED >= ${#rows[@]} )) && HIST_SELECTED=$(( ${#rows[@]} - 1 ))
+    (( HIST_SELECTED < 0 )) && HIST_SELECTED=0
+
+    local _rule_w=120
+    [[ -t 1 ]] && _rule_w="$(tput cols 2>/dev/null || echo 120)"
+    (( _rule_w > 135 )) && _rule_w=135
+    local tbl_w=$(( _rule_w - 2 ))
+    (( tbl_w < 78 )) && tbl_w=78
+    local hdr_w=$(( tbl_w - 4 ))
+    local val_w=$(( tbl_w - 27 ))
+    local _dashes_top _dashes_val _hdr_rule
+    printf -v _dashes_top "%*s" "$(( tbl_w - 2 ))" ""; _dashes_top="${_dashes_top// /-}"
+    printf -v _dashes_val "%*s" "$(( val_w + 2 ))" ""; _dashes_val="${_dashes_val// /-}"
+    printf -v _hdr_rule "%*s" "$_rule_w" ""; _hdr_rule="${_hdr_rule// /-}"
+    local _tbl_top="  +${_dashes_top}+"
+    local _tbl_rule="  +----------------------+${_dashes_val}+"
+
+    HIST_HDR_LINES=()
+    HIST_HDR_PLAIN=()
+    HIST_HDR_SEL=()
+
+    local body="" r idx ts tag model dec_s pre_s sw gw cw act_n act_csv req_s qual_s has_opts avg_dec_s avg_pre_s dur_s
+    local pwr_s dec_cell pre_cell chk_cell act_lbl _s
+    local opt_items=()
+    body+="$(echo -e "${C_BOLD}Strata Benchmark Results & Coupled Configurations (${#rows[@]} recorded)${C_RESET}")"$'\n'
+    body+="$(echo -e "${C_DIM}${_hdr_rule}${C_RESET}")"$'\n'
     for r in "${rows[@]}"; do
-      IFS='|' read -r idx ts tag model dec_s pre_s sw gw cw act_n act_csv req_s qual_s <<< "$r"
+      IFS='|' read -r idx ts tag model dec_s pre_s sw gw cw act_n act_csv req_s qual_s has_opts avg_dec_s avg_pre_s dur_s <<< "$r"
       pwr_s="$(format_avg_power_str "$sw" "$gw" "$cw")"
-      [[ -z "$pwr_s" ]] && pwr_s="n/a"
-      printf "  ${C_BOLD}[%d]${C_RESET} %s (%s) | %s\n" "$((idx + 1))" "$ts" "$tag" "$model"
-      printf "      Decode: ${C_GREEN}%s tok/s${C_RESET} | Prefill: ${C_CYAN}%s tok/s${C_RESET} | Avg Power: ${C_YELLOW}%s${C_RESET} | Opts: %s active\n" "$dec_s" "$pre_s" "$pwr_s" "$act_n"
+      [[ -z "$pwr_s" ]] && pwr_s="n/a (not recorded)"
+
+      dec_cell="${dec_s} tok/s"
+      [[ -n "$avg_dec_s" ]] && dec_cell+=" (Avg: ${avg_dec_s} tok/s)"
+      pre_cell="${pre_s} tok/s"
+      [[ -n "$avg_pre_s" ]] && pre_cell+=" (Avg: ${avg_pre_s} tok/s)"
+
+      chk_cell=""
+      [[ -n "$req_s" ]] && chk_cell="Reqs: ${req_s}"
+      if [[ -n "$qual_s" ]]; then
+        [[ -n "$chk_cell" ]] && chk_cell+=" | "
+        chk_cell+="$qual_s"
+      fi
+      [[ -n "$dur_s" ]] && chk_cell+="${chk_cell:+ | }Dur: ${dur_s}"
+
+      opt_items=()
+      if [[ "$has_opts" != "1" ]]; then
+        opt_items=("Not recorded (CLI run)")
+        act_lbl="Active options not recorded for CLI run"
+      elif [[ -z "$act_csv" ]]; then
+        opt_items=("(none)")
+        act_lbl="Press [Enter] or [$((idx + 1))] to revert all active optimizations"
+      else
+        local _slist=() _stitle
+        IFS=',' read -ra _slist <<< "$act_csv"
+        for _s in "${_slist[@]}"; do
+          if declare -F "title_${_s}" >/dev/null 2>&1; then
+            _stitle="$("title_${_s}")"
+          else
+            _stitle="$_s"
+          fi
+          opt_items+=("- ${_stitle}")
+        done
+        act_lbl="Press [Enter] or [$((idx + 1))] to apply/restore these ${act_n} option(s)"
+      fi
+
+      local hdr_base="[$((idx + 1))] ${ts}${tag:+ (${tag})}"
+      local hdr_plain_txt="  ${hdr_base}" hdr_sel_txt="> ${hdr_base}"
+      (( ${#hdr_plain_txt} > hdr_w )) && hdr_plain_txt="${hdr_plain_txt:0:$((hdr_w - 3))}..."
+      (( ${#hdr_sel_txt} > hdr_w )) && hdr_sel_txt="${hdr_sel_txt:0:$((hdr_w - 3))}..."
+      (( ${#model} > val_w )) && model="${model:0:$((val_w - 3))}..."
+      (( ${#act_lbl} > val_w )) && act_lbl="${act_lbl:0:$((val_w - 3))}..."
+
+      local row_plain row_sel
+      row_plain="$(printf "  | ${C_BOLD}%-*s${C_RESET} |" "$hdr_w" "$hdr_plain_txt")"
+      row_sel="$(printf "  | ${C_CYAN}${C_BOLD}%-*s${C_RESET} |" "$hdr_w" "$hdr_sel_txt")"
+      HIST_HDR_PLAIN+=("$row_plain")
+      HIST_HDR_SEL+=("$row_sel")
+
+      body+=$'\n'"${_tbl_top}"$'\n'
+      local cur_line_no
+      cur_line_no="$(printf "%s" "$body" | wc -l)"
+      HIST_HDR_LINES+=("$((cur_line_no + 1))")
+      if (( idx == HIST_SELECTED )); then
+        body+="${row_sel}"$'\n'
+      else
+        body+="${row_plain}"$'\n'
+      fi
+      body+="${_tbl_rule}"$'\n'
+      body+="$(printf "  | %-20s | %-*s |" "Model" "$val_w" "$model")"$'\n'
+      body+="$(printf "  | %-20s | ${C_GREEN}%-*s${C_RESET} |" "Decode (Med / Avg)" "$val_w" "$dec_cell")"$'\n'
+      body+="$(printf "  | %-20s | ${C_CYAN}%-*s${C_RESET} |" "Prefill (Med / Avg)" "$val_w" "$pre_cell")"$'\n'
+      body+="$(printf "  | %-20s | ${C_YELLOW}%-*s${C_RESET} |" "Average Power" "$val_w" "$pwr_s")"$'\n'
+      [[ -n "$chk_cell" ]] && body+="$(printf "  | %-20s | %-*s |" "Checks" "$val_w" "$chk_cell")"$'\n'
+      local opts_hdr="Active Opts (${act_n})"
+      [[ "$has_opts" != "1" ]] && opts_hdr="Active Opts (CLI)"
+      local first_opt_row=true _opt_line
+      for _opt_line in "${opt_items[@]}"; do
+        (( ${#_opt_line} > val_w )) && _opt_line="${_opt_line:0:$((val_w - 3))}..."
+        if [[ "$first_opt_row" == true ]]; then
+          body+="$(printf "  | %-20s | %-*s |" "$opts_hdr" "$val_w" "$_opt_line")"$'\n'
+          first_opt_row=false
+        else
+          body+="$(printf "  | %-20s | %-*s |" "" "$val_w" "$_opt_line")"$'\n'
+        fi
+      done
+      body+="$(printf "  | %-20s | ${C_BOLD}%-*s${C_RESET} |" "Restore Options" "$val_w" "$act_lbl")"$'\n'
+      body+="${_tbl_rule}"$'\n'
     done
 
-    echo ""
-    echo -e "  ${C_DIM}Enter a number [1-${#rows[@]}] to inspect/restore its options, or [b/Enter] to go back:${C_RESET}"
-    local h_choice
-    read -r -p "Choose: " h_choice
+    body+=$'\n'"$(echo -e "  ${C_DIM}Use [↑/↓ + Enter] or [1-${#rows[@]} + Enter] to apply a benchmark's active options, or [b/q/Esc] to go back:${C_RESET}")"$'\n'
+    printf "%s" "$body"
+    local body_lines lines_up h_choice hi
+    body_lines="$(printf "%s" "$body" | wc -l)"
+    for (( hi = 0; hi < ${#HIST_HDR_LINES[@]}; hi++ )); do
+      HIST_HDR_LINES[$hi]=$(( body_lines - HIST_HDR_LINES[$hi] + 1 ))
+    done
+    lines_up=$(( LIVE_STATS_COUNT + POST_HEADER_LINES + body_lines ))
+    read_line_with_live_stats h_choice "Choose: " "$lines_up" "${#rows[@]}"
     case "$h_choice" in
-      ""|b|B|q|Q) return 0 ;;
+      __refresh__) continue ;;
+      __esc__|b|B|q|Q) return 0 ;;
       *)
+        [[ -z "$h_choice" ]] && h_choice=$(( HIST_SELECTED + 1 ))
         if ! [[ "$h_choice" =~ ^[0-9]+$ ]] || (( h_choice < 1 || h_choice > ${#rows[@]} )); then
           echo -e "${C_RED}Invalid selection '${h_choice}'.${C_RESET}"; sleep 1
           continue
         fi
-        IFS='|' read -r idx ts tag model dec_s pre_s sw gw cw act_n act_csv req_s qual_s <<< "${rows[$((h_choice - 1))]}"
+        HIST_SELECTED=$(( h_choice - 1 ))
+        IFS='|' read -r idx ts tag model dec_s pre_s sw gw cw act_n act_csv req_s qual_s has_opts avg_dec_s avg_pre_s dur_s <<< "${rows[$HIST_SELECTED]}"
         pwr_s="$(format_avg_power_str "$sw" "$gw" "$cw")"
         [[ -z "$pwr_s" ]] && pwr_s="n/a"
         echo ""
@@ -3104,22 +3536,33 @@ PY
         echo "  Throughput:    Decode ${dec_s} tok/s | Prefill ${pre_s} tok/s"
         echo "  Avg Power:     $pwr_s"
         [[ -n "$req_s$qual_s" ]] && echo "  Checks:        ${req_s}${req_s:+${qual_s:+ | }}${qual_s}"
-        echo -e "  Active Opts (${act_n}):"
-        if [[ -z "$act_csv" ]]; then
-          echo "    (none)"
+        if [[ "$has_opts" != "1" ]]; then
+          echo -e "  Active Opts:   ${C_YELLOW}Not recorded (this benchmark was run outside the setup script).${C_RESET}"
+          echo -e "  ${C_DIM}Run future benchmarks via [s4] Run Strata Benchmark to couple active host options and power.${C_RESET}"
+          pause_prompt
         else
-          local _s
-          IFS=',' read -ra _slist <<< "$act_csv"
-          for _s in "${_slist[@]}"; do
-            if declare -F "title_${_s}" >/dev/null 2>&1; then
-              echo "    * $("title_${_s}")"
-            else
-              echo "    * $_s"
-            fi
-          done
+          echo -e "  Active Opts (${act_n}):"
+          if [[ -z "$act_csv" ]]; then
+            echo "    (none)"
+          else
+            local _s
+            IFS=',' read -ra _slist <<< "$act_csv"
+            for _s in "${_slist[@]}"; do
+              if declare -F "title_${_s}" >/dev/null 2>&1; then
+                echo "    * $("title_${_s}")"
+              else
+                echo "    * $_s"
+              fi
+            done
+          fi
+          local _ab_rc=0
+          apply_bench_history_config "$act_csv" || _ab_rc=$?
+          if (( _ab_rc == 2 )); then
+            sleep 1
+          else
+            pause_prompt
+          fi
         fi
-        apply_bench_history_config "$act_csv"
-        pause_prompt
         ;;
     esac
   done
@@ -3200,63 +3643,332 @@ run_strata_benchmark() {
   return "$rc"
 }
 
-apply_strata_manager() {
+ACTIVE_STRATA_OPTIONS=()
+
+build_strata_options() {
+  if [[ -z "$STRATA_BIN" ]]; then
+    ACTIVE_STRATA_OPTIONS=(install)
+  else
+    ACTIVE_STRATA_OPTIONS=(update remove service benchmark history)
+  fi
+}
+
+title_strata_install()   { echo "Install Strata (Niko1221/Strata)"; }
+title_strata_update()    { echo "Update Strata (strata update)"; }
+title_strata_remove()    { echo "Remove Strata & Uninstall Service"; }
+title_strata_service()   { echo "Manage Strata Systemd Service (strata.service)"; }
+title_strata_benchmark() { echo "Run Strata Benchmark (strata bench run)"; }
+title_strata_history()   { echo "View All Benchmark Results & Coupled Options"; }
+
+badge_strata_install() {
+  [[ -n "$STRATA_BIN" ]] && echo "${C_GREEN}[INSTALLED]    ${C_RESET}" || echo "${C_YELLOW}[NOT INSTALLED]${C_RESET}"
+}
+badge_strata_update() {
+  if [[ -z "$STRATA_BIN" ]]; then
+    echo "${C_DIM}[NOT INSTALLED]${C_RESET}"
+  elif [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
+    echo "${C_BGREEN}[UPDATE READY] ${C_RESET}"
+  else
+    echo "${C_GREEN}[UP TO DATE]   ${C_RESET}"
+  fi
+}
+badge_strata_remove() {
+  [[ -n "$STRATA_BIN" ]] && echo "${C_GREEN}[INSTALLED]    ${C_RESET}" || echo "${C_DIM}[NOT INSTALLED]${C_RESET}"
+}
+badge_strata_service() {
+  if [[ -z "$STRATA_BIN" ]]; then
+    echo "${C_DIM}[NOT INSTALLED]${C_RESET}"
+  elif strata_service_installed; then
+    unit_active strata.service && echo "${C_GREEN}[ACTIVE]       ${C_RESET}" || echo "${C_YELLOW}[STOPPED]      ${C_RESET}"
+  else
+    echo "${C_YELLOW}[NOT SETUP]    ${C_RESET}"
+  fi
+}
+badge_strata_benchmark() {
+  if [[ -z "$STRATA_BIN" ]]; then
+    echo "${C_DIM}[NOT INSTALLED]${C_RESET}"
+  elif [[ -n "$STRATA_RUNNING_URL" ]]; then
+    echo "${C_GREEN}[READY]        ${C_RESET}"
+  else
+    echo "${C_YELLOW}[NOT RUNNING]  ${C_RESET}"
+  fi
+}
+badge_strata_history() {
+  local cnt
+  cnt="$(count_bench_history)"
+  if (( cnt > 0 )); then
+    printf "${C_CYAN}%-15s${C_RESET}" "[${cnt} SAVED]"
+  else
+    echo "${C_DIM}[NONE SAVED]   ${C_RESET}"
+  fi
+}
+
+strata_action_install() {
+  refresh_strata_bin
+  if [[ -n "$STRATA_BIN" ]]; then
+    echo -e "${C_GREEN}Strata is already installed at: ${STRATA_BIN}${C_RESET}"
+    echo -e "${C_DIM}Use [s2] to check for updates.${C_RESET}"
+    return 0
+  fi
+  local hw_warns=""
+  hw_warns="$(format_strata_hw_warnings)"
+  if [[ -n "$hw_warns" ]]; then
+    printf "%s\n\n" "$hw_warns"
+  fi
+  if confirm_yn "Install Strata now? [Y/n]: " "Y"; then
+    command -v curl >/dev/null 2>&1 || prompt_install_deps repo curl || return 0
+    run_as_user "curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh | sh"
+    refresh_strata_bin
+    [[ -n "$STRATA_BIN" && -z "$STRATA_POLLER_PID" ]] && start_strata_update_poller
+  fi
+}
+
+strata_action_update() {
   refresh_strata_bin
   if [[ -z "$STRATA_BIN" ]]; then
-    if confirm_yn "Strata is not installed. Install Strata now? [Y/n]: " "Y"; then
-      command -v curl >/dev/null 2>&1 || prompt_install_deps repo curl || return 0
-      run_as_user "curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh | sh"
-      refresh_strata_bin
-      [[ -n "$STRATA_BIN" && -z "$STRATA_POLLER_PID" ]] && start_strata_update_poller
-    fi
-  else
-    echo -e "${C_GREEN}Strata is installed at: ${STRATA_BIN}${C_RESET}"
-    echo -e "${C_DIM}Checking for Strata updates...${C_RESET}"
-    if check_strata_update_sync; then
-      echo -e "${C_CYAN}An update is available for Strata (${STRATA_UPDATE_SUMMARY})!${C_RESET}"
-      perform_strata_update
-    else
-      echo -e "${C_GREEN}Strata is up to date.${C_RESET}"
-    fi
+    echo -e "${C_YELLOW}Strata is not installed. Run [s1] to install Strata first.${C_RESET}"
+    return 0
   fi
+  echo -e "${C_DIM}Checking for Strata updates...${C_RESET}"
+  if check_strata_update_sync; then
+    echo -e "${C_CYAN}An update is available for Strata (${STRATA_UPDATE_SUMMARY})!${C_RESET}"
+    perform_strata_update
+  else
+    echo -e "${C_GREEN}Strata is up to date (${STRATA_VERSION:-installed}).${C_RESET}"
+  fi
+}
 
+strata_action_remove() {
   refresh_strata_bin
-  [[ -n "$STRATA_BIN" ]] || return 0
-
-  echo ""
-  confirm_yn "Launch Strata interactively now ('strata launch')? [y/N]: " "N" && run_as_user_exec "$STRATA_BIN" launch
-
-  echo ""
+  if [[ -z "$STRATA_BIN" ]] && ! strata_service_installed; then
+    echo -e "${C_YELLOW}Strata is not installed.${C_RESET}"
+    return 0
+  fi
+  echo -e "${C_YELLOW}This will stop any running Strata instance, uninstall strata.service (if installed), and remove ${STRATA_BIN:-the Strata binary}.${C_RESET}"
+  confirm_yn "Remove Strata now? [y/N]: " "N" || return 0
+  stop_strata_update_poller
   if strata_service_installed; then
-    echo -e "${C_GREEN}strata.service is currently installed.${C_RESET}"
-    echo "  1) Change preset / reinstall strata.service"
-    echo "  2) Uninstall strata.service"
-    echo "  3) Skip"
-    read -r -p "Choose [1-3]: " svc_choice
+    remove_service strata.service && echo -e "${C_GREEN}strata.service uninstalled.${C_RESET}"
+  fi
+  if [[ -n "$STRATA_BIN" ]]; then
+    run_as_user_exec "$STRATA_BIN" launch --stop 2>/dev/null || true
+    if [[ -w "$(dirname "$STRATA_BIN")" ]]; then
+      rm -f "$STRATA_BIN"
+    else
+      run_root rm -f "$STRATA_BIN"
+    fi
+    echo -e "${C_GREEN}Removed ${STRATA_BIN}.${C_RESET}"
+  fi
+  STRATA_BIN="" STRATA_VERSION="" STRATA_RUNNING_PRESET="" STRATA_RUNNING_URL=""
+  STRATA_UPDATE_AVAILABLE=false STRATA_UPDATE_SUMMARY=""
+}
+
+strata_action_service() {
+  refresh_strata_bin
+  if [[ -z "$STRATA_BIN" ]]; then
+    echo -e "${C_YELLOW}Strata is not installed. Run [s1] to install Strata first.${C_RESET}"
+    return 0
+  fi
+  if strata_service_installed; then
+    echo -e "${C_GREEN}strata.service is installed ($(unit_active strata.service && echo "active" || echo "inactive")).${C_RESET}"
+    echo "  1) Start / Restart strata.service"
+    echo "  2) Stop strata.service"
+    echo "  3) Change preset / reinstall strata.service"
+    echo "  4) Uninstall strata.service"
+    echo "  5) Cancel"
+    local svc_choice
+    read -r -p "Choose [1-5]: " svc_choice
     case "$svc_choice" in
-      1) install_strata_service_fn ;;
-      2) remove_service strata.service && echo -e "${C_GREEN}strata.service uninstalled.${C_RESET}" ;;
-      3|"") ;;
+      1)
+        if run_root systemctl restart strata.service; then
+          wait_for_strata_model_live 120
+        else
+          echo -e "${C_RED}Failed to start strata.service (check 'journalctl -u strata -n 50').${C_RESET}"
+        fi
+        ;;
+      2)
+        run_root systemctl stop strata.service && echo -e "${C_GREEN}strata.service stopped.${C_RESET}"
+        ;;
+      3) install_strata_service_fn ;;
+      4) remove_service strata.service && echo -e "${C_GREEN}strata.service uninstalled.${C_RESET}" ;;
+      5|"") ;;
       *) echo -e "${C_RED}Invalid selection '${svc_choice}'. Cancelled.${C_RESET}" ;;
     esac
   else
     local preset_count
     preset_count="$(list_strata_presets | wc -l)"
+    if (( preset_count == 0 )); then
+      echo -e "${C_YELLOW}No saved Strata presets found yet.${C_RESET}"
+      if confirm_yn "Launch Strata interactively now ('strata launch') to create a preset? [y/N]: " "N"; then
+        run_as_user_exec "$STRATA_BIN" launch
+        preset_count="$(list_strata_presets | wc -l)"
+      fi
+    fi
     if (( preset_count > 0 )); then
-      confirm_yn "Saved presets detected ($preset_count). Install Strata as a systemd service? [y/N]: " "N" && install_strata_service_fn
-    else
-      echo -e "${C_DIM}No saved presets found yet; run 'strata launch' to create one first.${C_RESET}"
+      confirm_yn "Saved presets detected ($preset_count). Install strata.service? [Y/n]: " "Y" && install_strata_service_fn
     fi
   fi
+}
 
-  refresh_strata_running
-  if [[ -n "$STRATA_BIN" && -n "$STRATA_RUNNING_URL" ]]; then
+strata_action_benchmark() {
+  run_strata_benchmark
+}
+
+explain_strata_install() {
+  cat <<'EOF'
+Impact:
+  Downloads and installs Strata (Niko1221/Strata) using the official installer
+  for the current user, and starts background update checking.
+EOF
+  local hw_warns=""
+  hw_warns="$(format_strata_hw_warnings)"
+  if [[ -n "$hw_warns" ]]; then
     echo ""
-    confirm_yn "Strata is running (${STRATA_RUNNING_PRESET:-active} at ${STRATA_RUNNING_URL}). Run Strata benchmark now? [y/N]: " "N" && run_strata_benchmark
+    printf "%s\n" "$hw_warns"
   fi
 }
-revert_strata_manager() {
-  strata_service_installed && remove_service strata.service && echo -e "${C_GREEN}strata.service uninstalled.${C_RESET}" || echo -e "${C_YELLOW}strata.service is not installed.${C_RESET}"
+
+explain_strata_update() {
+  cat <<'EOF'
+Impact:
+  Checks whether a newer Strata engine/control release is available and runs
+  'strata update --yes'. If strata.service is active, stops it cleanly before
+  updating and restarts it once the model is ready.
+EOF
+  if [[ -n "$STRATA_BIN" ]]; then
+    echo -e "\nInstalled: ${STRATA_VERSION:-$STRATA_BIN}"
+    [[ "$STRATA_UPDATE_AVAILABLE" == true ]] && echo -e "${C_BGREEN}Update available: ${STRATA_UPDATE_SUMMARY}${C_RESET}"
+  fi
+}
+
+explain_strata_remove() {
+  cat <<'EOF'
+Impact:
+  Stops any running Strata instance, uninstalls strata.service (if present),
+  and removes the Strata binary from the host. Saved launch presets and
+  coupled benchmark history are preserved.
+EOF
+  [[ -n "$STRATA_BIN" ]] && echo -e "\nBinary: ${STRATA_BIN}"
+}
+
+explain_strata_service() {
+  cat <<'EOF'
+Impact:
+  Configures strata.service (systemd) using a saved 'strata launch' preset
+  with LimitMEMLOCK=infinity (and numactl --interleave=all when enabled).
+  Lets you start, stop, restart, change preset, or uninstall the service.
+EOF
+  local preset_count
+  preset_count="$(list_strata_presets | wc -l)"
+  echo -e "\nSaved presets: ${preset_count}"
+}
+
+explain_strata_benchmark() {
+  cat <<'EOF'
+Impact:
+  Runs Strata's built-in benchmark ('strata bench run') against the currently
+  running Strata instance, measures average GPU/CPU/system power consumption,
+  and stores results + active host optimizations in persistent host history.
+EOF
+  if [[ -n "$STRATA_RUNNING_URL" ]]; then
+    echo -e "\nActive target: ${STRATA_RUNNING_PRESET:-active} (${STRATA_RUNNING_URL})"
+  else
+    echo -e "\n${C_YELLOW}Strata is not currently serving. Start strata.service or 'strata launch' first.${C_RESET}"
+  fi
+}
+
+strata_action_history() {
+  show_benchmark_history
+}
+
+explain_strata_history() {
+  local cnt
+  cnt="$(count_bench_history)"
+  cat <<'EOF'
+Impact:
+  Lists all recorded benchmark runs with decode/prefill throughput and average
+  GPU/CPU/system power consumption. Selecting any result lets you revert/apply
+  the host optimizations to match what was active during that benchmark run.
+EOF
+  echo -e "\nRecorded benchmark results: ${cnt}"
+}
+
+run_strata_option() {
+  local target_opt="$1" s_idx=0 total="${#ACTIVE_STRATA_OPTIONS[@]}" i opt action action_label
+  (( total > 0 )) || return 0
+  for (( i = 0; i < total; i++ )); do
+    [[ "${ACTIVE_STRATA_OPTIONS[$i]}" == "$target_opt" ]] && { s_idx=$i; break; }
+  done
+
+  while true; do
+    refresh_strata_bin
+    build_strata_options
+    total="${#ACTIVE_STRATA_OPTIONS[@]}"
+    (( s_idx >= total )) && s_idx=$(( total - 1 ))
+    opt="${ACTIVE_STRATA_OPTIONS[$s_idx]}"
+    if [[ "$opt" == "history" ]]; then
+      show_benchmark_history
+      return 0
+    fi
+    print_header
+
+    local body=""
+    body+="$(echo -e "${C_BOLD}Strata Option s$((s_idx + 1)) of ${total}: $("title_strata_${opt}")${C_RESET}")"$'\n'
+    body+="$(echo -e "Status: $("badge_strata_${opt}")")"$'\n'
+    body+="$(echo -e "${C_DIM}----------------------------------------------------------------------${C_RESET}")"$'\n'
+    body+="$("explain_strata_${opt}")"$'\n'
+    body+="$(echo -e "${C_DIM}----------------------------------------------------------------------${C_RESET}")"$'\n\n'
+
+    case "$opt" in
+      install)   action_label="Install Strata" ;;
+      update)    action_label="Check & install Strata update" ;;
+      remove)    action_label="Remove Strata & uninstall service" ;;
+      service)   action_label="Manage strata.service" ;;
+      benchmark) action_label="Run Strata benchmark" ;;
+      history)   action_label="View all benchmark results" ;;
+      *)         action_label="Run action" ;;
+    esac
+
+    if [[ "$opt" == "remove" ]]; then
+      body+="$(echo -e "  ${C_RED}[a]${C_RESET} ${action_label}")"$'\n'
+    else
+      body+="$(echo -e "  ${C_GREEN}[a]${C_RESET} ${action_label}")"$'\n'
+    fi
+    if [[ "$opt" == "benchmark" ]] || (( $(count_bench_history) > 0 )); then
+      body+="$(echo -e "  ${C_CYAN}[h]${C_RESET} Benchmark history & restore coupled options")"$'\n'
+    fi
+    body+="$(echo -e "  ${C_DIM}[n]${C_RESET} Next option   ${C_DIM}[b]${C_RESET} Previous option   ${C_DIM}[i/Esc]${C_RESET} Back to Index   ${C_DIM}[q]${C_RESET} Quit")"$'\n\n'
+
+    printf "%s" "$body"
+    local body_lines lines_up
+    body_lines="$(printf "%s" "$body" | wc -l)"
+    lines_up=$(( LIVE_STATS_COUNT + POST_HEADER_LINES + body_lines ))
+    read_step_action action "$lines_up"
+    case "$action" in
+      __refresh__) ;;
+      __esc__|i|I) return 0 ;;
+      a|A)
+        echo ""
+        "strata_action_${opt}"
+        [[ "$opt" != "history" ]] && pause_prompt
+        ;;
+      h|H)
+        if [[ "$opt" == "benchmark" ]] || (( $(count_bench_history) > 0 )); then
+          show_benchmark_history
+        else
+          echo -e "${C_RED}Invalid action '${action}'.${C_RESET}"; sleep 1
+        fi
+        ;;
+      n|N|"")
+        (( s_idx + 1 < total )) && ((s_idx++)) || return 0
+        ;;
+      b|B)
+        (( s_idx > 0 )) && ((s_idx--))
+        ;;
+      q|Q) exit 0 ;;
+      *) echo -e "${C_RED}Invalid action '${action}'.${C_RESET}"; sleep 1 ;;
+    esac
+  done
 }
 
 # ------------------------------------------------------------------------------
@@ -3693,6 +4405,18 @@ print(f"{model}|{live_s}|{avg_s}")
   [[ -n "$svc_str" ]] && STRATA_STAT_LINES+=("$(printf "  %-8s %b" "Service:" "$svc_str")")
 }
 
+format_pct_delta() {
+  local pct="$1"
+  [[ -n "$pct" ]] || return 1
+  if [[ "$pct" == -* ]]; then
+    printf "%b%s%%%b" "${C_RED}" "$pct" "${C_RESET}"
+  elif [[ "$pct" == "0.0" ]]; then
+    printf "%b0.0%%%b" "${C_DIM}" "${C_RESET}"
+  else
+    printf "%b+%s%%%b" "${C_GREEN}" "$pct" "${C_RESET}"
+  fi
+}
+
 collect_strata_bench_lines() {
   local newest="" hist_mtime="0"
   newest="$(find_latest_results_json 0)"
@@ -3704,7 +4428,7 @@ collect_strata_bench_lines() {
     STRATA_BENCH_LINES+=("$(printf "%bLatest Benchmark:%b" "${C_BOLD}" "${C_RESET}")")
     STRATA_BENCH_LINES+=("$(printf "  %-8s %bNo benchmark history found%b" "Status:" "${C_DIM}" "${C_RESET}")")
     if [[ -n "$STRATA_BIN" ]]; then
-      STRATA_BENCH_LINES+=("$(printf "  %-8s %b'strata bench run' (or Strata step -> [t])%b" "Run:" "${C_DIM}" "${C_RESET}")")
+      STRATA_BENCH_LINES+=("$(printf "  %-8s %b'strata bench run' (or [s4])%b" "Run:" "${C_DIM}" "${C_RESET}")")
     fi
     return 0
   fi
@@ -3718,135 +4442,295 @@ collect_strata_bench_lines() {
 
   local parsed=""
   if command -v python3 >/dev/null 2>&1; then
-    parsed="$(python3 - "$newest" "$STRATA_BENCH_HISTORY_FILE" <<'PY' 2>/dev/null || true
-import json, os, statistics, sys
+    parsed="$(python3 - "$STRATA_BENCH_HISTORY_FILE" "$PWD/bench/results" "$PWD/bench-results" "$TARGET_HOME/bench/results" "$TARGET_HOME/bench-results" "$TARGET_HOME/.local/share/strata/bench-results" "$TARGET_HOME/.config/strata/bench-results" <<'PY' 2>/dev/null || true
+import datetime, glob, json, os, statistics, sys
 
-res_path, hist_path = sys.argv[1], sys.argv[2]
+hist_path = sys.argv[1]
+search_dirs = sys.argv[2:]
 
-hist_entry = None
-if hist_path and os.path.exists(hist_path):
-    try:
-        with open(hist_path) as f:
-            hl = json.load(f)
-        if isinstance(hl, list) and hl:
-            if res_path:
-                for e in reversed(hl):
-                    if isinstance(e, dict) and e.get("results_file") == res_path:
-                        hist_entry = e
-                        break
-            if hist_entry is None and not res_path:
-                hist_entry = hl[-1]
-    except Exception:
-        pass
-
-if res_path and os.path.exists(res_path):
-    with open(res_path) as f:
-        d = json.load(f)
-    run = d.get("run") or {}
-    ts = (run.get("timestamp") or "").replace("T", " ")
+def fmt_ts(ts):
+    ts = (ts or "").replace("T", " ")
     if ts.endswith("Z"):
         ts = ts[:-1] + " UTC"
     if len(ts) > 20 and " UTC" in ts:
         ts = ts[:16] + " UTC"
+    return ts
 
-    cfg = d.get("configuration") or {}
-    prof = cfg.get("profile") or ""
-    proto = d.get("protocol_id") or d.get("format") or ""
-    tag = prof or ("standard-v1" if "standard" in proto else proto)
-
-    mdl = d.get("model") or {}
-    m_name = mdl.get("name") or ""
-    m_quant = mdl.get("quantization") or ""
-    model_s = f"{m_name} ({m_quant})" if (m_name and m_quant) else (m_name or m_quant or "Unknown")
-
-    sums = d.get("summaries") or {}
-    reqs = d.get("requests") or []
-    dec = sums.get("median_decode_tok_s")
-    if dec is None:
-        dec = sums.get("decode_tps")
+def from_results_file(path, hist_by_file):
+    try:
+        with open(path) as f:
+            d = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    he = hist_by_file.get(os.path.realpath(path)) or hist_by_file.get(path)
+    run = d.get("run") if isinstance(d.get("run"), dict) else {}
+    ts = fmt_ts(run.get("started_at") or run.get("timestamp") or d.get("timestamp") or "")
+    if not ts:
+        try:
+            ts = datetime.datetime.fromtimestamp(os.path.getmtime(path), tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        except Exception:
+            ts = "Unknown"
+    cfg = d.get("configuration") if isinstance(d.get("configuration"), dict) else {}
+    proto_d = d.get("protocol") if isinstance(d.get("protocol"), dict) else {}
+    prof = proto_d.get("profile") or cfg.get("profile") or ""
+    proto = proto_d.get("id") or d.get("protocol_id") or d.get("format") or ""
+    tag = prof or ("standard-v1" if "standard" in proto else proto) or (he.get("tag") if he else "")
+    mdl = d.get("model")
+    if isinstance(mdl, dict):
+        m_name = mdl.get("name") or mdl.get("id") or ""
+        m_quant = mdl.get("quantization") or ""
+        if m_name and m_quant and m_quant.lower() not in m_name.lower():
+            model_s = f"{m_name} ({m_quant})"
+        else:
+            model_s = m_name or m_quant or "Unknown"
+    elif isinstance(mdl, str) and mdl:
+        model_s = mdl
+    else:
+        model_s = (he.get("model") if he else None) or "Unknown"
+    sums_raw = d.get("summaries") if "summaries" in d else d.get("summary")
+    reqs = d.get("requests") if isinstance(d.get("requests"), list) else []
+    dec = None
+    pre = None
+    tot_r = None
+    fail_r = 0
+    if isinstance(sums_raw, list):
+        perf_dec = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("phase") == "performance" and s.get("metric") == "decode_tps" and isinstance(s.get("median"), (int, float))]
+        all_dec = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("metric") == "decode_tps" and isinstance(s.get("median"), (int, float))]
+        perf_pre = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("phase") == "performance" and s.get("metric") == "prompt_tps" and isinstance(s.get("median"), (int, float))]
+        all_pre = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("metric") == "prompt_tps" and isinstance(s.get("median"), (int, float))]
+        if perf_dec:
+            dec = statistics.median(perf_dec)
+        elif all_dec:
+            dec = statistics.median(all_dec)
+        if perf_pre:
+            pre = statistics.median(perf_pre)
+        elif all_pre:
+            pre = statistics.median(all_pre)
+    elif isinstance(sums_raw, dict):
+        dec = sums_raw.get("median_decode_tok_s") or sums_raw.get("decode_tps") or sums_raw.get("decode_tok_s")
+        pre = sums_raw.get("median_prefill_tok_s") or sums_raw.get("prompt_tps") or sums_raw.get("prefill_tok_s")
+        tot_r = sums_raw.get("total_requests")
+        fail_r = sums_raw.get("failed_requests") if isinstance(sums_raw.get("failed_requests"), int) else 0
     if dec is None:
         vals = [r.get("decode_tok_s") for r in reqs if isinstance(r, dict) and isinstance(r.get("decode_tok_s"), (int, float))]
         if vals:
             dec = statistics.median(vals)
-    pre = sums.get("median_prefill_tok_s")
-    if pre is None:
-        pre = sums.get("prompt_tps")
     if pre is None:
         vals = [r.get("prefill_tok_s") for r in reqs if isinstance(r, dict) and isinstance(r.get("prefill_tok_s"), (int, float))]
         if vals:
             pre = statistics.median(vals)
-
-    dec_s = f"{dec:.1f} tok/s" if isinstance(dec, (int, float)) else "—"
-    pre_s = f"{pre:.1f} tok/s" if isinstance(pre, (int, float)) else "—"
-
-    tot_r = sums.get("total_requests")
-    fail_r = sums.get("failed_requests")
-    if tot_r is None and reqs:
+    perf_reqs = [r for r in reqs if isinstance(r, dict) and r.get("phase") == "performance"]
+    req_pool = perf_reqs if perf_reqs else [r for r in reqs if isinstance(r, dict) and r.get("phase") != "warmup"]
+    avg_dec_vals = []
+    avg_pre_vals = []
+    for r in req_pool:
+        m = r.get("metrics") if isinstance(r.get("metrics"), dict) else {}
+        dv = m.get("decode_tps") if isinstance(m.get("decode_tps"), (int, float)) else r.get("decode_tok_s")
+        pv = m.get("prompt_tps") if isinstance(m.get("prompt_tps"), (int, float)) else r.get("prefill_tok_s")
+        if dv is None:
+            tk = r.get("tokens") if isinstance(r.get("tokens"), dict) else {}
+            tm = r.get("timings") if isinstance(r.get("timings"), dict) else {}
+            if isinstance(tk.get("decode_tokens"), (int, float)) and isinstance(tm.get("decode_s"), (int, float)) and tm["decode_s"] > 0:
+                dv = tk["decode_tokens"] / tm["decode_s"]
+        if pv is None:
+            tk = r.get("tokens") if isinstance(r.get("tokens"), dict) else {}
+            tm = r.get("timings") if isinstance(r.get("timings"), dict) else {}
+            rtok = tk.get("read_tokens") if isinstance(tk.get("read_tokens"), (int, float)) else tk.get("input_tokens")
+            if isinstance(rtok, (int, float)) and isinstance(tm.get("prompt_s"), (int, float)) and tm["prompt_s"] > 0:
+                pv = rtok / tm["prompt_s"]
+        if isinstance(dv, (int, float)):
+            avg_dec_vals.append(dv)
+        if isinstance(pv, (int, float)):
+            avg_pre_vals.append(pv)
+    avg_dec = statistics.mean(avg_dec_vals) if avg_dec_vals else (he.get("avg_decode_tok_s") if he else None)
+    avg_pre = statistics.mean(avg_pre_vals) if avg_pre_vals else (he.get("avg_prefill_tok_s") if he else None)
+    rcounts = d.get("request_counts") if isinstance(d.get("request_counts"), dict) else {}
+    if not isinstance(tot_r, int) and rcounts:
+        tot_r = sum(v.get("attempted", 0) for v in rcounts.values() if isinstance(v, dict) and isinstance(v.get("attempted"), int))
+        fail_r = sum(v.get("failed", 0) for v in rcounts.values() if isinstance(v, dict) and isinstance(v.get("failed"), int))
+    if not isinstance(tot_r, int) and reqs:
         tot_r = len(reqs)
-        fail_r = sum(1 for r in reqs if isinstance(r, dict) and r.get("status") not in (None, "ok"))
-    req_s = ""
-    if isinstance(tot_r, int) and tot_r > 0:
-        ok_r = tot_r - (fail_r if isinstance(fail_r, int) else 0)
-        req_s = f"{ok_r}/{tot_r} ok"
-
-    qual = d.get("quality") or {}
-    q_pass = qual.get("sanity_checks_passed")
-    q_tot = qual.get("sanity_checks_total")
-    qual_s = f"Sanity: {q_pass}/{q_tot}" if isinstance(q_pass, int) and isinstance(q_tot, int) and q_tot > 0 else ""
-elif hist_entry:
-    ts = (hist_entry.get("timestamp") or "").replace("T", " ")
-    if ts.endswith("Z"):
-        ts = ts[:-1] + " UTC"
-    if len(ts) > 20 and " UTC" in ts:
-        ts = ts[:16] + " UTC"
-    tag = hist_entry.get("tag") or hist_entry.get("mode") or ""
-    model_s = hist_entry.get("model") or "Unknown"
-    dec = hist_entry.get("decode_tok_s")
-    pre = hist_entry.get("prefill_tok_s")
-    dec_s = f"{dec:.1f} tok/s" if isinstance(dec, (int, float)) else "—"
-    pre_s = f"{pre:.1f} tok/s" if isinstance(pre, (int, float)) else "—"
-    tot_r = hist_entry.get("total_requests")
-    fail_r = hist_entry.get("failed_requests") or 0
+        fail_r = sum(1 for r in reqs if isinstance(r, dict) and r.get("status") not in (None, "ok", "completed"))
     req_s = f"{tot_r - fail_r}/{tot_r} ok" if isinstance(tot_r, int) and tot_r > 0 else ""
-    qp = hist_entry.get("sanity_checks_passed")
-    qt = hist_entry.get("sanity_checks_total")
+    qual = d.get("quality") if isinstance(d.get("quality"), dict) else {}
+    qp = qual.get("sanity_checks_passed") if qual.get("sanity_checks_passed") is not None else qual.get("passed")
+    qt = qual.get("sanity_checks_total") if qual.get("sanity_checks_total") is not None else qual.get("total")
     qual_s = f"Sanity: {qp}/{qt}" if isinstance(qp, int) and isinstance(qt, int) and qt > 0 else ""
-else:
+    pwr = (he.get("avg_power") if isinstance((he or {}).get("avg_power"), dict) else {})
+    return {
+        "ts": ts, "tag": tag, "model": model_s,
+        "dec": float(dec) if isinstance(dec, (int, float)) else None,
+        "pre": float(pre) if isinstance(pre, (int, float)) else None,
+        "avg_dec": float(avg_dec) if isinstance(avg_dec, (int, float)) else None,
+        "avg_pre": float(avg_pre) if isinstance(avg_pre, (int, float)) else None,
+        "req_s": req_s, "qual_s": qual_s,
+        "sw": str(pwr.get("sys_w") or ""), "gw": str(pwr.get("gpu_w") or ""), "cw": str(pwr.get("cpu_w") or ""),
+        "key": os.path.realpath(path),
+    }
+
+def from_hist_entry(e):
+    ts = fmt_ts(e.get("timestamp"))
+    tag = e.get("tag") or e.get("mode") or ""
+    model_s = e.get("model") or "Unknown"
+    dec = e.get("decode_tok_s")
+    pre = e.get("prefill_tok_s")
+    avg_dec = e.get("avg_decode_tok_s")
+    avg_pre = e.get("avg_prefill_tok_s")
+    tot_r = e.get("total_requests")
+    fail_r = e.get("failed_requests") if isinstance(e.get("failed_requests"), int) else 0
+    req_s = f"{tot_r - fail_r}/{tot_r} ok" if isinstance(tot_r, int) and tot_r > 0 else ""
+    qp, qt = e.get("sanity_checks_passed"), e.get("sanity_checks_total")
+    qual_s = f"Sanity: {qp}/{qt}" if isinstance(qp, int) and isinstance(qt, int) and qt > 0 else ""
+    pwr = e.get("avg_power") if isinstance(e.get("avg_power"), dict) else {}
+    rf = e.get("results_file") or ""
+    return {
+        "ts": ts, "tag": tag, "model": model_s,
+        "dec": float(dec) if isinstance(dec, (int, float)) else None,
+        "pre": float(pre) if isinstance(pre, (int, float)) else None,
+        "avg_dec": float(avg_dec) if isinstance(avg_dec, (int, float)) else None,
+        "avg_pre": float(avg_pre) if isinstance(avg_pre, (int, float)) else None,
+        "req_s": req_s, "qual_s": qual_s,
+        "sw": str(pwr.get("sys_w") or ""), "gw": str(pwr.get("gpu_w") or ""), "cw": str(pwr.get("cpu_w") or ""),
+        "key": os.path.realpath(rf) if rf else f"hist:{e.get('id') or ts}",
+    }
+
+hist_list = []
+hist_by_file = {}
+if hist_path and os.path.exists(hist_path):
+    try:
+        with open(hist_path) as f:
+            loaded = json.load(f)
+        if isinstance(loaded, list):
+            hist_list = [e for e in loaded if isinstance(e, dict)]
+            for e in hist_list:
+                rf = e.get("results_file")
+                if rf:
+                    hist_by_file[rf] = e
+                    hist_by_file[os.path.realpath(rf)] = e
+    except Exception:
+        pass
+
+items = []
+seen = set()
+# Prefer coupled host history (newest first)
+for e in reversed(hist_list):
+    rf = e.get("results_file") or ""
+    rec = from_results_file(rf, hist_by_file) if (rf and os.path.exists(rf)) else from_hist_entry(e)
+    if rec and rec["key"] not in seen:
+        seen.add(rec["key"])
+        items.append(rec)
+    if len(items) >= 2:
+        break
+
+# Fill remaining slots from raw results.json files on disk (newest mtime first)
+if len(items) < 2:
+    found_files = []
+    for d in search_dirs:
+        if not os.path.isdir(d):
+            continue
+        for pat in (os.path.join(d, "*", "results.json"), os.path.join(d, "results.json")):
+            for p in glob.glob(pat):
+                try:
+                    found_files.append((os.path.getmtime(p), os.path.realpath(p), p))
+                except Exception:
+                    pass
+    found_files.sort(reverse=True)
+    for _, rp, p in found_files:
+        if rp in seen:
+            continue
+        rec = from_results_file(p, hist_by_file)
+        if rec:
+            seen.add(rp)
+            items.append(rec)
+        if len(items) >= 2:
+            break
+
+if not items:
     sys.exit(0)
 
-pwr = (hist_entry or {}).get("avg_power") or {}
-sw = pwr.get("sys_w") or ""
-gw = pwr.get("gpu_w") or ""
-cw = pwr.get("cpu_w") or ""
-print("|".join([ts, tag, model_s, dec_s, pre_s, req_s, qual_s, sw, gw, cw]))
+def fmt_rec(kind, rec, d_pct="", p_pct=""):
+    dec_s = f"{rec['dec']:.1f} tok/s" if rec["dec"] is not None else "—"
+    pre_s = f"{rec['pre']:.1f} tok/s" if rec["pre"] is not None else "—"
+    avg_dec_s = f"{rec['avg_dec']:.1f} tok/s" if rec.get("avg_dec") is not None else ""
+    avg_pre_s = f"{rec['avg_pre']:.1f} tok/s" if rec.get("avg_pre") is not None else ""
+    return "|".join([kind, rec["ts"], rec["tag"], rec["model"], dec_s, pre_s, rec["req_s"], rec["qual_s"], rec["sw"], rec["gw"], rec["cw"], d_pct, p_pct, avg_dec_s, avg_pre_s])
+
+d_pct = ""
+p_pct = ""
+if len(items) >= 2:
+    cur, prev = items[0], items[1]
+    if cur["dec"] is not None and prev["dec"] is not None and prev["dec"] > 0:
+        d_pct = f"{((cur['dec'] - prev['dec']) / prev['dec']) * 100.0:.1f}"
+    if cur["pre"] is not None and prev["pre"] is not None and prev["pre"] > 0:
+        p_pct = f"{((cur['pre'] - prev['pre']) / prev['pre']) * 100.0:.1f}"
+
+print(fmt_rec("CUR", items[0]))
+if len(items) >= 2:
+    print(fmt_rec("PREV", items[1], d_pct, p_pct))
 PY
 )"
   fi
 
   STRATA_BENCH_CACHE_KEY="$cache_key"
   STRATA_BENCH_LINES=()
-  STRATA_BENCH_LINES+=("$(printf "%bLatest Benchmark:%b" "${C_BOLD}" "${C_RESET}")")
   if [[ -z "$parsed" ]]; then
-    STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b" "File:" "${C_DIM}" "${newest:-None}" "${C_RESET}")")
+    STRATA_BENCH_LINES+=("$(printf "%bLatest Benchmark:%b" "${C_BOLD}" "${C_RESET}")")
+    STRATA_BENCH_LINES+=("$(printf "  %-8s %bNo readable benchmark data%b" "Status:" "${C_DIM}" "${C_RESET}")")
     return 0
   fi
 
-  local b_ts b_tag b_model b_dec b_pre b_req b_qual b_sw b_gw b_cw b_pwr
-  IFS='|' read -r b_ts b_tag b_model b_dec b_pre b_req b_qual b_sw b_gw b_cw <<< "$parsed"
-  local date_disp="${b_ts:-Unknown}"
-  [[ -n "$b_tag" ]] && date_disp+=" (${b_tag})"
-  STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b" "Date:" "${C_DIM}" "$date_disp" "${C_RESET}")")
-  STRATA_BENCH_LINES+=("$(printf "  %-8s %s" "Model:" "$b_model")")
-  STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b | Prefill: %b%s%b" "Decode:" "${C_GREEN}" "$b_dec" "${C_RESET}" "${C_CYAN}" "$b_pre" "${C_RESET}")")
-  b_pwr="$(format_avg_power_str "$b_sw" "$b_gw" "$b_cw")"
-  [[ -n "$b_pwr" ]] && STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b" "Power:" "${C_YELLOW}" "$b_pwr" "${C_RESET}")")
-  local summary_tail=""
-  [[ -n "$b_req" ]] && summary_tail="Reqs: ${b_req}"
-  if [[ -n "$b_qual" ]]; then
-    [[ -n "$summary_tail" ]] && summary_tail+=" | "
-    summary_tail+="$b_qual"
-  fi
-  [[ -n "$summary_tail" ]] && STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b" "Checks:" "${C_DIM}" "$summary_tail" "${C_RESET}")")
+  local line kind b_ts b_tag b_model b_dec b_pre b_req b_qual b_sw b_gw b_cw b_dpct b_ppct b_avg_dec b_avg_pre
+  while IFS='|' read -r kind b_ts b_tag b_model b_dec b_pre b_req b_qual b_sw b_gw b_cw b_dpct b_ppct b_avg_dec b_avg_pre; do
+    [[ -n "$kind" ]] || continue
+    if [[ "$kind" == "CUR" ]]; then
+      STRATA_BENCH_LINES+=("$(printf "%bLatest Benchmark:%b" "${C_BOLD}" "${C_RESET}")")
+    else
+      STRATA_BENCH_LINES+=("$(printf "%bPrevious Benchmark:%b" "${C_BOLD}" "${C_RESET}")")
+    fi
+    local date_disp="${b_ts:-Unknown}"
+    [[ -n "$b_tag" ]] && date_disp+=" (${b_tag})"
+    STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b" "Date:" "${C_DIM}" "$date_disp" "${C_RESET}")")
+    STRATA_BENCH_LINES+=("$(printf "  %-8s %s" "Model:" "$b_model")")
+    STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b | Prefill: %b%s%b" "Decode:" "${C_GREEN}" "$b_dec" "${C_RESET}" "${C_CYAN}" "$b_pre" "${C_RESET}")")
+    if [[ -n "$b_avg_dec" || -n "$b_avg_pre" ]]; then
+      local avg_parts=()
+      [[ -n "$b_avg_dec" ]] && avg_parts+=("${b_avg_dec} decode")
+      [[ -n "$b_avg_pre" ]] && avg_parts+=("${b_avg_pre} prefill")
+      local avg_str="${avg_parts[0]}"
+      (( ${#avg_parts[@]} > 1 )) && avg_str+=" | ${avg_parts[1]}"
+      STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b" "Avg:" "${C_GREEN}" "$avg_str" "${C_RESET}")")
+    fi
+    local b_pwr
+    b_pwr="$(format_avg_power_str "$b_sw" "$b_gw" "$b_cw")"
+    if [[ -n "$b_pwr" ]]; then
+      STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b" "Power:" "${C_YELLOW}" "$b_pwr" "${C_RESET}")")
+    else
+      STRATA_BENCH_LINES+=("$(printf "  %-8s %bn/a (not recorded)%b" "Power:" "${C_DIM}" "${C_RESET}")")
+    fi
+    if [[ "$kind" == "CUR" ]]; then
+      local summary_tail=""
+      [[ -n "$b_req" ]] && summary_tail="Reqs: ${b_req}"
+      if [[ -n "$b_qual" ]]; then
+        [[ -n "$summary_tail" ]] && summary_tail+=" | "
+        summary_tail+="$b_qual"
+      fi
+      [[ -n "$summary_tail" ]] && STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b" "Checks:" "${C_DIM}" "$summary_tail" "${C_RESET}")")
+    else
+      local diff_parts=()
+      [[ -n "$b_dpct" ]] && diff_parts+=("Decode $(format_pct_delta "$b_dpct")")
+      [[ -n "$b_ppct" ]] && diff_parts+=("Prefill $(format_pct_delta "$b_ppct")")
+      if (( ${#diff_parts[@]} > 0 )); then
+        local diff_str="" di=0
+        for ((di=0; di<${#diff_parts[@]}; di++)); do
+          (( di > 0 )) && diff_str+=" | "
+          diff_str+="${diff_parts[$di]}"
+        done
+        STRATA_BENCH_LINES+=("$(printf "  %-8s %s" "Diff:" "$diff_str")")
+      fi
+    fi
+  done <<< "$parsed"
 }
 
 print_stats_and_info_grid() {
@@ -3955,48 +4839,234 @@ print_header() {
   echo ""
 }
 
+read_line_with_live_stats() {
+  local -n _line_out="$1"
+  local prompt_str="${2:-Choose: }"
+  local lines_up="${3:-0}"
+  local total_rows="${4:-0}"
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    read -r -p "$prompt_str" _line_out || exit 0
+    return 0
+  fi
+
+  local term_lines=40 can_live=false
+  term_lines="$(tput lines 2>/dev/null || echo 40)"
+  (( lines_up > 0 && lines_up + 1 <= term_lines )) && can_live=true
+
+  local tmp_file="" sampler_pid=""
+  if [[ "$can_live" == true ]]; then
+    tmp_file="$(mktemp /tmp/strata-stats.XXXXXX 2>/dev/null || echo "")"
+    if [[ -n "$tmp_file" ]]; then
+      (
+        while true; do
+          sleep 1
+          refresh_strata_running
+          if print_stats_and_info_grid true > "${tmp_file}.tmp" 2>/dev/null; then
+            printf "%s\n" "$LIVE_STATS_COUNT" > "${tmp_file}.meta.tmp" 2>/dev/null || true
+            mv -f "${tmp_file}.meta.tmp" "${tmp_file}.meta" 2>/dev/null || true
+            mv -f "${tmp_file}.tmp" "$tmp_file" 2>/dev/null || true
+          fi
+        done
+      ) &
+      sampler_pid=$!
+    fi
+  fi
+
+  local saved_tty=""
+  saved_tty="$(stty -g 2>/dev/null || true)"
+  stty -echo 2>/dev/null || true
+  _cleanup_line_live() {
+    [[ -n "$sampler_pid" ]] && { kill "$sampler_pid" 2>/dev/null || true; wait "$sampler_pid" 2>/dev/null || true; }
+    [[ -n "$tmp_file" ]] && rm -f "$tmp_file" "${tmp_file}.tmp" "${tmp_file}.meta" "${tmp_file}.meta.tmp" 2>/dev/null || true
+    if [[ -n "$saved_tty" ]]; then
+      stty "$saved_tty" 2>/dev/null || stty echo 2>/dev/null || true
+    else
+      stty echo 2>/dev/null || true
+    fi
+  }
+  trap '_cleanup_line_live; exit 0' INT TERM
+
+  local buf="" ch="" rc=0 stats_block="" new_lines=""
+  printf "%s" "$prompt_str"
+  while true; do
+    rc=0
+    IFS= read -rsn1 -t 1 ch || rc=$?
+    if (( rc == 0 )); then
+      if [[ -z "$ch" ]]; then
+        _cleanup_line_live; trap - INT TERM; printf "\n"
+        _line_out="$buf"; return 0
+      elif [[ "$ch" == $'\177' || "$ch" == $'\b' ]]; then
+        if [[ -n "$buf" ]]; then
+          buf="${buf%?}"; printf "\b \b"
+        fi
+      elif [[ "$ch" == $'\e' ]]; then
+        local _esc="" _ec="" _en=0
+        IFS= read -rsn2 -t 0.01 _esc || true
+        if [[ -z "$_esc" ]]; then
+          _cleanup_line_live; trap - INT TERM; printf "\n"
+          _line_out="__esc__"; return 0
+        fi
+        if [[ "$_esc" == \[* || "$_esc" == O* ]] && [[ ! "$_esc" =~ [A-Za-z~]$ ]]; then
+          while (( _en++ < 8 )) && IFS= read -rsn1 -t 0.01 _ec; do
+            [[ "$_ec" =~ [A-Za-z~] ]] && break
+          done
+        fi
+        if (( total_rows > 0 )) && [[ "$_esc" == "[A" || "$_esc" == "OA" || "$_esc" == "[B" || "$_esc" == "OB" ]]; then
+          local old_idx="$HIST_SELECTED" new_idx="$HIST_SELECTED"
+          if [[ "$_esc" == "[A" || "$_esc" == "OA" ]]; then
+            new_idx=$(( (old_idx - 1 + total_rows) % total_rows ))
+          else
+            new_idx=$(( (old_idx + 1) % total_rows ))
+          fi
+          if (( new_idx != old_idx )); then
+            HIST_SELECTED="$new_idx"
+            local old_up="${HIST_HDR_LINES[$old_idx]:-0}" new_up="${HIST_HDR_LINES[$new_idx]:-0}"
+            if (( old_up > 0 && new_up > 0 && old_up < term_lines && new_up < term_lines )); then
+              printf "\033[?2026h\033[?25l\033[s\033[%dA\r\033[2K%s\033[u\033[s\033[%dA\r\033[2K%s\033[u\033[?25h\033[?2026l" \
+                "$old_up" "${HIST_HDR_PLAIN[$old_idx]}" "$new_up" "${HIST_HDR_SEL[$new_idx]}"
+            else
+              _cleanup_line_live; trap - INT TERM; printf "\n"
+              _line_out="__refresh__"; return 0
+            fi
+          fi
+        fi
+      else
+        local _accept=false
+        if [[ -z "$buf" && "$ch" =~ ^[bBqQ]$ ]]; then
+          _accept=true
+        elif [[ "$ch" =~ ^[0-9]$ ]] && [[ -z "$buf" || "$buf" =~ ^[0-9]+$ ]]; then
+          local _cand="${buf}${ch}"
+          if (( total_rows == 0 || (10#_cand >= 1 && 10#_cand <= total_rows) )); then
+            _accept=true
+          fi
+        fi
+        if [[ "$_accept" == true ]]; then
+          buf+="$ch"; printf "%s" "$ch"
+        fi
+      fi
+    elif (( rc > 128 )); then
+      new_lines="$LIVE_STATS_COUNT"
+      [[ -n "$tmp_file" && -s "${tmp_file}.meta" ]] && read -r new_lines < "${tmp_file}.meta" || true
+      if [[ "$new_lines" =~ ^[0-9]+$ ]] && (( new_lines != LIVE_STATS_COUNT )); then
+        if [[ -z "$buf" ]]; then
+          _cleanup_line_live; trap - INT TERM; printf "\n"
+          _line_out="__refresh__"; return 0
+        fi
+      elif [[ -n "$tmp_file" && -s "$tmp_file" ]]; then
+        stats_block="$(<"$tmp_file")"
+        printf "\033[?2026h\033[?25l\033[s\033[%dA\r%s\033[u\033[?25h\033[?2026l" "$lines_up" "$stats_block"
+      fi
+    else
+      _cleanup_line_live; trap - INT TERM; printf "\n"; exit 0
+    fi
+  done
+}
+
 read_step_action() {
   local -n _act_out="$1"
+  local lines_up="${2:-0}"
   if [[ ! -t 0 || ! -t 1 ]]; then
     read -r -p "Select action: " _act_out || exit 0
     return 0
   fi
 
-  local buf="" ch="" esc_seq="" rc=0
+  local term_lines=40 can_live=false
+  term_lines="$(tput lines 2>/dev/null || echo 40)"
+  (( lines_up > 0 && lines_up + 1 <= term_lines )) && can_live=true
+
+  local tmp_file="" sampler_pid=""
+  if [[ "$can_live" == true ]]; then
+    tmp_file="$(mktemp /tmp/strata-stats.XXXXXX 2>/dev/null || echo "")"
+    if [[ -n "$tmp_file" ]]; then
+      (
+        while true; do
+          sleep 1
+          refresh_strata_running
+          if print_stats_and_info_grid true > "${tmp_file}.tmp" 2>/dev/null; then
+            printf "%s\n" "$LIVE_STATS_COUNT" > "${tmp_file}.meta.tmp" 2>/dev/null || true
+            mv -f "${tmp_file}.meta.tmp" "${tmp_file}.meta" 2>/dev/null || true
+            mv -f "${tmp_file}.tmp" "$tmp_file" 2>/dev/null || true
+          fi
+        done
+      ) &
+      sampler_pid=$!
+    fi
+  fi
+
+  local saved_tty=""
+  saved_tty="$(stty -g 2>/dev/null || true)"
+  stty -echo 2>/dev/null || true
+  _restore_step_tty() {
+    [[ -n "$sampler_pid" ]] && { kill "$sampler_pid" 2>/dev/null || true; wait "$sampler_pid" 2>/dev/null || true; }
+    [[ -n "$tmp_file" ]] && rm -f "$tmp_file" "${tmp_file}.tmp" "${tmp_file}.meta" "${tmp_file}.meta.tmp" 2>/dev/null || true
+    if [[ -n "$saved_tty" ]]; then
+      stty "$saved_tty" 2>/dev/null || stty echo 2>/dev/null || true
+    else
+      stty echo 2>/dev/null || true
+    fi
+  }
+  trap '_restore_step_tty; exit 0' INT TERM
+
+  local buf="" ch="" esc_seq="" rc=0 stats_block="" new_lines=""
   printf "Select action: "
   while true; do
     rc=0
-    IFS= read -rsn1 ch || rc=$?
-    if (( rc != 0 )); then
-      printf "\n"
-      exit 0
-    fi
-    if [[ -z "$ch" ]]; then
-      printf "\n"
-      _act_out="$buf"
-      return 0
-    elif [[ "$ch" == $'\177' || "$ch" == $'\b' ]]; then
-      if [[ -n "$buf" ]]; then
-        buf="${buf%?}"
-        printf "\b \b"
-      fi
-    elif [[ "$ch" == $'\e' ]]; then
-      esc_seq=""
-      IFS= read -rsn2 -t 0.01 esc_seq || true
-      if [[ -z "$esc_seq" ]]; then
+    IFS= read -rsn1 -t 1 ch || rc=$?
+    if (( rc == 0 )); then
+      if [[ -z "$ch" ]]; then
+        _restore_step_tty
+        trap - INT TERM
         printf "\n"
-        _act_out="__esc__"
+        _act_out="$buf"
         return 0
+      elif [[ "$ch" == $'\177' || "$ch" == $'\b' ]]; then
+        if [[ -n "$buf" ]]; then
+          buf="${buf%?}"
+          printf "\b \b"
+        fi
+      elif [[ "$ch" == $'\e' ]]; then
+        esc_seq=""
+        IFS= read -rsn2 -t 0.01 esc_seq || true
+        if [[ -z "$esc_seq" ]]; then
+          _restore_step_tty
+          trap - INT TERM
+          printf "\n"
+          _act_out="__esc__"
+          return 0
+        fi
+        if [[ "$esc_seq" == \[* || "$esc_seq" == O* ]] && [[ ! "$esc_seq" =~ [A-Za-z~]$ ]]; then
+          local _esc_ch="" _esc_n=0
+          while (( _esc_n++ < 8 )) && IFS= read -rsn1 -t 0.01 _esc_ch; do
+            [[ "$_esc_ch" =~ [A-Za-z~] ]] && break
+          done
+        fi
+      elif [[ -z "$buf" && "$ch" =~ ^[aArRuUhHnNbBiIqQ]$ ]]; then
+        buf="$ch"
+        printf "%s" "$ch"
       fi
-      if [[ "$esc_seq" == \[* || "$esc_seq" == O* ]] && [[ ! "$esc_seq" =~ [A-Za-z~]$ ]]; then
-        local _esc_ch="" _esc_n=0
-        while (( _esc_n++ < 8 )) && IFS= read -rsn1 -t 0.01 _esc_ch; do
-          [[ "$_esc_ch" =~ [A-Za-z~] ]] && break
-        done
+    elif (( rc > 128 )); then
+      local prev_upd="$STRATA_UPDATE_AVAILABLE"
+      load_strata_update_state
+      if [[ "$prev_upd" == false && "$STRATA_UPDATE_AVAILABLE" == true && -z "$buf" ]]; then
+        _restore_step_tty; trap - INT TERM; printf "\n"
+        _act_out="__refresh__"; return 0
+      fi
+      new_lines="$LIVE_STATS_COUNT"
+      [[ -n "$tmp_file" && -s "${tmp_file}.meta" ]] && read -r new_lines < "${tmp_file}.meta" || true
+      if [[ "$new_lines" =~ ^[0-9]+$ ]] && (( new_lines != LIVE_STATS_COUNT )); then
+        if [[ -z "$buf" ]]; then
+          _restore_step_tty; trap - INT TERM; printf "\n"
+          _act_out="__refresh__"; return 0
+        fi
+      elif [[ -n "$tmp_file" && -s "$tmp_file" ]]; then
+        stats_block="$(<"$tmp_file")"
+        printf "\033[?2026h\033[?25l\033[s\033[%dA\r%s\033[u\033[?25h\033[?2026l" "$lines_up" "$stats_block"
       fi
     else
-      buf+="$ch"
-      printf "%s" "$ch"
+      _restore_step_tty
+      trap - INT TERM
+      printf "\n"
+      exit 0
     fi
   done
 }
@@ -4009,29 +5079,33 @@ run_step_view() {
     applied=false
     "status_${step}" && applied=true
 
-    echo -e "${C_BOLD}Step $((idx + 1)) of ${total}: $("title_${step}")${C_RESET}"
-    [[ "$applied" == true ]] && echo -e "Status: ${C_GREEN}[APPLIED]${C_RESET}" || echo -e "Status: ${C_YELLOW}[NOT APPLIED]${C_RESET}"
-    echo -e "${C_DIM}----------------------------------------------------------------------${C_RESET}"
-    "explain_${step}"
-    echo -e "${C_DIM}----------------------------------------------------------------------${C_RESET}\n"
-
-    if [[ "$step" == "strata_manager" ]]; then
-      echo -e "  ${C_GREEN}[a]${C_RESET} Open Strata Install / Update / Launch / Service menu"
-      [[ -n "$STRATA_BIN" && -n "$STRATA_RUNNING_URL" ]] && echo -e "  ${C_CYAN}[t]${C_RESET} Run Strata benchmark ('strata bench run')"
-      echo -e "  ${C_BOLD}[h]${C_RESET} Benchmark history & restore coupled options"
-      strata_service_installed && echo -e "  ${C_RED}[r]${C_RESET} Uninstall strata.service"
+    local body=""
+    body+="$(echo -e "${C_BOLD}Step $((idx + 1)) of ${total}: $("title_${step}")${C_RESET}")"$'\n'
+    if [[ "$applied" == true ]]; then
+      body+="$(echo -e "Status: ${C_GREEN}[APPLIED]${C_RESET}")"$'\n'
     else
-      if [[ "$applied" == true ]]; then
-        echo -e "  ${C_RED}[r]${C_RESET} Revert this optimization"
-      else
-        echo -e "  ${C_GREEN}[a]${C_RESET} Apply this optimization"
-      fi
+      body+="$(echo -e "Status: ${C_YELLOW}[NOT APPLIED]${C_RESET}")"$'\n'
+    fi
+    body+="$(echo -e "${C_DIM}----------------------------------------------------------------------${C_RESET}")"$'\n'
+    body+="$("explain_${step}")"$'\n'
+    body+="$(echo -e "${C_DIM}----------------------------------------------------------------------${C_RESET}")"$'\n\n'
+
+    if [[ "$applied" == true ]]; then
+      body+="$(echo -e "  ${C_RED}[r]${C_RESET} Revert this optimization")"$'\n'
+    else
+      body+="$(echo -e "  ${C_GREEN}[a]${C_RESET} Apply this optimization")"$'\n'
     fi
 
-    [[ "$STRATA_UPDATE_AVAILABLE" == true ]] && echo -e "  ${C_BGREEN}[u]${C_RESET} Install Strata update (${STRATA_UPDATE_SUMMARY})"
-    echo -e "  ${C_DIM}[n]${C_RESET} Next step (Skip)   ${C_DIM}[b]${C_RESET} Previous step   ${C_DIM}[i/Esc]${C_RESET} Back to Index   ${C_DIM}[q]${C_RESET} Quit\n"
-    read_step_action action
+    [[ "$STRATA_UPDATE_AVAILABLE" == true ]] && body+="$(echo -e "  ${C_BGREEN}[u]${C_RESET} Install Strata update (${STRATA_UPDATE_SUMMARY})")"$'\n'
+    body+="$(echo -e "  ${C_DIM}[n]${C_RESET} Next step (Skip)   ${C_DIM}[b]${C_RESET} Previous step   ${C_DIM}[i/Esc]${C_RESET} Back to Index   ${C_DIM}[q]${C_RESET} Quit")"$'\n\n'
+
+    printf "%s" "$body"
+    local body_lines lines_up
+    body_lines="$(printf "%s" "$body" | wc -l)"
+    lines_up=$(( LIVE_STATS_COUNT + POST_HEADER_LINES + body_lines ))
+    read_step_action action "$lines_up"
     case "$action" in
+      __refresh__) ;;
       __esc__|i|I) return 0 ;;
       u|U)
         if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
@@ -4040,22 +5114,8 @@ run_step_view() {
           echo -e "${C_YELLOW}No Strata update available.${C_RESET}"; sleep 1
         fi
         ;;
-      t|T)
-        if [[ "$step" == "strata_manager" && -n "$STRATA_BIN" && -n "$STRATA_RUNNING_URL" ]]; then
-          echo ""; run_strata_benchmark; pause_prompt
-        else
-          echo -e "${C_YELLOW}Invalid action '${action}'.${C_RESET}"; sleep 1
-        fi
-        ;;
-      h|H)
-        if [[ "$step" == "strata_manager" ]]; then
-          show_benchmark_history
-        else
-          echo -e "${C_YELLOW}Invalid action '${action}'.${C_RESET}"; sleep 1
-        fi
-        ;;
       a|A)
-        if [[ "$step" != "strata_manager" && "$applied" == true ]]; then
+        if [[ "$applied" == true ]]; then
           echo -e "${C_YELLOW}This optimization is already applied.${C_RESET}"; sleep 1
         else
           echo ""; "apply_${step}"; prompt_reboot_if_needed; pause_prompt
@@ -4063,8 +5123,8 @@ run_step_view() {
         fi
         ;;
       r|R)
-        if [[ "$applied" == true ]] || { [[ "$step" == "strata_manager" ]] && strata_service_installed; }; then
-          echo ""; "revert_${step}"; pause_prompt
+        if [[ "$applied" == true ]]; then
+          echo ""; "revert_${step}"; prompt_reboot_if_needed; pause_prompt
           [[ "$mode" == "single" ]] && return 0
         else
           echo -e "${C_YELLOW}Nothing to revert for this step.${C_RESET}"; sleep 1
@@ -4098,22 +5158,40 @@ read_choice_with_live_stats() {
   (( lines_up > 0 && lines_up + 1 <= term_lines )) && can_live=true
 
   local tmp_file="" sampler_pid=""
+  local cur_running_url="$STRATA_RUNNING_URL" cur_svc_active="0"
+  unit_active strata.service && cur_svc_active="1"
   if [[ "$can_live" == true ]]; then
     tmp_file="$(mktemp /tmp/strata-stats.XXXXXX 2>/dev/null || echo "")"
     if [[ -n "$tmp_file" ]]; then
       (
         while true; do
           sleep 1
-          print_stats_and_info_grid true > "${tmp_file}.tmp" 2>/dev/null && mv -f "${tmp_file}.tmp" "$tmp_file" 2>/dev/null || true
+          refresh_strata_running
+          if print_stats_and_info_grid true > "${tmp_file}.tmp" 2>/dev/null; then
+            local _svc_now="0"
+            unit_active strata.service && _svc_now="1"
+            printf "%s|%s|%s\n" "$LIVE_STATS_COUNT" "$STRATA_RUNNING_URL" "$_svc_now" > "${tmp_file}.meta.tmp" 2>/dev/null || true
+            mv -f "${tmp_file}.meta.tmp" "${tmp_file}.meta" 2>/dev/null || true
+            mv -f "${tmp_file}.tmp" "$tmp_file" 2>/dev/null || true
+          fi
         done
       ) &
       sampler_pid=$!
     fi
   fi
 
+  local saved_tty=""
+  saved_tty="$(stty -g 2>/dev/null || true)"
+  stty -echo 2>/dev/null || true
+
   _cleanup_live_sampler() {
     [[ -n "$sampler_pid" ]] && { kill "$sampler_pid" 2>/dev/null || true; wait "$sampler_pid" 2>/dev/null || true; }
-    [[ -n "$tmp_file" ]] && rm -f "$tmp_file" "${tmp_file}.tmp" 2>/dev/null || true
+    [[ -n "$tmp_file" ]] && rm -f "$tmp_file" "${tmp_file}.tmp" "${tmp_file}.meta" "${tmp_file}.meta.tmp" 2>/dev/null || true
+    if [[ -n "$saved_tty" ]]; then
+      stty "$saved_tty" 2>/dev/null || stty echo 2>/dev/null || true
+    else
+      stty echo 2>/dev/null || true
+    fi
   }
   trap '_cleanup_live_sampler; exit 0' INT TERM
 
@@ -4143,21 +5221,24 @@ read_choice_with_live_stats() {
             [[ "$_esc_ch" =~ [A-Za-z~] ]] && break
           done
         fi
-        if (( footer_lines > 0 && ${#ACTIVE_STEPS[@]} > 0 )); then
-          local old_idx="$INDEX_SELECTED" new_idx="$INDEX_SELECTED" total_steps="${#ACTIVE_STEPS[@]}"
+        local n_opt="${#ACTIVE_STEPS[@]}" n_str="${#ACTIVE_STRATA_OPTIONS[@]}"
+        local total_rows=$(( n_opt + n_str ))
+        if (( footer_lines > 0 && total_rows > 0 )); then
+          local old_idx="$INDEX_SELECTED" new_idx="$INDEX_SELECTED"
           if [[ "$esc_seq" == "[A" || "$esc_seq" == "OA" ]]; then
-            new_idx=$(( (old_idx - 1 + total_steps) % total_steps ))
+            new_idx=$(( (old_idx - 1 + total_rows) % total_rows ))
           elif [[ "$esc_seq" == "[B" || "$esc_seq" == "OB" ]]; then
-            new_idx=$(( (old_idx + 1) % total_steps ))
+            new_idx=$(( (old_idx + 1) % total_rows ))
           fi
           if (( new_idx != old_idx )); then
             INDEX_SELECTED="$new_idx"
-            local old_up=$(( (total_steps - old_idx) + footer_lines ))
-            local new_up=$(( (total_steps - new_idx) + footer_lines ))
+            local old_up new_up
+            old_up="$(index_row_up_offset "$old_idx" "$n_opt" "$n_str" "$footer_lines")"
+            new_up="$(index_row_up_offset "$new_idx" "$n_opt" "$n_str" "$footer_lines")"
             if (( old_up < term_lines && new_up < term_lines )); then
               local old_row new_row
-              old_row="$(format_index_row "$old_idx" false)"
-              new_row="$(format_index_row "$new_idx" true)"
+              old_row="$(render_any_index_row "$old_idx" false)"
+              new_row="$(render_any_index_row "$new_idx" true)"
               printf "\033[?2026h\033[?25l\033[s\033[%dA\r\033[2K%s\033[u\033[s\033[%dA\r\033[2K%s\033[u\033[?25h\033[?2026l" \
                 "$old_up" "$old_row" "$new_up" "$new_row"
             else
@@ -4170,8 +5251,23 @@ read_choice_with_live_stats() {
           fi
         fi
       else
-        buf+="$ch"
-        printf "%s" "$ch"
+        local accept=false
+        if [[ -z "$buf" ]]; then
+          if [[ "$ch" =~ ^[wWuUhHaAxXrRqQsS]$ ]] || [[ "$ch" =~ ^[1-9]$ ]]; then
+            accept=true
+          fi
+        elif [[ "$buf" =~ ^[sS]$ ]]; then
+          if [[ "$ch" =~ ^[1-9]$ ]] && (( 10#$ch <= ${#ACTIVE_STRATA_OPTIONS[@]} )); then
+            accept=true
+          fi
+        elif [[ "$buf" =~ ^[0-9]{1,2}$ ]] && [[ "$ch" =~ ^[0-9]$ ]]; then
+          local cand="${buf}${ch}"
+          (( 10#$cand <= ${#ACTIVE_STEPS[@]} )) && accept=true
+        fi
+        if [[ "$accept" == true ]]; then
+          buf+="$ch"
+          printf "%s" "$ch"
+        fi
       fi
     elif (( rc > 128 )); then
       local prev_upd="$STRATA_UPDATE_AVAILABLE"
@@ -4183,9 +5279,43 @@ read_choice_with_live_stats() {
         _out_var="__refresh__"
         return 0
       fi
-      if [[ -n "$tmp_file" && -s "$tmp_file" ]]; then
-        stats_block="$(<"$tmp_file")"
-        printf "\033[?2026h\033[?25l\033[s\033[%dA\r%s\033[u\033[?25h\033[?2026l" "$lines_up" "$stats_block"
+      local new_lines="$LIVE_STATS_COUNT" new_running_url="$cur_running_url" new_svc_active="$cur_svc_active"
+      if [[ -n "$tmp_file" && -s "${tmp_file}.meta" ]]; then
+        IFS='|' read -r new_lines new_running_url new_svc_active < "${tmp_file}.meta" || true
+      fi
+      if [[ "$new_lines" =~ ^[0-9]+$ ]] && (( new_lines != LIVE_STATS_COUNT )); then
+        if [[ -z "$buf" ]]; then
+          _cleanup_live_sampler
+          trap - INT TERM
+          printf "\n"
+          _out_var="__refresh__"
+          return 0
+        fi
+      else
+        if [[ -n "$tmp_file" && -s "$tmp_file" ]]; then
+          stats_block="$(<"$tmp_file")"
+          printf "\033[?2026h\033[?25l\033[s\033[%dA\r%s\033[u\033[?25h\033[?2026l" "$lines_up" "$stats_block"
+        fi
+        if [[ "$new_running_url" != "$cur_running_url" || "$new_svc_active" != "$cur_svc_active" ]]; then
+          cur_running_url="$new_running_url"
+          cur_svc_active="$new_svc_active"
+          STRATA_RUNNING_URL="$new_running_url"
+          local n_opt="${#ACTIVE_STEPS[@]}" n_str="${#ACTIVE_STRATA_OPTIONS[@]}" s_i abs_i row_up row_str is_sel
+          if (( footer_lines > 0 && n_str > 0 )); then
+            for (( s_i = 0; s_i < n_str; s_i++ )); do
+              if [[ "${ACTIVE_STRATA_OPTIONS[$s_i]}" == "service" || "${ACTIVE_STRATA_OPTIONS[$s_i]}" == "benchmark" ]]; then
+                abs_i=$(( n_opt + s_i ))
+                row_up="$(index_row_up_offset "$abs_i" "$n_opt" "$n_str" "$footer_lines")"
+                if (( row_up < term_lines )); then
+                  is_sel=false
+                  (( abs_i == INDEX_SELECTED )) && is_sel=true
+                  row_str="$(render_any_index_row "$abs_i" "$is_sel")"
+                  printf "\033[?2026h\033[?25l\033[s\033[%dA\r\033[2K%s\033[u\033[?25h\033[?2026l" "$row_up" "$row_str"
+                fi
+              fi
+            done
+          fi
+        fi
       fi
     else
       _cleanup_live_sampler
@@ -4242,7 +5372,6 @@ declare -A STEP_GAIN_PTS=(
   [pcie_aspm]=1
   [nvidia_clock_lock]=1
   [tuned_profile]=1
-  [strata_manager]=0
 )
 
 render_gain_stars() {
@@ -4287,13 +5416,54 @@ format_index_row() {
   printf "%b %b  | %b | %b | %b | %b" "$ptr" "$row_num" "$badge" "$title_txt" "$gain_txt" "$note_txt"
 }
 
+format_strata_row() {
+  local s_idx="$1" selected="${2:-false}"
+  local opt="${ACTIVE_STRATA_OPTIONS[$s_idx]}"
+  local badge title_txt ptr row_tag
+  badge="$("badge_strata_${opt}")"
+  title_txt="$("title_strata_${opt}")"
+  if [[ "$selected" == true ]]; then
+    ptr="${C_CYAN}>${C_RESET}"
+    row_tag="${C_CYAN}${C_BOLD}s$((s_idx + 1))${C_RESET}"
+    title_txt="${C_CYAN}${C_BOLD}${title_txt}${C_RESET}"
+  else
+    ptr=" "
+    row_tag="s$((s_idx + 1))"
+  fi
+  printf "%b %b  | %b | %b" "$ptr" "$row_tag" "$badge" "$title_txt"
+}
+
+render_any_index_row() {
+  local idx="$1" selected="${2:-false}"
+  local n_opt="${#ACTIVE_STEPS[@]}"
+  if (( idx < n_opt )); then
+    format_index_row "$idx" "$selected"
+  else
+    format_strata_row "$((idx - n_opt))" "$selected"
+  fi
+}
+
+index_row_up_offset() {
+  local idx="$1" n_opt="$2" n_str="$3" footer_menu_lines="$4"
+  if (( idx < n_opt )); then
+    # Below opt table: blank + legend + blank + Strata title + header + sep (6 lines) + n_str rows + footer_menu_lines
+    echo $(( (n_opt - idx) + 6 + n_str + footer_menu_lines ))
+  else
+    local s_idx=$(( idx - n_opt ))
+    echo $(( (n_str - s_idx) + footer_menu_lines ))
+  fi
+}
+
 show_index() {
   while true; do
+    refresh_strata_bin
     build_active_steps
-    if (( ${#ACTIVE_STEPS[@]} == 0 )); then
+    build_strata_options
+    local total_rows=$(( ${#ACTIVE_STEPS[@]} + ${#ACTIVE_STRATA_OPTIONS[@]} ))
+    if (( total_rows == 0 )); then
       INDEX_SELECTED=0
-    elif (( INDEX_SELECTED >= ${#ACTIVE_STEPS[@]} )); then
-      INDEX_SELECTED=$(( ${#ACTIVE_STEPS[@]} - 1 ))
+    elif (( INDEX_SELECTED >= total_rows )); then
+      INDEX_SELECTED=$(( total_rows - 1 ))
     elif (( INDEX_SELECTED < 0 )); then
       INDEX_SELECTED=0
     fi
@@ -4319,7 +5489,21 @@ show_index() {
     done
     body+=$'\n'"$(echo -e "  ${C_YELLOW}[!]${C_RESET} ${C_DIM}Higher idle power, minimal gain${C_RESET}")"$'\n'
 
-    local footer_lines=8 hist_count
+    body+=$'\n'"$(echo -e "${C_BOLD}Strata Options:${C_RESET}")"$'\n'
+    body+="$(printf "  ${C_BOLD}%-3s | %-15s | %s${C_RESET}" "#" "Status" "Option")"$'\n'
+    body+="$(printf "  %s" "----+-----------------+-------------------------------------------------------")"$'\n'
+    local s_idx abs_idx
+    for (( s_idx = 0; s_idx < ${#ACTIVE_STRATA_OPTIONS[@]}; s_idx++ )); do
+      abs_idx=$(( ${#ACTIVE_STEPS[@]} + s_idx ))
+      if (( abs_idx == INDEX_SELECTED )); then
+        body+="$(format_strata_row "$s_idx" true)"$'\n'
+      else
+        body+="$(format_strata_row "$s_idx" false)"$'\n'
+      fi
+    done
+
+    local footer_lines=8 hist_count s_range="s1"
+    (( ${#ACTIVE_STRATA_OPTIONS[@]} > 1 )) && s_range="s1-${#ACTIVE_STRATA_OPTIONS[@]}"
     hist_count="$(count_bench_history)"
     body+=$'\n'"$(echo -e "  ${C_BOLD}[w]${C_RESET} Start guided wizard from Step 1")"$'\n'
     if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
@@ -4330,9 +5514,9 @@ show_index() {
       body+="$(echo -e "  ${C_CYAN}[h]${C_RESET} Benchmark history & restore coupled options (${hist_count})")"$'\n'
       ((footer_lines++))
     fi
-    body+="$(echo -e "  ${C_GREEN}[a]${C_RESET} Apply all recommended optimizations (excludes Strata & high-idle-power options)")"$'\n'
+    body+="$(echo -e "  ${C_GREEN}[a]${C_RESET} Apply all recommended optimizations (excludes high-idle-power options)")"$'\n'
     body+="$(echo -e "  ${C_RED}[x]${C_RESET} Revert all recommended optimizations")"$'\n'
-    body+="$(echo -e "  ${C_BOLD}[1-${#ACTIVE_STEPS[@]} / ↑↓+Enter]${C_RESET} Jump to or select a step")"$'\n'
+    body+="$(echo -e "  ${C_BOLD}[1-${#ACTIVE_STEPS[@]}, ${s_range} / ↑↓+Enter]${C_RESET} Select an option")"$'\n'
     body+="$(echo -e "  ${C_BOLD}[r]${C_RESET} Reboot system")"$'\n'
     body+="$(echo -e "  ${C_BOLD}[q]${C_RESET} Quit")"$'\n\n'
 
@@ -4345,8 +5529,11 @@ show_index() {
     case "$choice" in
       __refresh__) ;;
       "")
-        if (( ${#ACTIVE_STEPS[@]} > 0 )); then
+        if (( INDEX_SELECTED < ${#ACTIVE_STEPS[@]} )); then
           run_step_view "$INDEX_SELECTED" "single"
+        else
+          local sel_s=$(( INDEX_SELECTED - ${#ACTIVE_STEPS[@]} ))
+          (( sel_s >= 0 && sel_s < ${#ACTIVE_STRATA_OPTIONS[@]} )) && run_strata_option "${ACTIVE_STRATA_OPTIONS[$sel_s]}"
         fi
         ;;
       u|U)
@@ -4365,6 +5552,14 @@ show_index() {
         sleep 1
         ;;
       q|Q) exit 0 ;;
+      s[1-9]|S[1-9])
+        local sn=$(( 10#${choice:1} - 1 ))
+        if (( sn >= 0 && sn < ${#ACTIVE_STRATA_OPTIONS[@]} )); then
+          run_strata_option "${ACTIVE_STRATA_OPTIONS[$sn]}"
+        else
+          echo -e "${C_RED}Invalid choice '${choice}'. Cancelled.${C_RESET}"; sleep 1
+        fi
+        ;;
       *)
         if [[ "$choice" =~ ^[0-9]+$ ]] && (( ${#choice} <= 3 && 10#$choice >= 1 && 10#$choice <= ${#ACTIVE_STEPS[@]} )); then
           run_step_view $((10#$choice - 1)) "single"
