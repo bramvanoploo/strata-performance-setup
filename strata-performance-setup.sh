@@ -885,7 +885,7 @@ append_gpu_pcie_lines() {
     elif [[ "$rebar" == "off" ]]; then
       line+=" | ${C_YELLOW}[!] ReBAR: off${C_RESET}${C_DIM} (enable Resizable BAR in BIOS)"
     fi
-    SYS_INFO_LINES+=("$(printf "%bPCIe:   %b%b" "${C_DIM}" "$line" "${C_RESET}")")
+    SYS_INFO_LINES+=("$(printf "PCIe:   %b%b%b" "${C_DIM}" "$line" "${C_RESET}")")
   done
 }
 
@@ -3645,9 +3645,9 @@ PY
     (( HIST_SELECTED >= ${#rows[@]} )) && HIST_SELECTED=$(( ${#rows[@]} - 1 ))
     (( HIST_SELECTED < 0 )) && HIST_SELECTED=0
 
-    local _rule_w=120
-    [[ -t 1 ]] && _rule_w="$(tput cols 2>/dev/null || echo 120)"
-    (( _rule_w > 135 )) && _rule_w=135
+    local _rule_w=117
+    [[ -t 1 ]] && _rule_w="$(tput cols 2>/dev/null || echo 117)"
+    (( _rule_w > 117 )) && _rule_w=117
     local tbl_w=$(( _rule_w - 2 ))
     (( tbl_w < 78 )) && tbl_w=78
     local hdr_w=$(( tbl_w - 4 ))
@@ -4291,7 +4291,7 @@ print_logo() {
 }
 
 render_bar() {
-  local pct="$1" width="${2:-20}"
+  local pct="$1" width="${2:-40}"
   (( pct < 0 )) && pct=0
   (( pct > 100 )) && pct=100
   local filled=$(( pct * width / 100 ))
@@ -4663,29 +4663,29 @@ print_live_stats() {
 build_sys_info_lines() {
   SYS_INFO_LINES=()
   SYS_INFO_LINES+=("$(printf "%bSystem Information:%b" "${C_BOLD}" "${C_RESET}")")
-  SYS_INFO_LINES+=("$(printf "%bOS:     %s (%s) | Kernel: %s | Laptop: %s%b" "${C_DIM}" "${OS_PRETTY:-$DISTRO_ID}" "$DISTRO_FAMILY" "$KERNEL_VER" "$IS_LAPTOP" "${C_RESET}")")
+  SYS_INFO_LINES+=("$(printf "OS:     %b%s (%s) | Kernel: %s | Laptop: %s%b" "${C_DIM}" "${OS_PRETTY:-$DISTRO_ID}" "$DISTRO_FAMILY" "$KERNEL_VER" "$IS_LAPTOP" "${C_RESET}")")
   if [[ "$IS_JETSON" == true ]]; then
-    SYS_INFO_LINES+=("$(printf "%bJetson: %s (L4T %s%s)%b" "${C_DIM}" "${JETSON_MODEL:-Jetson}" "${JETSON_L4T_REL:-unknown}" "${JETSON_SOC:+, ${JETSON_SOC}}" "${C_RESET}")")
+    SYS_INFO_LINES+=("$(printf "Jetson: %b%s (L4T %s%s)%b" "${C_DIM}" "${JETSON_MODEL:-Jetson}" "${JETSON_L4T_REL:-unknown}" "${JETSON_SOC:+, ${JETSON_SOC}}" "${C_RESET}")")
   fi
-  SYS_INFO_LINES+=("$(printf "%bCPU:    %s%b" "${C_DIM}" "$CPU_SUMMARY" "${C_RESET}")")
-  SYS_INFO_LINES+=("$(printf "%bRAM:    %s GiB%s%b" "${C_DIM}" "$RAM_GB" "$RAM_DETAILS" "${C_RESET}")")
-  SYS_INFO_LINES+=("$(printf "%bGPU(s): %s%b" "${C_DIM}" "$GPU_SUMMARY" "${C_RESET}")")
+  SYS_INFO_LINES+=("$(printf "CPU:    %b%s%b" "${C_DIM}" "$CPU_SUMMARY" "${C_RESET}")")
+  SYS_INFO_LINES+=("$(printf "RAM:    %b%s GiB%s%b" "${C_DIM}" "$RAM_GB" "$RAM_DETAILS" "${C_RESET}")")
+  SYS_INFO_LINES+=("$(printf "GPU(s): %b%s%b" "${C_DIM}" "$GPU_SUMMARY" "${C_RESET}")")
   if (( TOTAL_VRAM_MB > 0 )); then
     local total_vram_gb
     total_vram_gb="$(awk "BEGIN {g=$TOTAL_VRAM_MB/1024; if (g == int(g)) printf \"%d\", g; else printf \"%.1f\", g}")"
-    SYS_INFO_LINES+=("$(printf "%bVRAM:   %s GiB%b" "${C_DIM}" "$total_vram_gb" "${C_RESET}")")
+    SYS_INFO_LINES+=("$(printf "VRAM:   %b%s GiB%b" "${C_DIM}" "$total_vram_gb" "${C_RESET}")")
   fi
   if [[ "$HAS_NVIDIA" == true && -n "$NVIDIA_CURRENT_PL" ]]; then
-    SYS_INFO_LINES+=("$(printf "%bNVIDIA Power Limit: %sW (Default: %sW, Max: %sW)%b" "${C_DIM}" "$NVIDIA_CURRENT_PL" "$NVIDIA_DEFAULT_PL" "$NVIDIA_MAX_PL" "${C_RESET}")")
+    SYS_INFO_LINES+=("$(printf "NVIDIA Power Limit: %b%sW (Default: %sW, Max: %sW)%b" "${C_DIM}" "$NVIDIA_CURRENT_PL" "$NVIDIA_DEFAULT_PL" "$NVIDIA_MAX_PL" "${C_RESET}")")
   fi
   append_gpu_pcie_lines
-  [[ -n "$IS_VIRT" ]] && SYS_INFO_LINES+=("$(printf "%bVirt:   %s (hardware-specific steps hidden)%b" "${C_DIM}" "$IS_VIRT" "${C_RESET}")")
+  [[ -n "$IS_VIRT" ]] && SYS_INFO_LINES+=("$(printf "Virt:   %b%s (hardware-specific steps hidden)%b" "${C_DIM}" "$IS_VIRT" "${C_RESET}")")
   local rl pdl
   for rl in "${RAM_HEALTH_LINES[@]}" "${GPU_TOPO_LINES[@]}"; do [[ -n "$rl" ]] && SYS_INFO_LINES+=("$rl"); done
   pdl="$(power_daemon_conflict_line)"
   [[ -n "$pdl" ]] && SYS_INFO_LINES+=("$pdl")
   if grep -qiE "PowerEdge|ProLiant|ThinkSystem|Supermicro|PRIMERGY|SYS-[0-9]" <<<"${SYS_VENDOR} ${PRODUCT_NAME}"; then
-    SYS_INFO_LINES+=("$(printf "%bServer: set the BIOS/BMC system power profile to 'Performance' (not automated)%b" "${C_DIM}" "${C_RESET}")")
+    SYS_INFO_LINES+=("$(printf "Server: %bset the BIOS/BMC system power profile to 'Performance' (not automated)%b" "${C_DIM}" "${C_RESET}")")
   fi
   local _si
   for (( _si = 1; _si < ${#SYS_INFO_LINES[@]}; _si++ )); do
@@ -4703,6 +4703,39 @@ pad_ansi_col() {
   else
     printf "%s" "$str"
   fi
+}
+
+truncate_ansi_col() {
+  local str="$1" max_w="$2"
+  (( max_w <= 0 )) && return 0
+  local vis="${str//$'\033'\[*([0-9;])m/}"
+  if (( ${#vis} <= max_w )); then
+    printf "%s" "$str"
+    return 0
+  fi
+  local limit=$(( max_w > 3 ? max_w - 3 : max_w ))
+  awk -v lim="$limit" -v ell="$( (( max_w > 3 )) && echo "..." || echo "" )" '
+  {
+    n = length($0); vis_n = 0; out = ""; i = 1; had_esc = 0
+    while (i <= n) {
+      ch = substr($0, i, 1)
+      if (ch == "\033" && substr($0, i + 1, 1) == "[") {
+        rest = substr($0, i)
+        if (match(rest, /^\033\[[0-9;]*m/)) {
+          out = out substr(rest, 1, RLENGTH)
+          i += RLENGTH
+          had_esc = 1
+          continue
+        }
+      }
+      if (vis_n >= lim) break
+      out = out ch
+      vis_n++
+      i++
+    }
+    if (had_esc) out = out "\033[0m"
+    printf "%s%s", out, ell
+  }' <<< "$str"
 }
 
 collect_strata_stats_lines() {
@@ -5085,13 +5118,7 @@ PY
       STRATA_BENCH_LINES+=("$(printf "  %-8s %bn/a (not recorded)%b" "Power:" "${C_DIM}" "${C_RESET}")")
     fi
     STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b | Prefill: %b%s%b" "Decode:" "${C_CYAN}" "$b_dec" "${C_RESET}" "${C_CYAN}" "$b_pre" "${C_RESET}")")
-    local summary_tail=""
-    [[ -n "$b_req" ]] && summary_tail="Reqs: ${b_req}"
-    if [[ -n "$b_qual" ]]; then
-      [[ -n "$summary_tail" ]] && summary_tail+=" | "
-      summary_tail+="$b_qual"
-    fi
-    [[ -n "$summary_tail" ]] && STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b" "Checks:" "${C_DIM}" "$summary_tail" "${C_RESET}")")
+    local has_diff=false
     if [[ "$kind" == "CUR" ]]; then
       local diff_parts=()
       [[ -n "$b_dpct" ]] && diff_parts+=("Decode $(format_pct_delta "$b_dpct")")
@@ -5103,7 +5130,18 @@ PY
           diff_str+="${diff_parts[$di]}"
         done
         STRATA_BENCH_LINES+=("$(printf "  %-8s %s" "Diff:" "$diff_str")")
+        has_diff=true
       fi
+    fi
+    local summary_tail=""
+    [[ -n "$b_req" ]] && summary_tail="Reqs: ${b_req}"
+    if [[ -n "$b_qual" ]]; then
+      [[ -n "$summary_tail" ]] && summary_tail+=" | "
+      summary_tail+="$b_qual"
+    fi
+    [[ -n "$summary_tail" ]] && STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b" "Checks:" "${C_DIM}" "$summary_tail" "${C_RESET}")")
+    if [[ "$has_diff" == true || -n "$summary_tail" ]]; then
+      STRATA_BENCH_LINES+=("")
     fi
   done <<< "$parsed"
 }
@@ -5113,74 +5151,34 @@ print_stats_and_info_grid() {
   [[ "$inplace" == true ]] && eol=$'\033[K'
 
   print_live_stats "$inplace" || true
-  local term_cols="${TERM_COLS_CACHED:-120}"
+  local term_cols="${TERM_COLS_CACHED:-117}"
   if [[ -t 1 ]]; then
-    term_cols="$(tput cols 2>/dev/null || echo 120)"
+    term_cols="$(tput cols 2>/dev/null || echo 117)"
     TERM_COLS_CACHED="$term_cols"
   fi
+  local max_grid_w=$(( term_cols > 117 ? 117 : term_cols ))
 
-  local out="" total_lines=0
-  if (( term_cols >= 110 )); then
-    local n_left="${#LIVE_STAT_LINES[@]}" n_right="${#SYS_INFO_LINES[@]}"
-    local max_rows=$(( n_left > n_right ? n_left : n_right ))
-    local r left_s right_s
-    local sep
-    sep="$(printf "  %b│%b  " "${C_DIM}" "${C_RESET}")"
-    for ((r=0; r<max_rows; r++)); do
-      left_s=""
-      right_s=""
-      (( r < n_left )) && left_s="${LIVE_STAT_LINES[$r]}"
-      (( r < n_right )) && right_s="${SYS_INFO_LINES[$r]}"
-      if (( r > 0 )); then out+=$'\n'; fi
-      out+="$(pad_ansi_col "$left_s" 56)${sep}${right_s}${eol}"
-    done
-    total_lines="$max_rows"
-  else
-    local l
-    for l in "${LIVE_STAT_LINES[@]}"; do
-      [[ -n "$out" ]] && out+=$'\n'
-      out+="${l}${eol}"
-      total_lines=$((total_lines + 1))
-    done
-    out+=$'\n'"${eol}"
-    total_lines=$((total_lines + 1))
-    for l in "${SYS_INFO_LINES[@]}"; do
-      out+=$'\n'"${l}${eol}"
-      total_lines=$((total_lines + 1))
-    done
-  fi
-  collect_strata_stats_lines
-  collect_strata_bench_lines
-  if (( ${#STRATA_STAT_LINES[@]} > 0 || ${#STRATA_BENCH_LINES[@]} > 0 )); then
-    out+=$'\n'"${eol}"
-    total_lines=$((total_lines + 1))
-    if (( term_cols >= 110 )); then
-      local n_sl="${#STRATA_STAT_LINES[@]}" n_bl="${#STRATA_BENCH_LINES[@]}"
-      local max_sb=$(( n_sl > n_bl ? n_sl : n_bl ))
-      local r sl_s bl_s sep_sb
-      sep_sb="$(printf "  %b│%b  " "${C_DIM}" "${C_RESET}")"
-      for ((r=0; r<max_sb; r++)); do
-        sl_s=""
-        bl_s=""
-        (( r < n_sl )) && sl_s="${STRATA_STAT_LINES[$r]}"
-        (( r < n_bl )) && bl_s="${STRATA_BENCH_LINES[$r]}"
-        out+=$'\n'"$(pad_ansi_col "$sl_s" 56)${sep_sb}${bl_s}${eol}"
-        total_lines=$((total_lines + 1))
-      done
-    else
-      local sl
-      for sl in "${STRATA_STAT_LINES[@]}"; do
-        out+=$'\n'"${sl}${eol}"
-        total_lines=$((total_lines + 1))
-      done
+  local out="${eol}" total_lines=1
+  _append_grid_section() {
+    (( $# == 0 )) && return 0
+    if (( total_lines > 1 )); then
       out+=$'\n'"${eol}"
       total_lines=$((total_lines + 1))
-      for sl in "${STRATA_BENCH_LINES[@]}"; do
-        out+=$'\n'"${sl}${eol}"
-        total_lines=$((total_lines + 1))
-      done
     fi
-  fi
+    local _sec_line
+    for _sec_line in "$@"; do
+      (( total_lines > 0 )) && out+=$'\n'
+      out+="$(truncate_ansi_col "$_sec_line" "$max_grid_w")${eol}"
+      total_lines=$((total_lines + 1))
+    done
+  }
+  collect_strata_stats_lines
+  collect_strata_bench_lines
+  _append_grid_section "${SYS_INFO_LINES[@]}"
+  _append_grid_section "${LIVE_STAT_LINES[@]}"
+  _append_grid_section "${STRATA_STAT_LINES[@]}"
+  _append_grid_section "${STRATA_BENCH_LINES[@]}"
+  unset -f _append_grid_section
   LIVE_STATS_COUNT="$total_lines"
   printf "%s\n" "$out"
 }
@@ -5200,8 +5198,8 @@ print_header() {
   local hdr_mode="${1:-none}" skip_rule="${2:-false}"
   clear 2>/dev/null || true
   local _rule_w=120 _hdr_eq="" _hdr_rule=""
-  [[ -t 1 ]] && _rule_w="$(tput cols 2>/dev/null || echo 120)"
-  (( _rule_w > 135 )) && _rule_w=135
+  [[ -t 1 ]] && _rule_w="$(tput cols 2>/dev/null || echo 117)"
+  (( _rule_w > 117 )) && _rule_w=117
   print_logo "$_rule_w"
   printf -v _hdr_eq "%*s" "$_rule_w" ""
   _hdr_eq="${_hdr_eq// /=}"
