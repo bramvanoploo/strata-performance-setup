@@ -52,7 +52,7 @@ The wizard supports systemd-based Linux distributions across three package famil
 | :--- | :--- | :--- |
 | **Arch-based** | Arch Linux, CachyOS, EndeavourOS, Manjaro, Garuda (and `ID_LIKE=arch`) | `pacman` (plus `yay` or `paru` for AUR packages) |
 | **Fedora-based** | Fedora, Nobara, RHEL, CentOS, Rocky Linux, AlmaLinux (and `ID_LIKE=fedora` / `rhel`) | `dnf` |
-| **Debian-based** | Debian, Ubuntu, Pop!\_OS, Linux Mint, KDE neon (and `ID_LIKE=debian` / `ubuntu`) | `apt-get` |
+| **Debian-based** | Debian, Ubuntu (including **Jetson Linux R32 / L4T R32.x**), Pop!\_OS, Linux Mint, KDE neon (and `ID_LIKE=debian` / `ubuntu`) | `apt-get` |
 
 > **Bootloaders:** Kernel command-line parameters (used when BIOS locks runtime PCIe ASPM writes or for `gpu-unlock`) are automatically configured for **Limine** (`/etc/default/limine`), **GRUB** (`/etc/default/grub` via `grub-mkconfig` or `grub2-mkconfig`), or **systemd-boot** (`/etc/kernel/cmdline`).
 
@@ -74,6 +74,12 @@ The script probes your system at startup and enables hardware-specific steps onl
   - LACT (`lactd`) core & VRAM clock offsets
 - **Intel Arc / Integrated GPUs**:
   - Minimum GPU frequency locked to RP0/max (supports both `xe` and `i915` kernel drivers) for SYCL
+- **NVIDIA Jetson (Jetson Linux R32 / L4T R32.x)**:
+  - **Jetson TX2 Series** (`TX2`, `TX2 4GB`, `TX2i`, `TX2 NX` / `tegra186`) auto-detection via device tree & `/etc/nv_tegra_release`
+  - `nvpmodel -m 0` (`MAXN` mode enabling all Denver 2 + Cortex-A57 cores) and `jetson_clocks` persisted via systemd
+  - PWM Fan maximum cooling (`target_pwm=255` via `strata-jetson-fan.service`)
+  - CUDA device access (`video` group for `/dev/nvhost-gpu`)
+  - Kernel 4.9 / Ubuntu 18.04 compatibility (THP `madvise` fallback and `zram-tools` / `zram-config` / `strata-zram.service` with `zstd` → `lz4` → `lzo`)
 
 ### Laptops & OEM Thermal / EC Controls
 - **Generic ACPI Platform Profile** (`performance` mode via `/sys/firmware/acpi/platform_profile` — ThinkPad, IdeaPad, Legion, ASUS, HP, Dell, Acer, AMD PMF)
@@ -99,9 +105,9 @@ The script probes your system at startup and enables hardware-specific steps onl
 
 The header continuously refreshes every **1 second** across **all pages** (index, step views, and benchmark history) without interrupting your input:
 
-- **Live System Usage (left):** Color-coded bars for CPU usage + temperature, RAM usage, per-GPU utilization + temperature and VRAM (supports single and multi-GPU NVIDIA/AMD setups), and horizontal `Power:` (`GPU`, `CPU`, and `Sys` watts).
-  - *Tip:* On systems without a PSU or battery hwmon sensor, run with `sudo` (`sudo ~/strata-performance-setup.sh`) so the script can read root-only `intel-rapl` energy counters for `CPU` and `Sys` power.
-- **System Information (right):** OS, kernel, CPU model/threads, RAM capacity/speed/timings, GPU model(s), total VRAM, and NVIDIA power limits.
+- **Live System Usage (left):** Color-coded bars for CPU usage + temperature, RAM usage, per-GPU utilization + temperature and VRAM (supports single/multi-GPU NVIDIA/AMD setups and Jetson Tegra X2 load/`GPU-therm`), and horizontal `Power:` (`GPU`, `CPU`, and `Sys` watts, including Jetson INA3221 `VDD_IN`/`VDD_GPU`/`VDD_CPU` rails).
+  - *Tip:* On x86 systems without a PSU or battery hwmon sensor, run with `sudo` (`sudo ~/strata-performance-setup.sh`) so the script can read root-only `intel-rapl` energy counters for `CPU` and `Sys` power.
+- **System Information (right):** OS, kernel, Jetson board/L4T/SoC (when on Jetson), CPU model/threads, RAM capacity/speed/timings, GPU model(s), total VRAM, and NVIDIA power limits.
 - **Strata & Latest Benchmark Block:** Installed Strata version, live running state & `strata.service` status (polled every 1s), active serving preset and model, live/session average `tok/s`, and the **Latest Benchmark** summary (model, median & average decode/prefill `tok/s`, average power, and check/sanity counts).
 - **Active Update Polling:** Checks for Strata updates in the background every **60 seconds**, displays an `[UPDATE AVAILABLE]` banner on every screen when a new version is found, and lets you press `u` to stop `strata.service`, run `strata update --yes`, restart `strata.service`, and notify you once the model is `[LIVE]` again.
 

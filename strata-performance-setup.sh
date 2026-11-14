@@ -32,6 +32,7 @@ DISTRO_FAMILY="unknown" DISTRO_ID="unknown" OS_PRETTY="" KERNEL_VER="" AUR_HELPE
 HAS_NVIDIA=false HAS_NVIDIA_POWERD=false HAS_AMD=false HAS_INTEL_GPU=false HAS_INTEL_ARC=false
 GPU_SUMMARY="" GPU_RAW="" CPU_SUMMARY="" RAM_GB=0 RAM_DETAILS="" NVIDIA_VRAM_MB=0 TOTAL_VRAM_MB=0
 HAS_MSI_EC=false SYS_VENDOR="" PRODUCT_NAME="" IS_LAPTOP=false HAS_ASPM=false
+IS_JETSON=false IS_JETSON_TX2=false JETSON_MODEL="" JETSON_L4T_REL="" JETSON_SOC=""
 NVIDIA_DEFAULT_PL="" NVIDIA_MAX_PL="" NVIDIA_CURRENT_PL=""
 NVIDIA_MAX_GFX_CLK="" NVIDIA_MAX_MEM_CLK="" NVIDIA_ECC_CUR="" NVIDIA_ECC_PEND=""
 IS_VIRT="" NUMA_NODES=1 CPU_SOCKETS=1 DISCRETE_GPU_COUNT=0 DMI_MEM_CACHE=""
@@ -42,8 +43,10 @@ REBOOT_REQUIRED=false REBOOT_PROMPT_PENDING=false
 PREV_CPU_TOTAL="" PREV_CPU_IDLE="" PREV_RAPL_UJ="" PREV_RAPL_US="" LIVE_STATS_COUNT=0 POST_HEADER_LINES=0
 declare -a LIVE_STAT_LINES=() SYS_INFO_LINES=() STRATA_STAT_LINES=() STRATA_BENCH_LINES=()
 STRATA_BENCH_CACHE_KEY=""
+BENCH_HISTORY_COUNT_KEY="" BENCH_HISTORY_COUNT_CACHE=0
 STRATA_BENCH_HISTORY_FILE="$TARGET_HOME/.local/share/strata-performance-setup/bench-history.json"
-BENCH_POWER_SAMPLER_PID=""
+BENCH_POWER_SAMPLER_PID="" BENCH_POWER_TMP_FILE=""
+ACTIVE_SAMPLER_PID="" ACTIVE_SAMPLER_TMP=""
 STRATA_UPDATE_AVAILABLE=false STRATA_UPDATE_SUMMARY="" STRATA_UPDATE_CACHE_FILE="" STRATA_POLLER_PID=""
 UNIT_FILES_CACHE=""
 declare -A PKG_AVAIL_CACHE PKG_INST_CACHE
@@ -83,6 +86,10 @@ run_as_user_exec() {
   fi
 }
 
+refresh_unit_files_cache() {
+  UNIT_FILES_CACHE="$(systemctl list-unit-files --no-legend --no-pager 2>/dev/null || true)"
+}
+
 unit_exists() {
   awk -v u="$1" '$1 == u {found=1; exit} END {exit !found}' <<< "$UNIT_FILES_CACHE"
 }
@@ -99,6 +106,7 @@ install_service() {
   local unit="$1"
   run_root tee "/etc/systemd/system/${unit}" >/dev/null
   run_root systemctl daemon-reload
+  refresh_unit_files_cache
   run_root systemctl enable --now "$unit"
 }
 
@@ -107,6 +115,7 @@ remove_service() {
   run_root systemctl disable --now "$unit" 2>/dev/null || true
   run_root rm -f "/etc/systemd/system/${unit}"
   run_root systemctl daemon-reload
+  refresh_unit_files_cache
 }
 
 pkg_installed() {
@@ -139,7 +148,7 @@ pkg_available() {
         ;;
       fedora) [[ "$mode" == "repo" ]] && dnf info --available "$pkg" >/dev/null 2>&1 && rc=0 ;;
       debian) [[ "$mode" == "repo" ]] && apt-cache show "$pkg" >/dev/null 2>&1 && rc=0 ;;
-      suse)   [[ "$mode" == "repo" ]] && zypper --non-interactive info "$pkg" 2>/dev/null | grep -qi "^Repository" && rc=0 ;;
+      suse)   [[ "$mode" == "repo" ]] && zypper --non-interactive info "$pkg" 2>/dev/null | grep -i "^Repository" >/dev/null && rc=0 ;;
     esac
   fi
   PKG_AVAIL_CACHE[$key]=$rc
@@ -156,6 +165,7 @@ pkg_install() {
     *)      echo -e "${C_RED}Unsupported package manager.${C_RESET}"; return 1 ;;
   esac
   PKG_INST_CACHE=()
+  refresh_unit_files_cache
   return "$rc"
 }
 
@@ -167,6 +177,7 @@ aur_install() {
   local rc=0
   run_as_user_exec "$AUR_HELPER" -S --needed --noconfirm "$@" || rc=$?
   PKG_INST_CACHE=()
+  refresh_unit_files_cache
   return "$rc"
 }
 
@@ -222,7 +233,7 @@ _file_has_kparam() {
   local param="$1" file="$2" esc
   [[ -r "$file" ]] || return 1
   esc="$(_escape_ere "$param")"
-  grep -v '^[[:space:]]*#' "$file" | grep -Eq "(^|[[:space:]\"'])${esc}([[:space:]\"']|\$)"
+  grep -Ev '^[[:space:]]*#' "$file" 2>/dev/null | grep -E "(^|[[:space:]\"'])${esc}([[:space:]\"']|\$)" >/dev/null
 }
 
 _remove_kparam_from_file() {
@@ -383,7 +394,7 @@ remove_kernel_param() {
   fi
 }
 
-pause_prompt() { echo ""; read -r -p "Press [Enter] to continue..." _; }
+pause_prompt() { echo ""; read -r -p "Press [Enter] to continue..." _ || true; }
 
 prompt_reboot_if_needed() {
   [[ "$REBOOT_PROMPT_PENDING" == true ]] || return 0
@@ -484,7 +495,9 @@ for line in sys.stdin:
     running = d.get("running") or []
     if running and isinstance(running[0], dict):
         r = running[0]
-        print((r.get("name") or "") + "|" + (r.get("url") or ""))
+        nm = str(r.get("name") or "").replace("|", "/").replace("\n", " ")
+        ur = str(r.get("url") or "").replace("|", "").replace("\n", "")
+        print(nm + "|" + ur)
     break
 ' <<< "$st_json" 2>/dev/null || true)"
     if [[ -n "$parsed" ]]; then
@@ -493,13 +506,48 @@ for line in sys.stdin:
   fi
 }
 
+detect_jetson_platform() {
+  IS_JETSON=false IS_JETSON_TX2=false JETSON_MODEL="" JETSON_L4T_REL="" JETSON_SOC=""
+  local dt_model="" dt_compat="" tegra_rel=""
+  [[ -r /proc/device-tree/model ]] && dt_model="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || true)"
+  [[ -r /proc/device-tree/compatible ]] && dt_compat="$(tr '\0' ' ' < /proc/device-tree/compatible 2>/dev/null || true)"
+  [[ -r /etc/nv_tegra_release ]] && tegra_rel="$(head -n1 /etc/nv_tegra_release 2>/dev/null || true)"
+
+  if [[ -n "$tegra_rel" ]] || grep -qiE "jetson|tegra" <<< "${dt_model} ${dt_compat}"; then
+    IS_JETSON=true
+  else
+    return 0
+  fi
+
+  if [[ -n "$tegra_rel" ]]; then
+    local l4t_maj="" l4t_rev=""
+    l4t_maj="$(sed -nE 's/.*# *R([0-9]+).*/\1/p' <<< "$tegra_rel")"
+    l4t_rev="$(sed -nE 's/.*REVISION: *([0-9.]+).*/\1/p' <<< "$tegra_rel")"
+    if [[ -n "$l4t_maj" && -n "$l4t_rev" ]]; then
+      JETSON_L4T_REL="R${l4t_maj}.${l4t_rev}"
+    elif [[ -n "$l4t_maj" ]]; then
+      JETSON_L4T_REL="R${l4t_maj}"
+    fi
+  fi
+
+  JETSON_MODEL="${dt_model:-NVIDIA Jetson}"
+  if grep -qi "nvidia,tegra186" <<< "$dt_compat" || grep -qiE "t186ref|t186" <<< "$tegra_rel" || grep -qiE "TX2|quill|storm|lanai" <<< "$dt_model"; then
+    IS_JETSON_TX2=true
+    JETSON_SOC="tegra186"
+    if [[ -z "$dt_model" || "$dt_model" =~ ^(quill|storm|lanai|p2771|p3636) ]]; then
+      JETSON_MODEL="NVIDIA Jetson TX2"
+    fi
+  fi
+}
+
 PLATFORM_BASICS_DONE=false
 detect_platform_basics() {
   [[ "$PLATFORM_BASICS_DONE" == true ]] && return 0
   PLATFORM_BASICS_DONE=true
-  UNIT_FILES_CACHE="$(systemctl list-unit-files --no-legend --no-pager 2>/dev/null || true)"
+  refresh_unit_files_cache
   IS_VIRT="$(systemd-detect-virt 2>/dev/null || true)"
   [[ "$IS_VIRT" == "none" ]] && IS_VIRT=""
+  detect_jetson_platform
 
   if [[ -r /etc/os-release ]]; then
     # shellcheck disable=SC1091
@@ -544,7 +592,7 @@ ensure_script_tools() {
       *)    missing_pkgs+=("python3") ;;
     esac
   fi
-  if [[ -z "$IS_VIRT" ]] && ! command -v dmidecode >/dev/null 2>&1; then
+  if [[ -z "$IS_VIRT" && "$IS_JETSON" == false ]] && ! command -v dmidecode >/dev/null 2>&1; then
     missing_cmds+=("dmidecode"); missing_pkgs+=("dmidecode")
   fi
   [[ ${#missing_pkgs[@]} -eq 0 ]] && return 0
@@ -582,12 +630,11 @@ detect_environment() {
       refresh_nvidia_ecc
     fi
   fi
-  if [[ "$HAS_NVIDIA" == false ]] && lspci 2>/dev/null | grep -iE "vga|3d|display" | grep -qi "nvidia"; then
-    HAS_NVIDIA=true
-  fi
-
   local gpu_lines
   gpu_lines="$(lspci 2>/dev/null | grep -iE "vga|3d|display" || true)"
+  if [[ "$HAS_NVIDIA" == false ]] && grep -qi "nvidia" <<< "$gpu_lines"; then
+    HAS_NVIDIA=true
+  fi
   GPU_RAW="$gpu_lines"
   GPU_SUMMARY="$(echo "$gpu_lines" | sed -E 's/^[^ ]+ [^:]+: //; s/ \((rev|prog-if)[^)]*\)//g; s/.*\[([^][]+)\][[:space:]]*$/\1/' | awk 'NF {s = (s ? s "; " $0 : $0)} END {print s}')"
   [[ -z "$GPU_SUMMARY" ]] && GPU_SUMMARY="Unknown"
@@ -605,7 +652,15 @@ detect_environment() {
     echo "$gpu_lines" | grep -qiE "Arc|DG2|Battlemage|Alchemist" && HAS_INTEL_ARC=true
   fi
 
-  if [[ -z "$IS_VIRT" ]] && command -v dmidecode >/dev/null 2>&1; then
+  if [[ "$IS_JETSON" == true && "$HAS_NVIDIA" == false ]]; then
+    HAS_NVIDIA=true
+    if [[ "$IS_JETSON_TX2" == true ]]; then
+      GPU_SUMMARY="NVIDIA Tegra X2 (Pascal, 256 CUDA cores, Unified)"
+    else
+      GPU_SUMMARY="${JETSON_MODEL:-NVIDIA Jetson} Integrated GPU (Unified)"
+    fi
+  fi
+  if [[ -z "$IS_VIRT" && "$IS_JETSON" == false ]] && command -v dmidecode >/dev/null 2>&1; then
     if [[ $EUID -eq 0 ]]; then DMI_MEM_CACHE="$(dmidecode -t 17 2>/dev/null || true)"
     elif sudo -n true >/dev/null 2>&1; then DMI_MEM_CACHE="$(sudo -n dmidecode -t 17 2>/dev/null || true)"; fi
   fi
@@ -619,14 +674,17 @@ detect_environment() {
   cpu_model="$(awk -F': ' '/^model name/ {print $2; exit}' /proc/cpuinfo 2>/dev/null | sed 's/  */ /g')"
   cpu_threads="$(nproc 2>/dev/null || echo '?')"
   [[ -z "$cpu_model" ]] && cpu_model="$(lscpu 2>/dev/null | awk -F': +' '/^Model name/ {print $2; exit}')"
+  if [[ "$IS_JETSON_TX2" == true ]] && [[ -z "$cpu_model" || "$cpu_model" == ARMv8* ]]; then
+    cpu_model="NVIDIA Denver 2 + ARM Cortex-A57"
+  fi
   CPU_SUMMARY="${cpu_model:-Unknown CPU} (${cpu_threads} threads)"
 
   local nd=0 d
   for d in /sys/devices/system/node/node[0-9]*; do [[ -d "$d" ]] && ((nd++)); done
   NUMA_NODES=$(( nd > 0 ? nd : 1 ))
   local sk
-  sk="$(cat /sys/devices/system/cpu/cpu[0-9]*/topology/physical_package_id 2>/dev/null | sort -u | wc -l)"
-  [[ "$sk" =~ ^[0-9]+$ ]] && (( sk > 0 )) || sk="$(lscpu 2>/dev/null | awk -F: '/^Socket\(s\)/ {gsub(/ /,"",$2); print $2}')"
+  sk="$(cat /sys/devices/system/cpu/cpu[0-9]*/topology/physical_package_id 2>/dev/null | sort -u | wc -l || true)"
+  [[ "$sk" =~ ^[0-9]+$ ]] && (( sk > 0 )) || sk="$(lscpu 2>/dev/null | awk -F: '/^Socket\(s\)/ {gsub(/ /,"",$2); print $2}' || true)"
   CPU_SOCKETS="${sk:-1}"
 
   local dev cls ven gn=0
@@ -655,11 +713,11 @@ detect_environment() {
 kernel_param_value() {
   local name="$1" esc f v
   esc="$(_escape_ere "$name")"
-  v="$(tr ' ' '\n' </proc/cmdline 2>/dev/null | grep -m1 "^${name}=" | cut -d= -f2-)"
+  v="$(tr ' ' '\n' </proc/cmdline 2>/dev/null | grep -m1 -E "^${esc}=" | cut -d= -f2- || true)"
   [[ -n "$v" ]] && { echo "$v"; return 0; }
   for f in /etc/default/limine /etc/default/grub /etc/kernel/cmdline /boot/refind_linux.conf /boot/loader/entries/*.conf /efi/loader/entries/*.conf /boot/efi/loader/entries/*.conf; do
     [[ -r "$f" ]] || continue
-    v="$(grep -v '^[[:space:]]*#' "$f" | grep -oE "(^|[[:space:]\"'])${esc}=[^ \"']+" | head -n1 | sed -E 's/^[[:space:]"'\'']+//' | cut -d= -f2-)"
+    v="$(grep -v '^[[:space:]]*#' "$f" 2>/dev/null | grep -oE "(^|[[:space:]\"'])${esc}=[^ \"']+" | head -n1 | sed -E 's/^[[:space:]"'\'']+//' | cut -d= -f2- || true)"
     [[ -n "$v" ]] && { echo "$v"; return 0; }
   done
   return 1
@@ -835,7 +893,7 @@ append_gpu_pcie_lines() {
 # ------------------------------------------------------------------------------
 ALL_STEPS=(
   gpu_unlock amd_apu_memory
-  gpu_groups intel_compute_stack lact_overclock jetson_perf
+  gpu_groups intel_compute_stack lact_overclock jetson_perf jetson_fan
   nvidia_power_limit amd_gpu_perf intel_gpu_perf ryzenadj_tdp nvidia_ecc
   headless_target numactl_interleave amd_x3d_mode intel_rapl msi_cooling lenovo_legion
   asus_perf dell_thermal system76_perf tuxedo_perf acpi_platform_profile intel_pcore_pinning zram_swap numa_balancing
@@ -847,7 +905,7 @@ ALL_STEPS=(
 )
 ACTIVE_STEPS=()
 
-VM_HIDDEN_STEPS=" msi_cooling acpi_platform_profile asus_perf dell_thermal lenovo_legion system76_perf tuxedo_perf cpu_performance cstate_limit pcie_aspm ryzenadj_tdp intel_rapl intel_thermald amd_x3d_mode intel_pcore_pinning tuned_profile jetson_perf "
+VM_HIDDEN_STEPS=" msi_cooling acpi_platform_profile asus_perf dell_thermal lenovo_legion system76_perf tuxedo_perf cpu_performance cstate_limit pcie_aspm ryzenadj_tdp intel_rapl intel_thermald amd_x3d_mode intel_pcore_pinning tuned_profile jetson_perf jetson_fan "
 build_active_steps() {
   local step candidates=() pts
   for step in "${ALL_STEPS[@]}"; do
@@ -1154,7 +1212,7 @@ apply_cpu_performance() {
     case "$DISTRO_FAMILY" in
       arch)   prompt_install_deps repo cpupower || true ;;
       fedora) prompt_install_deps repo kernel-tools || true ;;
-      debian) prompt_install_deps repo linux-cpupower || true ;;
+      debian) pkg_available repo linux-cpupower && prompt_install_deps repo linux-cpupower || true ;;
       suse)   prompt_install_deps repo cpupower || true ;;
     esac
   fi
@@ -1308,16 +1366,17 @@ ExecStop=${smi_bin} -pl ${NVIDIA_DEFAULT_PL}
 [Install]
 WantedBy=multi-user.target
 EOF
-  NVIDIA_CURRENT_PL="$(nvidia-smi --query-gpu=power.limit --format=csv,noheader,nounits 2>/dev/null | head -n1 | awk '{printf "%.0f", $1}')"
+  NVIDIA_CURRENT_PL="$(nvidia-smi --query-gpu=power.limit --format=csv,noheader,nounits 2>/dev/null | head -n1 | awk '$1 ~ /^[0-9]+(\.[0-9]+)?$/ {printf "%.0f", $1}' || true)"
 }
 revert_nvidia_power_limit() {
   remove_service nvidia-power-limit.service
   run_root nvidia-smi -pl "$NVIDIA_DEFAULT_PL" >/dev/null 2>&1 || true
-  NVIDIA_CURRENT_PL="$(nvidia-smi --query-gpu=power.limit --format=csv,noheader,nounits 2>/dev/null | head -n1 | awk '{printf "%.0f", $1}')"
+  NVIDIA_CURRENT_PL="$(nvidia-smi --query-gpu=power.limit --format=csv,noheader,nounits 2>/dev/null | head -n1 | awk '$1 ~ /^[0-9]+(\.[0-9]+)?$/ {printf "%.0f", $1}' || true)"
 }
 
 # 10. LACT GPU Overclocking
 applicable_lact_overclock() {
+  [[ "$IS_JETSON" == true ]] && return 1
   [[ "$HAS_NVIDIA" == true || "$HAS_AMD" == true ]] || return 1
   command -v lact >/dev/null 2>&1 || pkg_available repo lact || pkg_available aur lact
 }
@@ -1406,7 +1465,7 @@ applicable_gpu_unlock() {
   pkg_installed gpu-unlock-dkms || pkg_available repo gpu-unlock-dkms || pkg_available aur gpu-unlock-dkms
 }
 title_gpu_unlock() { echo "NVIDIA GPU Unlock Module & Kernel Param (gpu-unlock-dkms)"; }
-status_gpu_unlock() { has_kernel_param "gpu_unlock.targets=all" && (lsmod | grep -q gpu_unlock || pkg_installed gpu-unlock-dkms); }
+status_gpu_unlock() { has_kernel_param "gpu_unlock.targets=all" && ([[ -d /sys/module/gpu_unlock ]] || lsmod 2>/dev/null | grep -E "gpu_unlock" >/dev/null || pkg_installed gpu-unlock-dkms); }
 explain_gpu_unlock() {
   cat <<'EOF'
 Impact:
@@ -1528,14 +1587,16 @@ EOF2
       prev_en="$(sed -E 's/.*\[([a-z+_]+)\].*/\1/' "$en" 2>/dev/null)"
       prev_df="$(sed -E 's/.*\[([a-z+_]+)\].*/\1/' "$df" 2>/dev/null)"
     fi
+    local thp_df_val="defer+madvise"
+    grep -qw "defer+madvise" "$df" 2>/dev/null || thp_df_val="madvise"
     run_root mkdir -p /etc/tmpfiles.d
     run_root tee /etc/tmpfiles.d/99-strata-thp.conf >/dev/null <<EOF2
 # prev_enabled=${prev_en:-madvise} prev_defrag=${prev_df:-madvise}
 w /sys/kernel/mm/transparent_hugepage/enabled - - - - always
-w /sys/kernel/mm/transparent_hugepage/defrag - - - - defer+madvise
+w /sys/kernel/mm/transparent_hugepage/defrag - - - - ${thp_df_val}
 EOF2
     echo always | run_root tee "$en" >/dev/null 2>&1 || true
-    echo defer+madvise | run_root tee "$df" >/dev/null 2>&1 || true
+    echo "$thp_df_val" | run_root tee "$df" >/dev/null 2>&1 || true
   fi
   if [[ "$DISTRO_FAMILY" == "arch" ]]; then
     local svc
@@ -1564,14 +1625,18 @@ applicable_zram_swap() {
   case "$DISTRO_FAMILY" in
     arch)   pkg_available repo zram-generator ;;
     fedora) pkg_available repo zram-generator-defaults || pkg_available repo zram-generator ;;
-    debian) pkg_available repo zram-tools ;;
+    debian)
+      pkg_available repo zram-tools && return 0
+      pkg_available repo zram-config && return 0
+      [[ "$IS_JETSON" == true ]] && { [[ -d /sys/module/zram ]] || modinfo zram >/dev/null 2>&1; }
+      ;;
     suse)   pkg_available repo zram-generator ;;
     *)      return 1 ;;
   esac
 }
-title_zram_swap() { echo "Compressed zram Swap (zstd) for Large Model Safety"; }
-status_zram_swap() { swapon --show=NAME --noheadings 2>/dev/null | grep -q "zram"; }
-explain_zram_swap() { echo -e "Impact:\n  Enables zstd-compressed RAM swap (/dev/zram0) to prevent OOM crashes on\n  large models without slow NVMe swap thrashing, and raises vm.swappiness to 100\n  (zram swap is faster than evicting page cache)."; }
+title_zram_swap() { echo "Compressed zram Swap (zstd/lz4) for Large Model Safety"; }
+status_zram_swap() { swapon --show=NAME --noheadings 2>/dev/null | grep -E "zram" >/dev/null; }
+explain_zram_swap() { echo -e "Impact:\n  Enables compressed RAM swap (/dev/zram0) to prevent OOM crashes on\n  large models without slow storage swap thrashing, and raises vm.swappiness to 100\n  (zram swap is faster than evicting page cache)."; }
 apply_zram_swap() {
   status_zram_swap && { echo -e "${C_GREEN}zram swap is already active.${C_RESET}"; return 0; }
   case "$DISTRO_FAMILY" in
@@ -1592,14 +1657,36 @@ EOF
       run_root systemctl start systemd-zram-setup@zram0.service 2>/dev/null || true
       ;;
     debian)
-      prompt_install_deps repo zram-tools || return 0
-      run_root cp -n /etc/default/zramswap /etc/default/zramswap.bak.strata-setup 2>/dev/null || true
-      run_root tee /etc/default/zramswap >/dev/null <<'EOF'
+      if pkg_available repo zram-tools; then
+        prompt_install_deps repo zram-tools || return 0
+        run_root cp -n /etc/default/zramswap /etc/default/zramswap.bak.strata-setup 2>/dev/null || true
+        run_root tee /etc/default/zramswap >/dev/null <<'EOF'
 ALGO=zstd
 PERCENT=50
 PRIORITY=100
 EOF
-      run_root systemctl enable --now zramswap.service
+        run_root systemctl enable --now zramswap.service
+      elif pkg_available repo zram-config; then
+        prompt_install_deps repo zram-config || return 0
+        run_root systemctl enable --now zram-config.service 2>/dev/null || true
+      else
+        local zram_kb
+        zram_kb=$(( $(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 4194304) / 2 ))
+        install_service strata-zram.service <<EOF
+[Unit]
+Description=Strata Compressed zram Swap
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'modprobe zram num_devices=1; algo=lzo; for a in zstd lz4 lzo; do grep -qw "\$a" /sys/block/zram0/comp_algorithm 2>/dev/null && { algo=\$a; break; }; done; echo "\$algo" > /sys/block/zram0/comp_algorithm 2>/dev/null || true; echo ${zram_kb}K > /sys/block/zram0/disksize && mkswap /dev/zram0 && swapon -p 100 /dev/zram0'
+ExecStop=/bin/sh -c 'swapoff /dev/zram0 2>/dev/null || true; echo 1 > /sys/block/zram0/reset 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+      fi
       ;;
   esac
   write_swappiness_conf
@@ -1616,8 +1703,16 @@ revert_zram_swap() {
       fi
       ;;
     debian)
-      run_root systemctl disable --now zramswap.service 2>/dev/null || true
-      [[ -f /etc/default/zramswap.bak.strata-setup ]] && run_root mv -f /etc/default/zramswap.bak.strata-setup /etc/default/zramswap
+      if [[ -f /etc/systemd/system/strata-zram.service ]]; then
+        remove_service strata-zram.service
+      elif unit_exists zramswap.service; then
+        run_root systemctl disable --now zramswap.service 2>/dev/null || true
+        [[ -f /etc/default/zramswap.bak.strata-setup ]] && run_root mv -f /etc/default/zramswap.bak.strata-setup /etc/default/zramswap
+      elif unit_exists zram-config.service; then
+        run_root systemctl disable --now zram-config.service 2>/dev/null || true
+      else
+        echo -e "${C_YELLOW}zram was configured by your OS by default; leaving OS zram intact.${C_RESET}"
+      fi
       ;;
   esac
   [[ -f /etc/sysctl.d/99-strata-swappiness.conf ]] && write_swappiness_conf
@@ -1772,7 +1867,7 @@ gpu_missing_groups() {
 }
 applicable_gpu_groups() {
   [[ "$TARGET_USER" != "root" ]] || return 1
-  compgen -G "/dev/dri/renderD*" >/dev/null 2>&1 || [[ -e /dev/kfd ]] || return 1
+  compgen -G "/dev/dri/renderD*" >/dev/null 2>&1 || [[ -e /dev/kfd || -e /dev/nvhost-gpu ]] || return 1
   getent group render >/dev/null 2>&1 || getent group video >/dev/null 2>&1
 }
 title_gpu_groups() { echo "GPU Device Access Groups (render / video for ROCm, Intel Arc, Vulkan)"; }
@@ -1898,7 +1993,7 @@ applicable_amd_apu_memory() {
   grep -iE "AMD|ATI|Radeon" <<<"$GPU_RAW" | grep -qiE "Strix|Phoenix|Hawk Point|Rembrandt|Barcelo|Cezanne|Renoir|Lucienne|Raphael|Granite Ridge|Mendocino|Krackan|Kraken|Picasso|Raven|Van Gogh|Vega Series|Vega Mobile|Radeon Graphics|Radeon [0-9]{3}M|Radeon 8[0-9]{2,3}S"
 }
 title_amd_apu_memory() { echo "AMD APU Unified Memory GPU Limit (ttm.pages_limit ~ $(( $(amd_apu_gtt_pages) * 4 / 1048576 )) GiB)"; }
-status_amd_apu_memory() { [[ -n "$(kernel_param_value ttm.pages_limit)" ]]; }
+status_amd_apu_memory() { [[ -n "$(kernel_param_value ttm.pages_limit || true)" ]]; }
 explain_amd_apu_memory() {
   cat <<EOF
 Impact:
@@ -1920,7 +2015,6 @@ revert_amd_apu_memory() {
     v="$(kernel_param_value "$n" || true)"
     [[ -n "$v" ]] && remove_kernel_param "${n}=${v}"
   done
-  REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
 }
 
 # 12k. NVMe Tuning
@@ -2153,7 +2247,7 @@ applicable_tuned_profile() {
   unit_exists tuned.service || command -v tuned-adm >/dev/null 2>&1 || pkg_available repo tuned
 }
 tuned_target_profile() {
-  if command -v tuned-adm >/dev/null 2>&1 && tuned-adm list 2>/dev/null | grep -q "accelerator-performance"; then
+  if command -v tuned-adm >/dev/null 2>&1 && tuned-adm list 2>/dev/null | grep -E "accelerator-performance" >/dev/null; then
     echo accelerator-performance
   else
     echo throughput-performance
@@ -2163,7 +2257,7 @@ title_tuned_profile() { echo "tuned Profile (throughput-performance / accelerato
 note_tuned_profile() { echo -e "${C_YELLOW}[!]${C_RESET}"; }
 status_tuned_profile() {
   unit_active tuned.service || return 1
-  tuned-adm active 2>/dev/null | grep -qE "throughput-performance|accelerator-performance"
+  tuned-adm active 2>/dev/null | grep -E "throughput-performance|accelerator-performance" >/dev/null
 }
 explain_tuned_profile() {
   cat <<'EOF'
@@ -2202,7 +2296,7 @@ title_iommu_pt() { echo "IOMMU Passthrough Mode (iommu=pt, lower multi-GPU DMA o
 status_iommu_pt() { has_kernel_param "iommu=pt" || has_kernel_param "iommu.passthrough=1"; }
 explain_iommu_pt() { echo -e "Impact:\n  Adds 'iommu=pt' to the kernel command line so host devices skip IOMMU address\n  translation (lower DMA overhead for multi-GPU transfers and fast NICs). VFIO\n  device passthrough keeps working. Requires a reboot."; }
 apply_iommu_pt() { add_kernel_param "iommu=pt"; }
-revert_iommu_pt() { remove_kernel_param "iommu=pt"; REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true; }
+revert_iommu_pt() { remove_kernel_param "iommu=pt"; remove_kernel_param "iommu.passthrough=1"; }
 
 # 12r. Intel compute stack
 intel_compute_pkgs() {
@@ -2231,6 +2325,7 @@ revert_intel_compute_stack() { echo -e "${C_YELLOW}Compute runtime packages are 
 
 # 12s. NVIDIA Jetson
 is_jetson() {
+  [[ "$IS_JETSON" == true ]] && return 0
   [[ -f /etc/nv_tegra_release ]] && return 0
   [[ -r /proc/device-tree/model ]] && tr -d '\0' < /proc/device-tree/model | grep -qi "jetson"
 }
@@ -2242,7 +2337,12 @@ jetson_maxn_id() {
 applicable_jetson_perf() { is_jetson && command -v nvpmodel >/dev/null 2>&1; }
 title_jetson_perf() { echo "NVIDIA Jetson MAXN Power Mode & Max Clocks (nvpmodel / jetson_clocks)"; }
 status_jetson_perf() { [[ -f /etc/systemd/system/strata-jetson-perf.service ]] && unit_enabled strata-jetson-perf.service; }
-explain_jetson_perf() { echo -e "Impact:\n  Switches the Jetson to its MAXN power model (nvpmodel) and pins CPU/GPU/EMC clocks\n  to maximum (jetson_clocks) at every boot. Clocks are restored on revert."; }
+explain_jetson_perf() {
+  echo -e "Impact:\n  Switches the Jetson to its MAXN power model (nvpmodel -m $(jetson_maxn_id)) and pins CPU/GPU/EMC\n  clocks to maximum (jetson_clocks) at every boot. Clocks are restored on revert."
+  if [[ "$IS_JETSON_TX2" == true ]]; then
+    echo -e "  On Jetson TX2 (L4T R32), MAXN also enables both Denver 2 cores alongside\n  the 4 Cortex-A57 cores (default boot mode leaves Denver 2 cores offline)."
+  fi
+}
 apply_jetson_perf() {
   local nv jc id
   nv="$(command -v nvpmodel)"; jc="$(command -v jetson_clocks || echo /usr/bin/jetson_clocks)"; id="$(jetson_maxn_id)"
@@ -2264,6 +2364,49 @@ WantedBy=multi-user.target
 EOF
 }
 revert_jetson_perf() { remove_service strata-jetson-perf.service; }
+
+# 12s2. NVIDIA Jetson PWM Fan Maximum Cooling
+jetson_fan_pwm_path() {
+  if [[ -e /sys/devices/pwm-fan/target_pwm ]]; then
+    echo "/sys/devices/pwm-fan/target_pwm"
+    return 0
+  fi
+  local hm
+  for hm in /sys/class/hwmon/hwmon*; do
+    [[ -r "$hm/name" ]] || continue
+    if grep -qiE "pwm-?fan" "$hm/name" 2>/dev/null && [[ -e "$hm/pwm1" ]]; then
+      echo "$hm/pwm1"
+      return 0
+    fi
+  done
+  return 1
+}
+applicable_jetson_fan() { is_jetson && jetson_fan_pwm_path >/dev/null 2>&1; }
+title_jetson_fan() { echo "NVIDIA Jetson PWM Fan Maximum Cooling (target_pwm=255)"; }
+status_jetson_fan() { [[ -f /etc/systemd/system/strata-jetson-fan.service ]] && unit_enabled strata-jetson-fan.service; }
+explain_jetson_fan() {
+  echo -e "Impact:\n  Locks the Jetson carrier board PWM fan to 100% (255) via systemd so the\n  SoC stays below thermal throttling thresholds during sustained MAXN inference."
+}
+apply_jetson_fan() {
+  local pwm_path tc_path=""
+  pwm_path="$(jetson_fan_pwm_path)" || return 1
+  [[ -e /sys/devices/pwm-fan/temp_control ]] && tc_path="/sys/devices/pwm-fan/temp_control"
+  install_service strata-jetson-fan.service <<EOF
+[Unit]
+Description=Set Jetson PWM Fan to Maximum Cooling for Strata
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c '${tc_path:+[ -w ${tc_path} ] && echo 0 > ${tc_path}; }[ -w ${pwm_path} ] && echo 255 > ${pwm_path} || true'
+ExecStop=/bin/sh -c '[ -w ${pwm_path} ] && echo 0 > ${pwm_path}; ${tc_path:+[ -w ${tc_path} ] && echo 1 > ${tc_path}; }true'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+revert_jetson_fan() { remove_service strata-jetson-fan.service; }
 
 # 12t. numactl interleave
 applicable_numactl_interleave() {
@@ -2302,7 +2445,7 @@ revert_numactl_interleave() {
 applicable_hugepages_1g() {
   [[ -n "$(kernel_param_value hugepages || true)" ]] && return 0
   grep -qw pdpe1gb /proc/cpuinfo 2>/dev/null || return 1
-  (( RAM_GB >= 64 )) && (( $(numa_node_count) > 1 ))
+  (( ${RAM_GB:-0} >= 64 )) && (( $(numa_node_count) > 1 ))
 }
 title_hugepages_1g() { echo "Reserve 1 GiB Hugepages ($(( RAM_GB / 4 )) GiB, multi-socket CPU inference)"; }
 note_hugepages_1g() { echo -e "${C_YELLOW}[!] Reserves RAM, minimal gain${C_RESET}"; }
@@ -2327,7 +2470,6 @@ revert_hugepages_1g() {
     v="$(kernel_param_value "$n" || true)"
     [[ -n "$v" ]] && remove_kernel_param "${n}=${v}"
   done
-  REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
 }
 
 # 12v. sched_ext scheduler
@@ -2352,15 +2494,17 @@ apply_scx_scheduler() {
   local u
   u="$(scx_unit)" || { echo -e "${C_YELLOW}No scx service found after installation.${C_RESET}"; return 1; }
   if [[ "$u" == "scx_loader.service" ]] && command -v scxctl >/dev/null 2>&1; then
+    local scxctl_bin
+    scxctl_bin="$(command -v scxctl)"
     run_root mkdir -p /etc/systemd/system/scx_loader.service.d
-    run_root tee /etc/systemd/system/scx_loader.service.d/strata.conf >/dev/null <<'EOF'
+    run_root tee /etc/systemd/system/scx_loader.service.d/strata.conf >/dev/null <<EOF
 [Service]
-ExecStartPost=-/usr/bin/scxctl start -s bpfland
+ExecStartPost=-${scxctl_bin} start -s bpfland
 EOF
     run_root systemctl daemon-reload
     run_root systemctl enable --now "$u"
     if [[ "$(cat /sys/kernel/sched_ext/state 2>/dev/null)" != "enabled" ]]; then
-      run_root scxctl start -s bpfland
+      run_root "$scxctl_bin" start -s bpfland
     fi
   else
     run_root systemctl enable --now "$u"
@@ -2523,7 +2667,11 @@ load_strata_update_state() {
 }
 
 stop_strata_update_poller() {
-  [[ -n "$STRATA_POLLER_PID" ]] && { kill "$STRATA_POLLER_PID" 2>/dev/null || true; wait "$STRATA_POLLER_PID" 2>/dev/null || true; STRATA_POLLER_PID=""; }
+  if [[ -n "$STRATA_POLLER_PID" ]]; then
+    kill "$STRATA_POLLER_PID" 2>/dev/null || true
+    wait "$STRATA_POLLER_PID" 2>/dev/null || true
+    STRATA_POLLER_PID=""
+  fi
   [[ -n "$STRATA_UPDATE_CACHE_FILE" ]] && rm -f "$STRATA_UPDATE_CACHE_FILE" "${STRATA_UPDATE_CACHE_FILE}.tmp" 2>/dev/null || true
 }
 
@@ -2532,9 +2680,11 @@ start_strata_update_poller() {
   [[ -n "$STRATA_UPDATE_CACHE_FILE" ]] || STRATA_UPDATE_CACHE_FILE="$(mktemp /tmp/strata-update-check.XXXXXX 2>/dev/null || echo "")"
   [[ -n "$STRATA_UPDATE_CACHE_FILE" ]] || return 0
   (
+    trap 'exit 0' TERM INT
     while true; do
       check_strata_update_sync >/dev/null 2>&1 || true
-      sleep 60
+      sleep 60 &
+      wait $! 2>/dev/null || exit 0
     done
   ) &
   STRATA_POLLER_PID=$!
@@ -2639,7 +2789,9 @@ format_strata_hw_warnings() {
   if (( RAM_GB > 0 && RAM_GB < 32 )); then
     echo -e "${C_YELLOW}[WARNING] System RAM is ${RAM_GB} GiB (< 32 GiB). Larger Strata models may not fit or may swap.${C_RESET}"
   fi
-  if [[ "$HAS_NVIDIA" == false && "$HAS_AMD" == false && "$HAS_INTEL_ARC" == false ]]; then
+  if [[ "$IS_JETSON" == true ]]; then
+    return 0
+  elif [[ "$HAS_NVIDIA" == false && "$HAS_AMD" == false && "$HAS_INTEL_ARC" == false ]]; then
     echo -e "${C_YELLOW}[WARNING] No dedicated NVIDIA, AMD Radeon, or Intel Arc GPU detected (${GPU_SUMMARY}). Strata models may not run.${C_RESET}"
   elif [[ "$HAS_NVIDIA" == true && "$NVIDIA_VRAM_MB" -gt 0 && "$NVIDIA_VRAM_MB" -lt 6144 ]]; then
     echo -e "${C_YELLOW}[WARNING] NVIDIA GPU VRAM is $((NVIDIA_VRAM_MB / 1024)) GiB (< 6 GiB). Larger Strata models may not fit in VRAM.${C_RESET}"
@@ -2755,6 +2907,25 @@ find_latest_results_json() {
   [[ -n "$newest" ]] && printf "%s" "$newest"
 }
 
+read_jetson_ina3221_watts() {
+  local d ch rname pval sw="" gw="" cw=""
+  for d in /sys/bus/i2c/drivers/ina3221x/*/iio:device*; do
+    [[ -d "$d" ]] || continue
+    for ch in 0 1 2; do
+      [[ -r "$d/rail_name_${ch}" && -r "$d/in_power${ch}_input" ]] || continue
+      rname="$(cat "$d/rail_name_${ch}" 2>/dev/null || true)"
+      pval="$(cat "$d/in_power${ch}_input" 2>/dev/null || true)"
+      [[ "$pval" =~ ^[0-9]+$ ]] || continue
+      case "$rname" in
+        VDD_IN|POM_5V_IN)   [[ -z "$sw" ]] && sw="$(awk -v m="$pval" 'BEGIN{printf "%.2f", m/1000.0}')" ;;
+        VDD_GPU|POM_5V_GPU) [[ -z "$gw" ]] && gw="$(awk -v m="$pval" 'BEGIN{printf "%.2f", m/1000.0}')" ;;
+        VDD_CPU|POM_5V_CPU|VDD_SYS_CPU) [[ -z "$cw" ]] && cw="$(awk -v m="$pval" 'BEGIN{printf "%.2f", m/1000.0}')" ;;
+      esac
+    done
+  done
+  printf "%s|%s|%s" "$sw" "$gw" "$cw"
+}
+
 start_bench_power_sampler() {
   local out_file="$1"
   (
@@ -2792,6 +2963,22 @@ start_bench_power_sampler() {
       if [[ "$has_g" == true ]]; then
         gpu_sum="$(awk -v a="$gpu_sum" -v b="$gw" 'BEGIN{printf "%.2f", a + b}')"
         ((gpu_n++))
+      fi
+      if [[ "$IS_JETSON" == true ]]; then
+        local j_sw="" j_gw="" j_cw=""
+        IFS='|' read -r j_sw j_gw j_cw <<< "$(read_jetson_ina3221_watts)"
+        if [[ "$has_g" == false && -n "$j_gw" ]]; then
+          gpu_sum="$(awk -v a="$gpu_sum" -v b="$j_gw" 'BEGIN{printf "%.2f", a + b}')"
+          ((gpu_n++))
+        fi
+        if [[ -n "$j_cw" ]]; then
+          cpu_sum="$(awk -v a="$cpu_sum" -v b="$j_cw" 'BEGIN{printf "%.2f", a + b}')"
+          ((cpu_n++))
+        fi
+        if [[ -n "$j_sw" ]]; then
+          sys_sum="$(awk -v a="$sys_sum" -v b="$j_sw" 'BEGIN{printf "%.2f", a + b}')"
+          ((sys_n++))
+        fi
       fi
 
       if [[ "$rapl_mode" != "none" ]]; then
@@ -3049,7 +3236,17 @@ PY
 
 count_bench_history() {
   command -v python3 >/dev/null 2>&1 || { echo 0; return 0; }
-  python3 - "$STRATA_BENCH_HISTORY_FILE" "$PWD/bench/results" "$PWD/bench-results" "$TARGET_HOME/bench/results" "$TARGET_HOME/bench-results" "$TARGET_HOME/.local/share/strata/bench-results" "$TARGET_HOME/.config/strata/bench-results" <<'PY' 2>/dev/null || echo 0
+  local newest="" hist_mtime="0" newest_mtime="0" ckey
+  newest="$(find_latest_results_json 0)"
+  [[ -r "$STRATA_BENCH_HISTORY_FILE" ]] && hist_mtime="$(stat -c '%Y' "$STRATA_BENCH_HISTORY_FILE" 2>/dev/null || echo 0)"
+  [[ -n "$newest" ]] && newest_mtime="$(stat -c '%Y' "$newest" 2>/dev/null || echo 0)"
+  ckey="${STRATA_BENCH_HISTORY_FILE}:${hist_mtime}:${newest}:${newest_mtime}"
+  if [[ "$ckey" == "$BENCH_HISTORY_COUNT_KEY" ]]; then
+    echo "$BENCH_HISTORY_COUNT_CACHE"
+    return 0
+  fi
+  local cnt
+  cnt="$(python3 - "$STRATA_BENCH_HISTORY_FILE" "$PWD/bench/results" "$PWD/bench-results" "$TARGET_HOME/bench/results" "$TARGET_HOME/bench-results" "$TARGET_HOME/.local/share/strata/bench-results" "$TARGET_HOME/.config/strata/bench-results" <<'PY' 2>/dev/null || echo 0
 import glob, json, os, sys
 hist_path = sys.argv[1]
 search_dirs = sys.argv[2:]
@@ -3081,6 +3278,11 @@ for sd in search_dirs:
                 count += 1
 print(count)
 PY
+)"
+  [[ "$cnt" =~ ^[0-9]+$ ]] || cnt=0
+  BENCH_HISTORY_COUNT_KEY="$ckey"
+  BENCH_HISTORY_COUNT_CACHE="$cnt"
+  echo "$cnt"
 }
 
 apply_bench_history_config() {
@@ -3389,7 +3591,8 @@ for _, rp, p in found_files:
         out_rows.append(row)
 
 for idx, cols in enumerate(out_rows):
-    print("|".join([str(idx)] + cols))
+    safe_cols = [str(c).replace("|", "/").replace("\n", " ").replace("\r", "") for c in cols]
+    print("|".join([str(idx)] + safe_cols))
 PY
 )
     if (( ${#rows[@]} == 0 )); then
@@ -3614,6 +3817,7 @@ run_strata_benchmark() {
 
   local pwr_file start_epoch rc=0
   pwr_file="$(mktemp /tmp/strata-bench-pwr.XXXXXX 2>/dev/null || echo "")"
+  BENCH_POWER_TMP_FILE="$pwr_file"
   start_epoch="$(date +%s)"
   [[ -n "$pwr_file" ]] && start_bench_power_sampler "$pwr_file"
 
@@ -3623,9 +3827,10 @@ run_strata_benchmark() {
   stop_bench_power_sampler
   local avg_sys="" avg_gpu="" avg_cpu="" samples="0"
   if [[ -n "$pwr_file" && -r "$pwr_file" ]]; then
-    IFS='|' read -r avg_sys avg_gpu avg_cpu samples < "$pwr_file"
+    IFS='|' read -r avg_sys avg_gpu avg_cpu samples < "$pwr_file" || true
     rm -f "$pwr_file" 2>/dev/null || true
   fi
+  BENCH_POWER_TMP_FILE=""
 
   local res_file=""
   res_file="$(find_latest_results_json "$((start_epoch - 2))")"
@@ -3636,6 +3841,7 @@ run_strata_benchmark() {
 
   save_bench_history_entry "$res_file" "$mode" "$avg_sys" "$avg_gpu" "$avg_cpu" "$samples" "$active_csv" "$applicable_csv"
   STRATA_BENCH_CACHE_KEY=""
+  BENCH_HISTORY_COUNT_KEY=""
   local pwr_disp
   pwr_disp="$(format_avg_power_str "$avg_sys" "$avg_gpu" "$avg_cpu")"
   echo -e "\n${C_GREEN}Benchmark saved to coupled host history.${C_RESET}"
@@ -4171,6 +4377,34 @@ print_live_stats() {
     done
   fi
 
+  if [[ "$IS_JETSON" == true && ${#gpu_pcts[@]} -eq 0 ]]; then
+    local j_load_f="" j_load="" j_gp="" j_gt="" tz_d tz_t j_mc
+    for j_load_f in /sys/devices/gpu.0/load /sys/devices/*.gp10b/load /sys/devices/platform/host1x/*.gp10b/load; do
+      if [[ -r "$j_load_f" ]]; then
+        j_load="$(cat "$j_load_f" 2>/dev/null || true)"
+        [[ "$j_load" =~ ^[0-9]+$ ]] && { j_gp=$(( j_load / 10 )); break; }
+      fi
+    done
+    for tz_d in /sys/class/thermal/thermal_zone*; do
+      [[ -r "$tz_d/type" && -r "$tz_d/temp" ]] || continue
+      tz_t="$(cat "$tz_d/type" 2>/dev/null || true)"
+      if [[ "$tz_t" == "GPU-therm" ]]; then
+        j_mc="$(cat "$tz_d/temp" 2>/dev/null || echo 0)"
+        [[ "$j_mc" =~ ^[0-9]+$ ]] && (( j_mc > 0 )) && { j_gt=$(( j_mc / 1000 )); break; }
+      fi
+    done
+    if [[ -n "$j_gp" || -n "$j_gt" ]]; then
+      gpu_pcts+=("${j_gp:-0}")
+      vram_pcts+=("")
+      vram_useds+=("")
+      vram_tots+=("")
+      pwr_ws+=("")
+      pwr_lim_ws+=("")
+      pwr_pcts+=("")
+      gpu_temps+=("$j_gt")
+    fi
+  fi
+
   local sys_pwr_w="" cpu_pwr_w=""
   # Total system power & CPU temperature (hwmon)
   local hm_dir hm_name
@@ -4203,7 +4437,7 @@ print_live_stats() {
     for tz_dir in /sys/class/thermal/thermal_zone*; do
       [[ -r "$tz_dir/type" && -r "$tz_dir/temp" ]] || continue
       tz_type="$(cat "$tz_dir/type" 2>/dev/null || true)"
-      if [[ "$tz_type" == "x86_pkg_temp" || "$tz_type" == "cpu"* ]]; then
+      if [[ "$tz_type" == "x86_pkg_temp" || "$tz_type" == "cpu"* || "$tz_type" == "CPU-therm" || "$tz_type" == "BCPU-therm" || "$tz_type" == "MCPU-therm" ]]; then
         local mc
         mc="$(cat "$tz_dir/temp" 2>/dev/null || echo 0)"
         [[ "$mc" =~ ^[0-9]+$ ]] && (( mc > 0 )) && { cpu_temp=$((mc / 1000)); break; }
@@ -4229,7 +4463,16 @@ print_live_stats() {
     done
   fi
 
-  # CPU package power (intel-rapl, when readable)
+  if [[ "$IS_JETSON" == true ]]; then
+    local j_sw="" j_gw="" j_cw=""
+    IFS='|' read -r j_sw j_gw j_cw <<< "$(read_jetson_ina3221_watts)"
+    [[ -n "$j_sw" && -z "$sys_pwr_w" ]] && sys_pwr_w="$(awk -v w="$j_sw" 'BEGIN{printf "%.0f", w}')"
+    [[ -n "$j_cw" && -z "$cpu_pwr_w" ]] && cpu_pwr_w="$(awk -v w="$j_cw" 'BEGIN{printf "%.0f", w}')"
+    if [[ -n "$j_gw" && "${#gpu_pcts[@]}" -gt 0 && -z "${pwr_ws[0]:-}" ]]; then
+      pwr_ws[0]="$(awk -v w="$j_gw" 'BEGIN{printf "%.0f", w}')"
+    fi
+  fi
+  if (( ${#gpu_pcts[@]} > 0 )) && [[ -n "$cpu_pwr_w" ]]; then true; fi
   if [[ "$rapl_can_read" == true ]]; then
     local rapl_now us_now
     if [[ -r "$rapl_file" ]]; then
@@ -4305,6 +4548,9 @@ build_sys_info_lines() {
   SYS_INFO_LINES=()
   SYS_INFO_LINES+=("$(printf "%bSystem Information:%b" "${C_BOLD}" "${C_RESET}")")
   SYS_INFO_LINES+=("$(printf "%bOS:     %s (%s) | Kernel: %s | Laptop: %s%b" "${C_DIM}" "${OS_PRETTY:-$DISTRO_ID}" "$DISTRO_FAMILY" "$KERNEL_VER" "$IS_LAPTOP" "${C_RESET}")")
+  if [[ "$IS_JETSON" == true ]]; then
+    SYS_INFO_LINES+=("$(printf "%bJetson: %s (L4T %s%s)%b" "${C_DIM}" "${JETSON_MODEL:-Jetson}" "${JETSON_L4T_REL:-unknown}" "${JETSON_SOC:+, ${JETSON_SOC}}" "${C_RESET}")")
+  fi
   SYS_INFO_LINES+=("$(printf "%bCPU:    %s%b" "${C_DIM}" "$CPU_SUMMARY" "${C_RESET}")")
   SYS_INFO_LINES+=("$(printf "%bRAM:    %s GiB%s%b" "${C_DIM}" "$RAM_GB" "$RAM_DETAILS" "${C_RESET}")")
   SYS_INFO_LINES+=("$(printf "%bGPU(s): %s%b" "${C_DIM}" "$GPU_SUMMARY" "${C_RESET}")")
@@ -4327,10 +4573,10 @@ build_sys_info_lines() {
   fi
 }
 
+shopt -s extglob
 pad_ansi_col() {
   local str="$1" width="$2"
-  local vis
-  vis="$(sed $'s/\033\\[[0-9;]*m//g' <<< "$str")"
+  local vis="${str//$'\033'\[*([0-9;])m/}"
   local pad=$(( width - ${#vis} ))
   if (( pad > 0 )); then
     printf "%s%*s" "$str" "$pad" ""
@@ -4390,6 +4636,8 @@ if out_tok > 0 and dec_ms > 0:
     avg_s = f"{out_tok / (dec_ms / 1000.0):.1f} tok/s ({reqs} reqs, {out_tok} tok)"
 else:
     avg_s = "0.0 tok/s (no reqs)"
+model = str(model).replace("|", "/").replace("\n", " ")
+live_s = str(live_s).replace("|", "/").replace("\n", " ")
 print(f"{model}|{live_s}|{avg_s}")
 ' <<< "$m_json" 2>/dev/null || true)"
       if [[ -n "$parsed" ]]; then
@@ -4655,7 +4903,8 @@ def fmt_rec(kind, rec, d_pct="", p_pct=""):
     pre_s = f"{rec['pre']:.1f} tok/s" if rec["pre"] is not None else "—"
     avg_dec_s = f"{rec['avg_dec']:.1f} tok/s" if rec.get("avg_dec") is not None else ""
     avg_pre_s = f"{rec['avg_pre']:.1f} tok/s" if rec.get("avg_pre") is not None else ""
-    return "|".join([kind, rec["ts"], rec["tag"], rec["model"], dec_s, pre_s, rec["req_s"], rec["qual_s"], rec["sw"], rec["gw"], rec["cw"], d_pct, p_pct, avg_dec_s, avg_pre_s])
+    cols = [kind, rec["ts"], rec["tag"], rec["model"], dec_s, pre_s, rec["req_s"], rec["qual_s"], rec["sw"], rec["gw"], rec["cw"], d_pct, p_pct, avg_dec_s, avg_pre_s]
+    return "|".join(str(c).replace("|", "/").replace("\n", " ").replace("\r", "") for c in cols)
 
 d_pct = ""
 p_pct = ""
@@ -4858,8 +5107,10 @@ read_line_with_live_stats() {
     tmp_file="$(mktemp /tmp/strata-stats.XXXXXX 2>/dev/null || echo "")"
     if [[ -n "$tmp_file" ]]; then
       (
+        trap 'exit 0' TERM INT
         while true; do
-          sleep 1
+          sleep 1 &
+          wait $! 2>/dev/null || exit 0
           refresh_strata_running
           if print_stats_and_info_grid true > "${tmp_file}.tmp" 2>/dev/null; then
             printf "%s\n" "$LIVE_STATS_COUNT" > "${tmp_file}.meta.tmp" 2>/dev/null || true
@@ -4869,6 +5120,8 @@ read_line_with_live_stats() {
         done
       ) &
       sampler_pid=$!
+      ACTIVE_SAMPLER_PID="$sampler_pid"
+      ACTIVE_SAMPLER_TMP="$tmp_file"
     fi
   fi
 
@@ -4876,8 +5129,9 @@ read_line_with_live_stats() {
   saved_tty="$(stty -g 2>/dev/null || true)"
   stty -echo 2>/dev/null || true
   _cleanup_line_live() {
-    [[ -n "$sampler_pid" ]] && { kill "$sampler_pid" 2>/dev/null || true; wait "$sampler_pid" 2>/dev/null || true; }
-    [[ -n "$tmp_file" ]] && rm -f "$tmp_file" "${tmp_file}.tmp" "${tmp_file}.meta" "${tmp_file}.meta.tmp" 2>/dev/null || true
+    [[ -n "$sampler_pid" ]] && { kill "$sampler_pid" 2>/dev/null || true; wait "$sampler_pid" 2>/dev/null || true; sampler_pid=""; }
+    [[ -n "$tmp_file" ]] && { rm -f "$tmp_file" "${tmp_file}.tmp" "${tmp_file}.meta" "${tmp_file}.meta.tmp" 2>/dev/null || true; tmp_file=""; }
+    ACTIVE_SAMPLER_PID="" ACTIVE_SAMPLER_TMP=""
     if [[ -n "$saved_tty" ]]; then
       stty "$saved_tty" 2>/dev/null || stty echo 2>/dev/null || true
     else
@@ -4945,6 +5199,12 @@ read_line_with_live_stats() {
         fi
       fi
     elif (( rc > 128 )); then
+      local prev_upd="$STRATA_UPDATE_AVAILABLE"
+      load_strata_update_state
+      if [[ "$prev_upd" == false && "$STRATA_UPDATE_AVAILABLE" == true && -z "$buf" ]]; then
+        _cleanup_line_live; trap - INT TERM; printf "\n"
+        _line_out="__refresh__"; return 0
+      fi
       new_lines="$LIVE_STATS_COUNT"
       [[ -n "$tmp_file" && -s "${tmp_file}.meta" ]] && read -r new_lines < "${tmp_file}.meta" || true
       if [[ "$new_lines" =~ ^[0-9]+$ ]] && (( new_lines != LIVE_STATS_COUNT )); then
@@ -4979,8 +5239,10 @@ read_step_action() {
     tmp_file="$(mktemp /tmp/strata-stats.XXXXXX 2>/dev/null || echo "")"
     if [[ -n "$tmp_file" ]]; then
       (
+        trap 'exit 0' TERM INT
         while true; do
-          sleep 1
+          sleep 1 &
+          wait $! 2>/dev/null || exit 0
           refresh_strata_running
           if print_stats_and_info_grid true > "${tmp_file}.tmp" 2>/dev/null; then
             printf "%s\n" "$LIVE_STATS_COUNT" > "${tmp_file}.meta.tmp" 2>/dev/null || true
@@ -4990,6 +5252,8 @@ read_step_action() {
         done
       ) &
       sampler_pid=$!
+      ACTIVE_SAMPLER_PID="$sampler_pid"
+      ACTIVE_SAMPLER_TMP="$tmp_file"
     fi
   fi
 
@@ -4997,8 +5261,9 @@ read_step_action() {
   saved_tty="$(stty -g 2>/dev/null || true)"
   stty -echo 2>/dev/null || true
   _restore_step_tty() {
-    [[ -n "$sampler_pid" ]] && { kill "$sampler_pid" 2>/dev/null || true; wait "$sampler_pid" 2>/dev/null || true; }
-    [[ -n "$tmp_file" ]] && rm -f "$tmp_file" "${tmp_file}.tmp" "${tmp_file}.meta" "${tmp_file}.meta.tmp" 2>/dev/null || true
+    [[ -n "$sampler_pid" ]] && { kill "$sampler_pid" 2>/dev/null || true; wait "$sampler_pid" 2>/dev/null || true; sampler_pid=""; }
+    [[ -n "$tmp_file" ]] && { rm -f "$tmp_file" "${tmp_file}.tmp" "${tmp_file}.meta" "${tmp_file}.meta.tmp" 2>/dev/null || true; tmp_file=""; }
+    ACTIVE_SAMPLER_PID="" ACTIVE_SAMPLER_TMP=""
     if [[ -n "$saved_tty" ]]; then
       stty "$saved_tty" 2>/dev/null || stty echo 2>/dev/null || true
     else
@@ -5164,8 +5429,10 @@ read_choice_with_live_stats() {
     tmp_file="$(mktemp /tmp/strata-stats.XXXXXX 2>/dev/null || echo "")"
     if [[ -n "$tmp_file" ]]; then
       (
+        trap 'exit 0' TERM INT
         while true; do
-          sleep 1
+          sleep 1 &
+          wait $! 2>/dev/null || exit 0
           refresh_strata_running
           if print_stats_and_info_grid true > "${tmp_file}.tmp" 2>/dev/null; then
             local _svc_now="0"
@@ -5177,6 +5444,8 @@ read_choice_with_live_stats() {
         done
       ) &
       sampler_pid=$!
+      ACTIVE_SAMPLER_PID="$sampler_pid"
+      ACTIVE_SAMPLER_TMP="$tmp_file"
     fi
   fi
 
@@ -5185,8 +5454,9 @@ read_choice_with_live_stats() {
   stty -echo 2>/dev/null || true
 
   _cleanup_live_sampler() {
-    [[ -n "$sampler_pid" ]] && { kill "$sampler_pid" 2>/dev/null || true; wait "$sampler_pid" 2>/dev/null || true; }
-    [[ -n "$tmp_file" ]] && rm -f "$tmp_file" "${tmp_file}.tmp" "${tmp_file}.meta" "${tmp_file}.meta.tmp" 2>/dev/null || true
+    [[ -n "$sampler_pid" ]] && { kill "$sampler_pid" 2>/dev/null || true; wait "$sampler_pid" 2>/dev/null || true; sampler_pid=""; }
+    [[ -n "$tmp_file" ]] && { rm -f "$tmp_file" "${tmp_file}.tmp" "${tmp_file}.meta" "${tmp_file}.meta.tmp" 2>/dev/null || true; tmp_file=""; }
+    ACTIVE_SAMPLER_PID="" ACTIVE_SAMPLER_TMP=""
     if [[ -n "$saved_tty" ]]; then
       stty "$saved_tty" 2>/dev/null || stty echo 2>/dev/null || true
     else
@@ -5215,6 +5485,13 @@ read_choice_with_live_stats() {
       elif [[ "$ch" == $'\e' ]]; then
         local esc_seq=""
         IFS= read -rsn2 -t 0.01 esc_seq || true
+        if [[ -z "$esc_seq" && -n "$buf" ]]; then
+          while [[ -n "$buf" ]]; do
+            buf="${buf%?}"
+            printf "\b \b"
+          done
+          continue
+        fi
         if [[ "$esc_seq" == \[* || "$esc_seq" == O* ]] && [[ ! "$esc_seq" =~ [A-Za-z~]$ ]]; then
           local _esc_ch="" _esc_n=0
           while (( _esc_n++ < 8 )) && IFS= read -rsn1 -t 0.01 _esc_ch; do
@@ -5306,7 +5583,7 @@ read_choice_with_live_stats() {
               if [[ "${ACTIVE_STRATA_OPTIONS[$s_i]}" == "service" || "${ACTIVE_STRATA_OPTIONS[$s_i]}" == "benchmark" ]]; then
                 abs_i=$(( n_opt + s_i ))
                 row_up="$(index_row_up_offset "$abs_i" "$n_opt" "$n_str" "$footer_lines")"
-                if (( row_up < term_lines )); then
+                if (( row_up > 0 && row_up < term_lines )); then
                   is_sel=false
                   (( abs_i == INDEX_SELECTED )) && is_sel=true
                   row_str="$(render_any_index_row "$abs_i" "$is_sel")"
@@ -5336,6 +5613,7 @@ declare -A STEP_GAIN_PTS=(
   [intel_compute_stack]=9
   [lact_overclock]=9
   [jetson_perf]=9
+  [jetson_fan]=6
   [nvidia_power_limit]=8
   [amd_gpu_perf]=8
   [intel_gpu_perf]=8
@@ -5571,7 +5849,26 @@ show_index() {
   done
 }
 
-trap 'stop_strata_update_poller' EXIT
+cleanup_all_on_exit() {
+  stop_strata_update_poller
+  stop_bench_power_sampler
+  [[ -n "$BENCH_POWER_TMP_FILE" ]] && rm -f "$BENCH_POWER_TMP_FILE" 2>/dev/null || true
+  if [[ -n "$ACTIVE_SAMPLER_PID" ]]; then
+    kill "$ACTIVE_SAMPLER_PID" 2>/dev/null || true
+    wait "$ACTIVE_SAMPLER_PID" 2>/dev/null || true
+    ACTIVE_SAMPLER_PID=""
+  fi
+  if [[ -n "$ACTIVE_SAMPLER_TMP" ]]; then
+    rm -f "$ACTIVE_SAMPLER_TMP" "${ACTIVE_SAMPLER_TMP}.tmp" "${ACTIVE_SAMPLER_TMP}.meta" "${ACTIVE_SAMPLER_TMP}.meta.tmp" 2>/dev/null || true
+    ACTIVE_SAMPLER_TMP=""
+  fi
+  if [[ -t 1 ]]; then
+    stty echo 2>/dev/null || true
+    printf "\033[?25h\033[?2026l" 2>/dev/null || true
+  fi
+}
+
+trap 'cleanup_all_on_exit' EXIT
 if [[ $EUID -ne 0 && -t 0 ]] && command -v sudo >/dev/null 2>&1 && ! sudo -n true >/dev/null 2>&1; then
   echo -e "${C_DIM}Sudo access is used for hardware sensors (RAPL CPU power, DMI RAM info) and applying optimizations.${C_RESET}"
   sudo -v || true
