@@ -1,6 +1,6 @@
 {
   "name": "strata-performance-setup",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "Interactive TUI wizard to inspect, apply, and revert host-level Linux performance optimizations for running Strata LLM inference.",
   "author": "Bram van Oploo",
   "email": "bramvano@gmail.com",

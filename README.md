@@ -44,15 +44,17 @@ chmod +x strata-performance-setup.sh
 
 ## Supported Distributions
 
-The wizard supports systemd-based Linux distributions across three package families:
+The wizard supports Linux distributions across systemd and Slackware SysVinit families:
 
 | Family | Supported Distributions | Package Manager |
 | :--- | :--- | :--- |
 | **Arch-based** | Arch Linux, CachyOS, EndeavourOS, Manjaro, Garuda (and `ID_LIKE=arch`) | `pacman` (plus `yay` or `paru` for AUR packages) |
 | **Fedora-based** | Fedora, Nobara, RHEL, CentOS, Rocky Linux, AlmaLinux (and `ID_LIKE=fedora` / `rhel`) | `dnf` |
 | **Debian-based** | Debian, Ubuntu (including **Jetson Linux R32 / L4T R32.x**), Pop!\_OS, Linux Mint, KDE neon (and `ID_LIKE=debian` / `ubuntu`) | `apt-get` |
+| **openSUSE / SLES** | openSUSE Leap/Tumbleweed, SLES, SLED (and `ID_LIKE=suse`) | `zypper` |
+| **Slackware** | Slackware 15.0 / -current (SysVinit `/etc/rc.d/rc.strata.*` + `/etc/rc.d/rc.local`) | `slackpkg` |
 
-> **Bootloaders:** Kernel command-line parameters (used when BIOS locks runtime PCIe ASPM writes or for `gpu-unlock`) are automatically configured for **Limine** (`/etc/default/limine`), **GRUB** (`/etc/default/grub` via `grub-mkconfig` or `grub2-mkconfig`), or **systemd-boot** (`/etc/kernel/cmdline`).
+> **Bootloaders:** Kernel command-line parameters (used when BIOS locks runtime PCIe ASPM writes or for `gpu-unlock`) are automatically configured for **Limine** (`/etc/default/limine`), **GRUB** (`/etc/default/grub` via `grub-mkconfig` or `grub2-mkconfig`), **systemd-boot** (`/etc/kernel/cmdline`), **ELILO** (`/boot/efi/EFI/Slackware/elilo.conf` or `/etc/elilo.conf`), or **LILO** (`/etc/lilo.conf`).
 
 ---
 
@@ -61,12 +63,17 @@ The wizard supports systemd-based Linux distributions across three package famil
 The script probes your system at startup and enables hardware-specific steps only when matching hardware is detected:
 
 ### GPUs
-- **NVIDIA** (GTX 16 / RTX 20 / RTX 30 / RTX 40 / A-series & L-series):
-  - `nvidia-persistenced` persistence mode (eliminates cold-start delays on headless hosts)
-  - `nvidia-powerd` Dynamic Boost (mobile RTX GPUs)
-  - Persistent maximum GPU power limit (`nvidia-smi -pl` via systemd)
-  - LACT (`lactd`) core & VRAM clock offsets
-  - `gpu-unlock-dkms` + `gpu_unlock.targets=all` *(Arch-based distros, supported Turing/Ampere/Ada GPUs)*
+- **NVIDIA** *(any NVIDIA GPU supported by `nvidia-smi` — GeForce GTX/RTX including 50-series, Quadro/RTX Workstation, and Tesla/Datacenter GPUs)*:
+  - **All supported NVIDIA GPUs** *(applied per-GPU for mixed or multi-GPU rigs)*:
+    - `nvidia-persistenced` persistence mode (eliminates cold-start delays on headless hosts)
+    - Per-GPU persistent maximum GPU power limit (`nvidia-smi -i <id> -pl`, when the card allows raising above default)
+    - Per-GPU clock lock (`-lgc`/`-lmc`, with `-ac` application clocks fallback for older Kepler/Maxwell Tesla GPUs)
+    - Per-GPU compute mode reset to `Default` (`nvidia-smi -i <id> -c 0`, when in `Exclusive_Process` or `Prohibited` mode)
+  - **Card- / platform-specific** *(auto-detected when applicable)*:
+    - Per-GPU ECC memory toggle (`nvidia-smi -i <id> -e 0` on ECC-capable workstation/Tesla/datacenter GPUs)
+    - `nvidia-powerd` Dynamic Boost (supported mobile RTX laptops)
+    - LACT (`lactd`) core & VRAM clock offsets (consumer/workstation GPUs; hidden on Tesla-only rigs)
+    - `gpu-unlock-dkms` + `gpu_unlock.targets=all` *(Arch-based distros only; supported Turing/Ampere/Ada GPUs such as GTX 16, RTX 20/30/40, A10/A40/A100/L40, and RTX A-series)*
 - **AMD Radeon**:
   - `amdgpu` high-performance DPM level (`power_dpm_force_performance_level=high`) for ROCm/HIP
   - LACT (`lactd`) core & VRAM clock offsets
