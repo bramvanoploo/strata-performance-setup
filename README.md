@@ -2,7 +2,7 @@
   <img src="assets/logo.png" alt="Strata Performance Setup" width="760">
 </p>
 
-An interactive TUI wizard (`strata-performance-setup.sh`) to inspect, apply, and revert host-level Linux performance optimizations for running **Strata** LLM inference—and to install, update, launch, and manage `strata.service` (or run in host-tuning mode when Strata is deployed in Docker on hosts like Unraid).
+An interactive TUI wizard (`strata-performance-setup.sh`) to inspect, apply, and revert host-level Linux performance optimizations for running **Strata** LLM inference—and to install, update, launch, and manage `strata.service` (or run in host-tuning mode when Strata is deployed in Docker on hosts like Unraid, TrueNAS SCALE, or Synology DSM).
 
 The script automatically detects your distribution, CPU, RAM, GPU(s), laptop/chassis vendor, and bootloader, then presents only the optimizations applicable to your machine. Every optimization can be applied or reverted cleanly from the wizard.
 

@@ -29,7 +29,7 @@ TARGET_USER="${SUDO_USER:-${USER:-$(id -un)}}"
 TARGET_HOME="$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6 || true)"
 [[ -n "$TARGET_HOME" ]] || TARGET_HOME="$HOME"
 STRATA_BIN="" STRATA_VERSION="" STRATA_RUNNING_PRESET="" STRATA_RUNNING_URL="" STRATA_DOCKER_CONTAINER=""
-DISTRO_FAMILY="unknown" DISTRO_ID="unknown" OS_PRETTY="" KERNEL_VER="" AUR_HELPER="" HAS_SYSTEMD=true IS_UNRAID=false
+DISTRO_FAMILY="unknown" DISTRO_ID="unknown" OS_PRETTY="" KERNEL_VER="" AUR_HELPER="" HAS_SYSTEMD=true IS_UNRAID=false IS_TRUENAS=false IS_SYNOLOGY=false
 HAS_NVIDIA=false HAS_NVIDIA_POWERD=false HAS_AMD=false HAS_INTEL_GPU=false HAS_INTEL_ARC=false
 HAS_NVIDIA_TESLA=false HAS_NVIDIA_NON_TESLA=false NVIDIA_COMPUTE_MODE_NON_DEFAULT=false
 GPU_SUMMARY="" GPU_RAW="" CPU_SUMMARY="" RAM_GB=0 RAM_DETAILS="" NVIDIA_VRAM_MB=0 TOTAL_VRAM_MB=0
@@ -111,6 +111,8 @@ resolve_rc_script() {
     echo "/etc/rc.d/rc.strata.${name}"
   elif [[ "$IS_UNRAID" == true && -x "/boot/config/strata/rc.strata.${name}" ]]; then
     echo "/boot/config/strata/rc.strata.${name}"
+  elif [[ "$IS_SYNOLOGY" == true && -x "/usr/local/etc/rc.d/strata-${name}.sh" ]]; then
+    echo "/usr/local/etc/rc.d/strata-${name}.sh"
   else
     return 1
   fi
@@ -230,6 +232,10 @@ EOF
     run_root cp "$rc_script" "$flash_script"
     run_root chmod +x "$flash_script"
     add_boot_hook "/boot/config/go" "# strata:${name}" "[ -x ${flash_script} ] && ${flash_script} start # strata:${name}" "#!/bin/bash"
+  elif [[ "$IS_SYNOLOGY" == true && -d /usr/local/etc/rc.d ]]; then
+    local syno_script="/usr/local/etc/rc.d/strata-${name}.sh"
+    run_root cp "$rc_script" "$syno_script"
+    run_root chmod +x "$syno_script"
   else
     add_boot_hook "/etc/rc.d/rc.local" "# strata:${name}" "[ -x ${rc_script} ] && ${rc_script} start # strata:${name}" "#!/bin/sh"
     run_root chmod +x /etc/rc.d/rc.local
@@ -255,6 +261,9 @@ remove_service() {
   if [[ "$IS_UNRAID" == true ]]; then
     run_root rm -f "/boot/config/strata/rc.strata.${name}"
     remove_boot_hook "/boot/config/go" "# strata:${name}"
+  fi
+  if [[ "$IS_SYNOLOGY" == true ]]; then
+    run_root rm -f "/usr/local/etc/rc.d/strata-${name}.sh"
   fi
   remove_boot_hook "/etc/rc.d/rc.local" "# strata:${name}"
 }
@@ -293,7 +302,7 @@ pkg_available() {
         fi
         ;;
       fedora)    [[ "$mode" == "repo" ]] && dnf info --available "$pkg" >/dev/null 2>&1 && rc=0 ;;
-      debian)    [[ "$mode" == "repo" ]] && apt-cache show "$pkg" >/dev/null 2>&1 && rc=0 ;;
+      debian)    [[ "$mode" == "repo" && ! ( "$IS_TRUENAS" == true && ! "$(command -v apt-get 2>/dev/null)" ) ]] && apt-cache show "$pkg" >/dev/null 2>&1 && rc=0 ;;
       suse)      [[ "$mode" == "repo" ]] && zypper --non-interactive info "$pkg" 2>/dev/null | grep -i "^Repository" >/dev/null && rc=0 ;;
       slackware)
         if [[ "$mode" == "repo" ]]; then
@@ -315,7 +324,12 @@ pkg_install() {
   case "$DISTRO_FAMILY" in
     arch)      run_root pacman -S --needed --noconfirm "$@" || rc=$? ;;
     fedora)    run_root dnf install -y "$@" || rc=$? ;;
-    debian)    run_root apt-get update -qq && run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" || rc=$? ;;
+    debian)
+      if [[ "$IS_TRUENAS" == true ]] && ! command -v apt-get >/dev/null 2>&1; then
+        echo -e "${C_YELLOW}TrueNAS SCALE appliance mode restricts apt; skipping package install ($*).${C_RESET}"; return 1
+      fi
+      run_root apt-get update -qq && run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" || rc=$?
+      ;;
     suse)      run_root zypper --non-interactive install "$@" || rc=$? ;;
     slackware)
       if command -v slackpkg >/dev/null 2>&1; then
@@ -798,6 +812,21 @@ detect_platform_basics() {
       unraid_ver="$(sed -n 's/.*version="\([^"]*\)".*/\1/p' /etc/unraid-version 2>/dev/null | head -n1)"
       [[ -n "$unraid_ver" ]] && OS_PRETTY="Unraid ${unraid_ver} (Slackware)" || OS_PRETTY="Unraid (Slackware)"
     fi
+  elif [[ -r /etc/truenas-version ]] || [[ "$DISTRO_ID" == "truenas" ]] || grep -qi "truenas" /etc/os-release 2>/dev/null; then
+    IS_TRUENAS=true
+    [[ "$DISTRO_FAMILY" == "unknown" ]] && DISTRO_FAMILY="debian"
+    if [[ -r /etc/truenas-version ]]; then
+      OS_PRETTY="TrueNAS SCALE $(head -n1 /etc/truenas-version 2>/dev/null || true)"
+    fi
+  elif [[ -d /usr/syno ]] || [[ -r /etc.defaults/VERSION ]] || grep -qi "synology" /etc/os-release 2>/dev/null; then
+    IS_SYNOLOGY=true
+    DISTRO_ID="synology"
+    DISTRO_FAMILY="synology"
+    local dsm_ver=""
+    if [[ -r /etc.defaults/VERSION ]]; then
+      dsm_ver="$(sed -n 's/^productversion="\([^"]*\)".*/\1/p' /etc.defaults/VERSION 2>/dev/null | head -n1)"
+    fi
+    [[ -n "$dsm_ver" ]] && OS_PRETTY="Synology DSM ${dsm_ver}" || OS_PRETTY="Synology DSM"
   fi
 
   if [[ "$DISTRO_FAMILY" == "arch" ]]; then
@@ -810,7 +839,8 @@ detect_platform_basics() {
 }
 
 ensure_script_tools() {
-  [[ "$DISTRO_FAMILY" != "unknown" ]] || return 0
+  [[ "$DISTRO_FAMILY" != "unknown" && "$DISTRO_FAMILY" != "synology" ]] || return 0
+  [[ "$IS_UNRAID" == true || "$IS_TRUENAS" == true ]] && return 0
   [[ -t 0 ]] || return 0
   local missing_cmds=() missing_pkgs=()
   if ! command -v lspci >/dev/null 2>&1; then
