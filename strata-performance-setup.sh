@@ -6090,6 +6090,7 @@ _render_live_stats_inplace() {
     block="$(awk -v s="$((skip + 1))" 'NR >= s' <<< "$stats_block")"
     [[ -n "$block" ]] || return 0
   fi
+  block="${block//$'\n'/$'\r\n'}"
   printf "\033[?2026h\033[?25l\033[s\033[%dA\r%s\033[u\033[?25h\033[?2026l" "$up" "$block"
 }
 
