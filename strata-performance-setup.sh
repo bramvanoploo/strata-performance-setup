@@ -20,8 +20,9 @@ set -uo pipefail
 if [[ -t 1 ]]; then
   C_RESET='\033[0m' C_BOLD='\033[1m' C_DIM='\033[2m'
   C_RED='\033[0;31m' C_GREEN='\033[0;32m' C_BGREEN='\033[1;32m' C_YELLOW='\033[0;33m' C_MAGENTA='\033[0;35m' C_CYAN='\033[0;36m'
+  C_UPDATE_BANNER='\033[1;30;102m'
 else
-  C_RESET='' C_BOLD='' C_DIM='' C_RED='' C_GREEN='' C_BGREEN='' C_YELLOW='' C_MAGENTA='' C_CYAN=''
+  C_RESET='' C_BOLD='' C_DIM='' C_RED='' C_GREEN='' C_BGREEN='' C_YELLOW='' C_MAGENTA='' C_CYAN='' C_UPDATE_BANNER=''
 fi
 
 TARGET_USER="${SUDO_USER:-${USER:-$(id -un)}}"
@@ -44,7 +45,7 @@ RYZENADJ_MARKER="/etc/strata-ryzenadj.prev" RAPL_MARKER="/etc/strata-rapl.prev" 
 HEADLESS_MARKER="/etc/strata-headless.prev" PSTATE_MARKER="/etc/strata-pstate.prev" GPU_GROUPS_MARKER="/etc/strata-gpu-groups.added"
 NVIDIA_COMPUTE_PREV_MARKER="/etc/strata-nvidia-compute-mode.prev"
 REBOOT_REQUIRED=false REBOOT_PROMPT_PENDING=false
-PREV_CPU_TOTAL="" PREV_CPU_IDLE="" PREV_RAPL_UJ="" PREV_RAPL_US="" LIVE_STATS_COUNT=0 POST_HEADER_LINES=0
+PREV_CPU_TOTAL="" PREV_CPU_IDLE="" PREV_RAPL_UJ="" PREV_RAPL_US="" LIVE_STATS_COUNT=0 POST_HEADER_LINES=0 UPDATE_BANNER_OFFSET=1
 TERM_COLS_CACHED=120 LIVE_COMPACT_SYS="" LIVE_COMPACT_STRATA=""
 declare -a LIVE_STAT_LINES=() SYS_INFO_LINES=() STRATA_STAT_LINES=() STRATA_BENCH_LINES=()
 STRATA_BENCH_CACHE_KEY=""
@@ -3376,14 +3377,15 @@ stop_strata_update_poller() {
     STRATA_POLLER_PID=""
   fi
   [[ -n "$STRATA_UPDATE_CACHE_FILE" ]] && rm -f "$STRATA_UPDATE_CACHE_FILE" "${STRATA_UPDATE_CACHE_FILE}.tmp" 2>/dev/null || true
+  STRATA_UPDATE_CACHE_FILE=""
 }
 
 start_strata_update_poller() {
-  [[ -n "$STRATA_BIN" ]] || return 0
+  [[ -n "$STRATA_BIN" && -z "$STRATA_POLLER_PID" ]] || return 0
   [[ -n "$STRATA_UPDATE_CACHE_FILE" ]] || STRATA_UPDATE_CACHE_FILE="$(mktemp /tmp/strata-update-check.XXXXXX 2>/dev/null || echo "")"
   [[ -n "$STRATA_UPDATE_CACHE_FILE" ]] || return 0
   (
-    trap 'exit 0' TERM INT
+    trap 'kill $(jobs -p) 2>/dev/null || true; exit 0' TERM INT
     while true; do
       check_strata_update_sync >/dev/null 2>&1 || true
       sleep 60 &
@@ -3433,6 +3435,24 @@ for s in d.get("serving") or []:
   return 1
 }
 
+wait_for_strata_stopped() {
+  local max_wait="${1:-60}" elapsed=0 svc_active=false
+  echo -e "${C_DIM}Waiting for Strata to stop completely...${C_RESET}"
+  while (( elapsed < max_wait )); do
+    svc_active=false
+    unit_active strata.service && svc_active=true
+    refresh_strata_running
+    if [[ "$svc_active" == false && -z "$STRATA_RUNNING_PRESET" ]]; then
+      echo -e "${C_GREEN}Strata stopped.${C_RESET}"
+      return 0
+    fi
+    sleep 1
+    (( elapsed += 1 ))
+  done
+  echo -e "${C_RED}Timed out waiting for Strata to stop after ${max_wait}s.${C_RESET}"
+  return 1
+}
+
 perform_strata_update() {
   refresh_strata_bin
   if [[ -z "$STRATA_BIN" ]]; then
@@ -3440,26 +3460,62 @@ perform_strata_update() {
     return 1
   fi
 
-  local was_active=false
+  local was_active=false was_launch_running=false
   unit_active strata.service && was_active=true
+  if [[ "$was_active" == false ]]; then
+    refresh_strata_running
+    [[ -n "$STRATA_RUNNING_PRESET" ]] && was_launch_running=true
+  fi
 
   echo -e "${C_BOLD}Strata Update${C_RESET}"
   [[ -n "$STRATA_UPDATE_SUMMARY" ]] && echo -e "Pending update: ${C_CYAN}${STRATA_UPDATE_SUMMARY}${C_RESET}"
-  echo -e "Service status: $([[ "$was_active" == true ]] && echo "${C_GREEN}active (will stop & restart)${C_RESET}" || echo "${C_DIM}inactive${C_RESET}")\n"
+  if [[ "$was_active" == true ]]; then
+    echo -e "Service status: ${C_GREEN}active (will stop & restart)${C_RESET}\n"
+  elif [[ "$was_launch_running" == true ]]; then
+    echo -e "Strata status: ${C_GREEN}running (${STRATA_RUNNING_PRESET}; will stop before updating)${C_RESET}\n"
+  else
+    echo -e "Service status: ${C_DIM}inactive${C_RESET}\n"
+  fi
 
   if ! confirm_yn "Install Strata update now? [Y/n]: " "Y"; then
     echo -e "${C_DIM}Update cancelled.${C_RESET}"
     return 0
   fi
 
+  # Pause background update polling and wait for any in-flight 'strata update --check'
+  # to release the component-folder lock before running 'strata update --yes'.
+  stop_strata_update_poller
+
   if [[ "$was_active" == true ]]; then
     echo -e "\n${C_CYAN}Stopping strata.service before updating...${C_RESET}"
     run_root systemctl stop strata.service || true
+    if ! wait_for_strata_stopped 60; then
+      start_strata_update_poller
+      return 1
+    fi
+  else
+    refresh_strata_running
+    if [[ "$was_launch_running" == true || -n "$STRATA_RUNNING_PRESET" ]]; then
+      echo -e "\n${C_CYAN}Stopping Strata ('strata launch --stop') before updating...${C_RESET}"
+      run_as_user_exec "$STRATA_BIN" launch --stop || true
+      if ! wait_for_strata_stopped 60; then
+        start_strata_update_poller
+        return 1
+      fi
+    fi
   fi
 
   echo -e "\n${C_CYAN}Running 'strata update --yes'...${C_RESET}"
-  local rc=0
-  run_as_user_exec "$STRATA_BIN" update --yes || rc=$?
+  local rc=0 attempt=0
+  for (( attempt = 1; attempt <= 4; attempt++ )); do
+    rc=0
+    run_as_user_exec "$STRATA_BIN" update --yes || rc=$?
+    if (( rc != 7 || attempt == 4 )); then
+      break
+    fi
+    echo -e "${C_YELLOW}Strata update lock is busy (exit code 7); waiting 5s to retry (${attempt}/3)...${C_RESET}"
+    sleep 5
+  done
 
   refresh_strata_bin
   if (( rc == 0 )); then
@@ -3487,6 +3543,8 @@ perform_strata_update() {
       fi
     fi
   fi
+
+  start_strata_update_poller
 }
 format_strata_hw_warnings() {
   if (( RAM_GB > 0 && RAM_GB < 32 )); then
@@ -4664,7 +4722,7 @@ badge_strata_update() {
   if [[ -z "$STRATA_BIN" ]]; then
     echo "${C_DIM}[NOT INSTALLED]${C_RESET}"
   elif [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
-    echo "${C_BGREEN}[UPDATE READY] ${C_RESET}"
+    echo "${C_UPDATE_BANNER}[UPDATE READY]${C_RESET} "
   else
     echo "${C_GREEN}[UP TO DATE]   ${C_RESET}"
   fi
@@ -4829,8 +4887,9 @@ explain_strata_update() {
   cat <<'EOF'
 Impact:
   Checks whether a newer Strata engine/control release is available and runs
-  'strata update --yes'. If strata.service is active, stops it cleanly before
-  updating and restarts it once the model is ready.
+  'strata update --yes'. Stops strata.service (if active) or any running
+  'strata launch' instance and waits until Strata is fully stopped before
+  updating, then restarts strata.service if it was active.
 EOF
   if [[ -n "$STRATA_BIN" ]]; then
     echo -e "\nInstalled: ${STRATA_VERSION:-$STRATA_BIN}"
@@ -4891,7 +4950,7 @@ EOF
 }
 
 run_strata_option() {
-  local target_opt="$1" s_idx=0 total="${#ACTIVE_STRATA_OPTIONS[@]}" i opt action action_label
+  local target_opt="$1" auto_run="${2:-false}" s_idx=0 total="${#ACTIVE_STRATA_OPTIONS[@]}" i opt action action_label
   (( total > 0 )) || return 0
   for (( i = 0; i < total; i++ )); do
     [[ "${ACTIVE_STRATA_OPTIONS[$i]}" == "$target_opt" ]] && { s_idx=$i; break; }
@@ -4937,6 +4996,17 @@ run_strata_option() {
     body+="$(echo -e "  ${C_DIM}[n]${C_RESET} Next option   ${C_DIM}[b]${C_RESET} Previous option   ${C_DIM}[i/Esc]${C_RESET} Back to Index   ${C_DIM}[q]${C_RESET} Quit")"$'\n\n'
 
     printf "%s" "$body"
+    if [[ "$auto_run" == true ]]; then
+      auto_run=false
+      echo ""
+      if [[ "$opt" == "update" ]]; then
+        perform_strata_update || true
+      else
+        "strata_action_${opt}" || true
+      fi
+      pause_prompt
+      continue
+    fi
     local body_lines lines_up
     body_lines="$(printf "%s" "$body" | wc -l)"
     lines_up=$(( LIVE_STATS_COUNT + POST_HEADER_LINES + body_lines ))
@@ -5899,6 +5969,31 @@ format_stats_toggle_row() {
   fi
 }
 
+format_strata_update_banner() {
+  local rule_w="${1:-117}"
+  [[ "$STRATA_UPDATE_AVAILABLE" == true ]] || return 0
+  local msg=" [UPDATE AVAILABLE] Strata update ready — Press [u] to install & restart service "
+  if (( rule_w > 10 && ${#msg} > rule_w )); then
+    msg="${msg:0:$((rule_w - 3))}..."
+  fi
+  local pad=$(( rule_w - ${#msg} ))
+  local spaces=""
+  (( pad > 0 )) && printf -v spaces "%*s" "$pad" ""
+  printf "%b%s%s%b" "${C_UPDATE_BANNER}" "$msg" "$spaces" "${C_RESET}"
+}
+
+_render_update_banner_inplace() {
+  local banner_up="$1" term_lines="${2:-40}"
+  (( banner_up > 0 && banner_up < term_lines )) || return 1
+  local rule_w=120
+  [[ -t 1 ]] && rule_w="$(tput cols 2>/dev/null || echo 117)"
+  (( rule_w > 117 )) && rule_w=117
+  local banner_line
+  banner_line="$(format_strata_update_banner "$rule_w")"
+  printf "\033[?2026h\033[?25l\033[s\033[%dA\r\033[2K%s\033[u\033[?25h\033[?2026l" "$banner_up" "$banner_line"
+  return 0
+}
+
 print_header() {
   local hdr_mode="${1:-none}" skip_rule="${2:-false}"
   clear 2>/dev/null || true
@@ -5925,25 +6020,31 @@ print_header() {
     printf "%s\n" "$(format_stats_toggle_row "$_tgl_sel")"
     echo ""
     POST_HEADER_LINES=3
+    UPDATE_BANNER_OFFSET=3
   elif [[ "$hdr_mode" == "stats" ]]; then
     build_sys_info_lines
     print_stats_and_info_grid false
     POST_HEADER_LINES=2
+    UPDATE_BANNER_OFFSET=1
   else
     LIVE_STATS_COUNT=0
     LIVE_STAT_LINES=()
     POST_HEADER_LINES=2
+    UPDATE_BANNER_OFFSET=1
   fi
   if [[ "$skip_rule" != true ]]; then
     printf -v _hdr_rule "%*s" "$_rule_w" ""
     echo -e "${C_DIM}${_hdr_rule// /─}${C_RESET}"
   else
     POST_HEADER_LINES=$((POST_HEADER_LINES - 1))
+    UPDATE_BANNER_OFFSET=$((UPDATE_BANNER_OFFSET - 1))
   fi
   if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
-    echo -e "\n${C_BGREEN}[UPDATE AVAILABLE]${C_RESET} ${C_CYAN}Strata update ready (${STRATA_UPDATE_SUMMARY}). Press [u] to install & restart service.${C_RESET}"
-    ((POST_HEADER_LINES += 2))
+    printf "%s\n" "$(format_strata_update_banner "$_rule_w")"
+  else
+    echo ""
   fi
+  ((POST_HEADER_LINES += 1))
   if [[ "$REBOOT_REQUIRED" == true ]]; then
     echo -e "\n${C_YELLOW}[!] Reboot pending: newly added kernel parameters require a reboot to take effect.${C_RESET}"
     ((POST_HEADER_LINES += 2))
@@ -6122,9 +6223,12 @@ read_line_with_live_stats() {
     elif (( rc > 128 )); then
       local prev_upd="$STRATA_UPDATE_AVAILABLE"
       load_strata_update_state
-      if [[ "$prev_upd" == false && "$STRATA_UPDATE_AVAILABLE" == true && -z "$buf" ]]; then
-        _cleanup_line_live; trap - INT TERM; printf "\n"
-        _line_out="__refresh__"; return 0
+      if [[ "$prev_upd" == false && "$STRATA_UPDATE_AVAILABLE" == true ]]; then
+        local _b_up=$(( lines_up - LIVE_STATS_COUNT - UPDATE_BANNER_OFFSET ))
+        if ! _render_update_banner_inplace "$_b_up" "$term_lines" && [[ -z "$buf" ]]; then
+          _cleanup_line_live; trap - INT TERM; printf "\n"
+          _line_out="__refresh__"; return 0
+        fi
       fi
       new_lines="$LIVE_STATS_COUNT"
       [[ -n "$tmp_file" && -s "${tmp_file}.meta" ]] && read -r new_lines < "${tmp_file}.meta" || true
@@ -6248,9 +6352,12 @@ read_step_action() {
     elif (( rc > 128 )); then
       local prev_upd="$STRATA_UPDATE_AVAILABLE"
       load_strata_update_state
-      if [[ "$prev_upd" == false && "$STRATA_UPDATE_AVAILABLE" == true && -z "$buf" ]]; then
-        _restore_step_tty; trap - INT TERM; printf "\n"
-        _act_out="__refresh__"; return 0
+      if [[ "$prev_upd" == false && "$STRATA_UPDATE_AVAILABLE" == true ]]; then
+        local _b_up=$(( lines_up - LIVE_STATS_COUNT - UPDATE_BANNER_OFFSET ))
+        if ! _render_update_banner_inplace "$_b_up" "$term_lines" && [[ -z "$buf" ]]; then
+          _restore_step_tty; trap - INT TERM; printf "\n"
+          _act_out="__refresh__"; return 0
+        fi
       fi
       new_lines="$LIVE_STATS_COUNT"
       [[ -n "$tmp_file" && -s "${tmp_file}.meta" ]] && read -r new_lines < "${tmp_file}.meta" || true
@@ -6312,7 +6419,7 @@ run_step_view() {
       __esc__|i|I) return 0 ;;
       u|U)
         if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
-          echo ""; perform_strata_update; pause_prompt
+          run_strata_option "update" true
         else
           echo -e "${C_YELLOW}No Strata update available.${C_RESET}"; sleep 1
         fi
@@ -6464,12 +6571,15 @@ read_choice_with_live_stats() {
     elif (( rc > 128 )); then
       local prev_upd="$STRATA_UPDATE_AVAILABLE"
       load_strata_update_state
-      if [[ "$prev_upd" == false && "$STRATA_UPDATE_AVAILABLE" == true && -z "$buf" ]]; then
-        _cleanup_live_sampler
-        trap - INT TERM
-        printf "\n"
-        _out_var="__refresh__"
-        return 0
+      if [[ "$prev_upd" == false && "$STRATA_UPDATE_AVAILABLE" == true ]]; then
+        local _b_up=$(( toggle_up - UPDATE_BANNER_OFFSET ))
+        if ! _render_update_banner_inplace "$_b_up" "$term_lines" && [[ -z "$buf" ]]; then
+          _cleanup_live_sampler
+          trap - INT TERM
+          printf "\n"
+          _out_var="__refresh__"
+          return 0
+        fi
       fi
       local new_lines="$LIVE_STATS_COUNT" new_running_url="$cur_running_url" new_svc_active="$cur_svc_active"
       if [[ -n "$tmp_file" && -s "${tmp_file}.meta" ]]; then
@@ -6668,7 +6778,7 @@ show_stats_page() {
       q|Q) exit 0 ;;
       u|U)
         if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
-          echo ""; perform_strata_update; pause_prompt
+          run_strata_option "update" true
         fi
         ;;
       *) ;;
@@ -6768,7 +6878,7 @@ show_index() {
         ;;
       u|U)
         if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
-          echo ""; perform_strata_update; pause_prompt
+          run_strata_option "update" true
         else
           echo -e "${C_YELLOW}No Strata update available.${C_RESET}"; sleep 1
         fi
