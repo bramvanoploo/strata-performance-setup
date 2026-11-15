@@ -73,7 +73,7 @@ The script probes your system at startup and enables hardware-specific steps onl
     - Per-GPU ECC memory toggle (`nvidia-smi -i <id> -e 0` on ECC-capable workstation/Tesla/datacenter GPUs)
     - `nvidia-powerd` Dynamic Boost (supported mobile RTX laptops)
     - LACT (`lactd`) core & VRAM clock offsets (consumer/workstation GPUs; hidden on Tesla-only rigs)
-    - `gpu-unlock-dkms` + `gpu_unlock.targets=all` *(Arch-based distros only; supported Turing/Ampere/Ada GPUs such as GTX 16, RTX 20/30/40, A10/A40/A100/L40, and RTX A-series)*
+    - `gpu-unlock` (`gpu-unlock-dkms` + `gpu_unlock.targets=all`, when Secure Boot is disabled; Arch-based distros via `pacman`/AUR, and experimental DKMS source-build support on Debian/Ubuntu, Fedora, and openSUSE; supported Turing/Ampere/Ada GPUs such as GTX 16, RTX 20/30/40, A10/A40/A100/L40, and RTX A-series)
 - **AMD Radeon**:
   - `amdgpu` high-performance DPM level (`power_dpm_force_performance_level=high`) for ROCm/HIP
   - LACT (`lactd`) core & VRAM clock offsets
@@ -123,7 +123,7 @@ The header continuously refreshes every **1 second** across **all pages** (index
 Once launched, the main index lists every optimization applicable to your machine along with its live `[APPLIED]` / `[NOT APPLIED]` status:
 
 - Navigate the index with **`↑` / `↓`** and press **`Enter`** (or type a **step number** / `s1`–`s5`) to open a step or Strata option, or press `w` to walk through the **guided wizard** step by step
-- Press `a` to **apply all recommended optimizations** for your hardware in one action (with confirmation; excludes Strata setup and minimal-gain/higher-idle-power options like CPU Performance and PCIe ASPM)
+- Press `a` to **apply all recommended optimizations** for your hardware in one action (with confirmation; excludes Strata setup, experimental options, and minimal-gain/higher-idle-power options like CPU Performance and PCIe ASPM)
 - Press `x` to **revert all recommended optimizations** in one action (with confirmation)
 - Press `u` (when shown) to **install a pending Strata update** and restart `strata.service`
 - Press `r` on the index to **reboot** the system (the wizard also prompts automatically whenever applying or reverting a change requires a reboot)
