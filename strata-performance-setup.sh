@@ -19,9 +19,9 @@ set -uo pipefail
 # ------------------------------------------------------------------------------
 if [[ -t 1 ]]; then
   C_RESET='\033[0m' C_BOLD='\033[1m' C_DIM='\033[2m'
-  C_RED='\033[0;31m' C_GREEN='\033[0;32m' C_BGREEN='\033[1;32m' C_YELLOW='\033[0;33m' C_CYAN='\033[0;36m'
+  C_RED='\033[0;31m' C_GREEN='\033[0;32m' C_BGREEN='\033[1;32m' C_YELLOW='\033[0;33m' C_MAGENTA='\033[0;35m' C_CYAN='\033[0;36m'
 else
-  C_RESET='' C_BOLD='' C_DIM='' C_RED='' C_GREEN='' C_BGREEN='' C_YELLOW='' C_CYAN=''
+  C_RESET='' C_BOLD='' C_DIM='' C_RED='' C_GREEN='' C_BGREEN='' C_YELLOW='' C_MAGENTA='' C_CYAN=''
 fi
 
 TARGET_USER="${SUDO_USER:-${USER:-$(id -un)}}"
@@ -1207,7 +1207,12 @@ build_active_steps() {
   done
 }
 
+is_experimental_step() {
+  [[ "$1" == "gpu_unlock" && "$DISTRO_FAMILY" != "arch" ]]
+}
+
 is_recommended_step() {
+  is_experimental_step "$1" && return 1
   case "$1" in
     cpu_performance|pcie_aspm|cstate_limit|nvidia_clock_lock|tuned_profile|hugepages_1g) return 1 ;;
     *) return 0 ;;
@@ -1231,7 +1236,9 @@ run_recommended_batch() {
   else
     echo -e "${C_BOLD}Revert Recommended Performance Optimizations${C_RESET}"
   fi
-  echo -e "${C_DIM}Excluded: CPU Performance, PCIe ASPM, CPU C-State Limit, NVIDIA Clock Lock, tuned profile (minimal gain / higher idle power), 1 GiB hugepages (reserves RAM), Strata setup.${C_RESET}\n"
+  local exp_excl=""
+  [[ "$DISTRO_FAMILY" != "arch" ]] && exp_excl=", experimental options"
+  echo -e "${C_DIM}Excluded: CPU Performance, PCIe ASPM, CPU C-State Limit, NVIDIA Clock Lock, tuned profile (minimal gain / higher idle power), 1 GiB hugepages (reserves RAM)${exp_excl}, Strata setup.${C_RESET}\n"
 
   if [[ ${#targets[@]} -eq 0 ]]; then
     if [[ "$mode" == "apply" ]]; then
@@ -1803,27 +1810,146 @@ revert_lact_overclock() {
 }
 
 # 11. GPU Unlock
-applicable_gpu_unlock() {
-  [[ "$HAS_NVIDIA" == true && "$DISTRO_FAMILY" == "arch" ]] || return 1
-  [[ "$HAS_NVIDIA_TESLA" == true && "$HAS_NVIDIA_NON_TESLA" == false ]] && return 1
-  grep -qiE "TU10|TU11|GA10|AD10|RTX 20|RTX 30|RTX 40|GTX 16|A100|A10|A40|L40|RTX A" <<< "${GPU_RAW:-$GPU_SUMMARY}" || return 1
-  pkg_installed gpu-unlock-dkms || pkg_available repo gpu-unlock-dkms || pkg_available aur gpu-unlock-dkms
+secure_boot_enabled() {
+  local sb_var="/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+  if [[ -r "$sb_var" ]]; then
+    local val
+    val="$(od -An -t u1 -j 4 -N 1 "$sb_var" 2>/dev/null | tr -d '[:space:]')"
+    [[ "$val" == "1" ]] && return 0
+    [[ "$val" == "0" ]] && return 1
+  fi
+  if command -v mokutil >/dev/null 2>&1; then
+    mokutil --sb-state 2>/dev/null | grep -qi "SecureBoot enabled" && return 0
+  fi
+  return 1
 }
+
+gpu_unlock_installed() {
+  pkg_installed gpu-unlock-dkms || pkg_installed gpu-unlock || [[ -d /sys/module/gpu_unlock ]] ||
+    (command -v dkms >/dev/null 2>&1 && dkms status 2>/dev/null | grep -qi "gpu[_-]unlock")
+}
+
+gpu_unlock_build_deps() {
+  local kver
+  kver="$(uname -r)"
+  case "$DISTRO_FAMILY" in
+    debian)
+      local hdr="linux-headers-${kver}"
+      if ! pkg_installed "$hdr" && ! pkg_available repo "$hdr"; then
+        if pkg_available repo "linux-headers-generic"; then
+          hdr="linux-headers-generic"
+        elif pkg_available repo "linux-headers-amd64"; then
+          hdr="linux-headers-amd64"
+        fi
+      fi
+      echo "git make dkms build-essential debhelper dh-dkms python3 zstd xz-utils curl ${hdr}"
+      ;;
+    fedora)
+      echo "git make dkms gcc python3 zstd xz curl rpm-build kernel-devel"
+      ;;
+    suse)
+      local kdev="kernel-default-devel"
+      if ! pkg_installed "$kdev" && ! pkg_available repo "$kdev"; then
+        kdev="kernel-devel"
+      fi
+      echo "git make dkms gcc python3 zstd xz curl rpm-build ${kdev}"
+      ;;
+  esac
+}
+
+applicable_gpu_unlock() {
+  [[ "$HAS_NVIDIA" == true ]] || return 1
+  secure_boot_enabled && return 1
+  [[ "$HAS_NVIDIA_TESLA" == true && "$HAS_NVIDIA_NON_TESLA" == false ]] && return 1
+  grep -qiE "TU10|TU11|GA10|AD10|RTX 20|RTX 30|RTX 40|GTX 16|A100|A10|A40|L40|RTX A" <<< "${GPU_RAW:-$GPU_SUMMARY} ${NVIDIA_GPU_NAMES[*]:-}" || return 1
+  if [[ "$DISTRO_FAMILY" == "arch" ]]; then
+    pkg_installed gpu-unlock-dkms || pkg_available repo gpu-unlock-dkms || pkg_available aur gpu-unlock-dkms
+  else
+    [[ "$DISTRO_FAMILY" =~ ^(debian|fedora|suse)$ ]]
+  fi
+}
+
 title_gpu_unlock() { echo "NVIDIA GPU Unlock Module & Kernel Param (gpu-unlock-dkms)"; }
-status_gpu_unlock() { has_kernel_param "gpu_unlock.targets=all" && ([[ -d /sys/module/gpu_unlock ]] || lsmod 2>/dev/null | grep -E "gpu_unlock" >/dev/null || pkg_installed gpu-unlock-dkms); }
+note_gpu_unlock() {
+  if [[ "$DISTRO_FAMILY" != "arch" ]]; then
+    echo -e "${C_MAGENTA}[EXP]${C_RESET}"
+  else
+    echo -e "${C_DIM}-${C_RESET}"
+  fi
+}
+status_gpu_unlock() {
+  has_kernel_param "gpu_unlock.targets=all" && ([[ -d /sys/module/gpu_unlock ]] || lsmod 2>/dev/null | grep -qE "gpu_unlock" || gpu_unlock_installed)
+}
 explain_gpu_unlock() {
-  cat <<'EOF'
+  if [[ "$DISTRO_FAMILY" == "arch" ]]; then
+    cat <<'EOF'
 Impact:
   Installs gpu-unlock-dkms + gpu-unlock-firmware and adds
   'gpu_unlock.targets=all' to the bootloader kernel command line.
 EOF
+  else
+    cat <<'EOF'
+Impact:
+  Installs build dependencies, compiles and installs gpu-unlock from source
+  (https://github.com/Zagitta/gpu-unlock) via DKMS, and adds
+  'gpu_unlock.targets=all' to the bootloader kernel command line.
+EOF
+    echo -e "\n${C_MAGENTA}[EXPERIMENTAL] This option is experimental for your distribution (${OS_PRETTY:-$DISTRO_ID})${C_RESET}"
+    echo -e "${C_MAGENTA}               and might not work properly.${C_RESET}"
+  fi
   echo -e "\n${C_BGREEN}[HIGH IMPACT] Big performance gains can be achieved with gpu-unlock on${C_RESET}"
   echo -e "${C_BGREEN}              supported Turing/Ampere/Ada GPUs (RTX 20/30/40 series),${C_RESET}"
   echo -e "${C_BGREEN}              unlocking hardware compute, clock, and power capabilities.${C_RESET}"
 }
 apply_gpu_unlock() {
-  if ! pkg_installed gpu-unlock-dkms; then
-    prompt_install_repo_or_aur gpu-unlock-dkms gpu-unlock-firmware || return 0
+  if ! gpu_unlock_installed; then
+    if [[ "$DISTRO_FAMILY" == "arch" ]]; then
+      prompt_install_repo_or_aur gpu-unlock-dkms gpu-unlock-firmware || return 0
+    else
+      local -a deps=()
+      read -r -a deps <<< "$(gpu_unlock_build_deps)"
+      if [[ ${#deps[@]} -gt 0 ]]; then
+        prompt_install_deps repo "${deps[@]}" || return 0
+      fi
+      local build_dir build_ok=false
+      build_dir="$(mktemp -d /tmp/gpu-unlock.XXXXXX)"
+      [[ $EUID -eq 0 && "$TARGET_USER" != "root" ]] && chown "$TARGET_USER" "$build_dir" 2>/dev/null || true
+      echo -e "${C_CYAN}Cloning and building gpu-unlock from source...${C_RESET}"
+      if ! run_as_user_exec git clone --depth 1 https://github.com/Zagitta/gpu-unlock.git "$build_dir/src"; then
+        echo -e "${C_RED}Failed to clone https://github.com/Zagitta/gpu-unlock.git.${C_RESET}"
+        rm -rf "$build_dir"
+        return 0
+      fi
+      case "$DISTRO_FAMILY" in
+        debian)
+          if run_as_user_exec make -C "$build_dir/src" CACHE="$build_dir/cache" deb &&
+             compgen -G "$build_dir/src/build/deb/gpu-unlock-*.deb" >/dev/null 2>&1 &&
+             run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "$build_dir"/src/build/deb/gpu-unlock-*.deb; then
+            build_ok=true
+          fi
+          ;;
+        fedora)
+          if run_as_user_exec make -C "$build_dir/src" CACHE="$build_dir/cache" rpm &&
+             compgen -G "$build_dir/src/build/rpm/RPMS/noarch/gpu-unlock-*.noarch.rpm" >/dev/null 2>&1 &&
+             run_root dnf install -y "$build_dir"/src/build/rpm/RPMS/noarch/gpu-unlock-*.noarch.rpm; then
+            build_ok=true
+          fi
+          ;;
+        suse)
+          if run_as_user_exec make -C "$build_dir/src" CACHE="$build_dir/cache" rpm &&
+             compgen -G "$build_dir/src/build/rpm/RPMS/noarch/gpu-unlock-*.noarch.rpm" >/dev/null 2>&1 &&
+             run_root zypper --non-interactive --no-gpg-checks install "$build_dir"/src/build/rpm/RPMS/noarch/gpu-unlock-*.noarch.rpm; then
+            build_ok=true
+          fi
+          ;;
+      esac
+      rm -rf "$build_dir"
+      PKG_INST_CACHE=()
+      if [[ "$build_ok" != true ]]; then
+        echo -e "${C_RED}Failed to build/install gpu-unlock from source.${C_RESET}"
+        return 0
+      fi
+    fi
   fi
   add_kernel_param "gpu_unlock.targets=all"
 }
@@ -6444,7 +6570,11 @@ show_index() {
         body+="$(format_index_row "$idx" false)"$'\n'
       fi
     done
-    body+=$'\n'"$(echo -e "  ${C_YELLOW}[!]${C_RESET} ${C_DIM}Higher idle power, minimal gain${C_RESET}")"$'\n'
+    local legend_line="  ${C_YELLOW}[!]${C_RESET} ${C_DIM}Higher idle power, minimal gain${C_RESET}"
+    if [[ "$DISTRO_FAMILY" != "arch" ]]; then
+      legend_line+="   ${C_MAGENTA}[EXP]${C_RESET} ${C_DIM}Experimental for this distribution, might not work properly${C_RESET}"
+    fi
+    body+=$'\n'"$(echo -e "$legend_line")"$'\n'
 
     body+=$'\n'"$(echo -e "${C_BOLD}Strata Options:${C_RESET}")"$'\n\n'
     body+="$(printf "  ${C_BOLD}%-3s | %-15s | %s${C_RESET}" "#" "Status" "Option")"$'\n'
@@ -6471,7 +6601,9 @@ show_index() {
       body+="$(echo -e "  ${C_CYAN}[h]${C_RESET} Benchmark history & restore coupled options (${hist_count})")"$'\n'
       ((footer_lines++))
     fi
-    body+="$(echo -e "  ${C_GREEN}[a]${C_RESET} Apply all recommended optimizations (excludes high-idle-power options)")"$'\n'
+    local rec_excl="excludes high-idle-power options"
+    [[ "$DISTRO_FAMILY" != "arch" ]] && rec_excl="excludes high-idle-power and experimental options"
+    body+="$(echo -e "  ${C_GREEN}[a]${C_RESET} Apply all recommended optimizations (${rec_excl})")"$'\n'
     body+="$(echo -e "  ${C_RED}[x]${C_RESET} Revert all recommended optimizations")"$'\n'
     body+="$(echo -e "  ${C_BOLD}[1-${#ACTIVE_STEPS[@]}, ${s_range} / ↑↓+Enter]${C_RESET} Select an option")"$'\n'
     body+="$(echo -e "  ${C_BOLD}[r]${C_RESET} Reboot system")"$'\n'
