@@ -1742,6 +1742,45 @@ Impact:
   'amdgpu.ppfeaturemask=0xffffffff' (reboot) to unlock clock/power controls.
 EOF
 }
+
+lact_config_file() {
+  # The config path LACT's own daemon resolves.
+  if [[ -n "${LACT_DAEMON_CONFIG_DIR:-}" ]]; then
+    printf '%s/config.yaml\n' "${LACT_DAEMON_CONFIG_DIR%/}"
+  else
+    printf '/etc/lact/config.yaml\n'
+  fi
+}
+lact_gpu_ids() {
+  # GPU ids are the keys of the `gpus:` map in LACT's config, e.g.
+  #   10DE:2684-1043:88EF-0000:0a:00.0
+  # Ask the daemon first (it only lists the GPUs it manages); fall back to
+  # building the very same id from the PCI uevent if it cannot be reached.
+  local -a ids=()
+  local line id uev
+  if command -v lact >/dev/null 2>&1; then
+    while IFS= read -r line; do
+      id="${line#*: }"          # drop the "0: " index prefix of `lact cli list`
+      id="${id%%[[:space:]]*}"  # the id is the first whitespace-separated token
+      [[ "$id" =~ ^[0-9A-Fa-f]{4}:[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}:[0-9A-Fa-f]{4}- ]] || continue
+      ids+=("$id")
+    done < <(lact cli list 2>/dev/null || true)
+  fi
+  if (( ${#ids[@]} == 0 )); then
+    for uev in /sys/class/drm/card[0-9]*/device/uevent; do
+      [[ -r "$uev" ]] || continue
+      id="$(awk -F= '
+        /^PCI_ID=/        { v = $2 }
+        /^PCI_SUBSYS_ID=/ { s = $2 }
+        /^PCI_SLOT_NAME=/ { p = $2 }
+        END               { if (v && s && p) printf "%s-%s-%s", v, s, p }' "$uev")"
+      [[ -n "$id" ]] && ids+=("$id")
+    done
+  fi
+  (( ${#ids[@]} )) || return 1
+  printf '%s\n' "${ids[@]}"
+}
+
 apply_lact_overclock() {
   if ! command -v lact >/dev/null 2>&1; then
     case "$DISTRO_FAMILY" in
@@ -1776,27 +1815,127 @@ apply_lact_overclock() {
     return 1
   fi
 
-  if [[ -f /etc/lact/config.yaml ]]; then
-    run_root cp -n /etc/lact/config.yaml /etc/lact/config.yaml.bak.strata-setup 2>/dev/null || true
-    if run_root python3 -c '
-import sys, yaml
-p = "/etc/lact/config.yaml"
-with open(p) as f: d = yaml.safe_load(f) or {}
-gpus = d.get("gpus") or {}
-if not gpus: sys.exit(1)
-gpu_id = next(iter(gpus))
-g = gpus[gpu_id] if isinstance(gpus[gpu_id], dict) else {}
-g["gpu_clock_offsets"] = {0: int(sys.argv[1])}
-g["mem_clock_offsets"] = {0: int(sys.argv[2])}
-g.setdefault("power_mizer_mode", "Adaptive")
-gpus[gpu_id] = g
-d["gpus"] = gpus
-with open(p, "w") as f: yaml.safe_dump(d, f, sort_keys=False)
-' "$core_off" "$mem_off" 2>/dev/null; then
-      run_root systemctl restart lactd.service
-    else
-      echo -e "${C_YELLOW}Could not auto-edit /etc/lact/config.yaml; configure in LACT GUI.${C_RESET}"
+  local cfg out rc i id
+  cfg="$(lact_config_file)"
+  if ! python3 -c "import yaml" >/dev/null 2>&1; then
+    echo -e "${C_YELLOW}PyYAML is missing, cannot edit ${cfg}; set the offsets in the LACT GUI.${C_RESET}"
+    return 1
+  fi
+  if [[ ! -f "$cfg" ]]; then
+    # lactd creates a default config on its first start
+    run_root systemctl restart lactd.service 2>/dev/null || true
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      [[ -f "$cfg" ]] && break
+      sleep 0.5
+    done
+  fi
+  if [[ ! -f "$cfg" ]]; then
+    echo -e "${C_YELLOW}${cfg} does not exist yet; start lactd once, then re-run.${C_RESET}"
+    return 1
+  fi
+
+  run_root cp -n "$cfg" "${cfg}.bak.strata-setup" 2>/dev/null || true
+
+  # `gpus:` is keyed by GPU id, so tell the editor which GPUs to configure
+  local -a pyargs=("$cfg" "$core_off" "$mem_off")
+  while IFS= read -r id; do
+    [[ -n "$id" ]] && pyargs+=("$id")
+  done < <(lact_gpu_ids || true)
+
+  rc=0
+  out="$(run_root python3 - "${pyargs[@]}" 2>&1 <<'PY'
+import sys
+
+import yaml
+
+path, core_off, mem_off = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+requested_ids = sys.argv[4:]
+
+try:
+    with open(path) as f:
+        data = yaml.safe_load(f)
+except FileNotFoundError:
+    data = None
+except yaml.YAMLError as err:
+    sys.exit(f"{path}: not valid YAML: {err}")
+except OSError as err:
+    sys.exit(f"{path}: could not be read: {err}")
+if data is None:
+    data = {}
+if not isinstance(data, dict):
+    sys.exit(f"{path}: the top level is not a mapping")
+
+# LACT applies the settings of the active profile when one is selected, and the
+# top level `gpus` map otherwise (see Config::gpus in lact-daemon).
+profile_name = data.get("current_profile")
+if profile_name:
+    profiles = data.setdefault("profiles", {})
+    if not isinstance(profiles, dict):
+        sys.exit(f"{path}: 'profiles' is not a mapping")
+    profile = profiles.get(profile_name)
+    if not isinstance(profile, dict):
+        profile = {}
+        profiles[profile_name] = profile
+    where = f"profile '{profile_name}'"
+else:
+    profile = data
+    where = "the default profile"
+
+gpus = profile.get("gpus")
+if not isinstance(gpus, dict):
+    gpus = {}
+    profile["gpus"] = gpus
+
+# On a fresh LACT install `gpus` does not exist yet, its entries are created here
+gpu_ids = [gpu_id for gpu_id in requested_ids if gpu_id] or list(gpus)
+if not gpu_ids:
+    sys.exit("no GPU id found - is lactd running? (`lact cli list`)")
+
+for gpu_id in gpu_ids:
+    gpu = gpus.get(gpu_id)
+    if not isinstance(gpu, dict):
+        gpu = {}
+    gpu["gpu_clock_offsets"] = {0: core_off}
+    gpu["mem_clock_offsets"] = {0: mem_off}
+    if gpu_id.split(":", 1)[0].upper() == "10DE":
+        # Nvidia only: controls the offsets through the adaptive clock governor
+        gpu.setdefault("power_mizer_mode", "Adaptive")
+    gpus[gpu_id] = gpu
+
+try:
+    with open(path, "w") as f:
+        yaml.safe_dump(data, f, sort_keys=False, default_flow_style=False)
+except OSError as err:
+    sys.exit(f"{path}: could not be written: {err}")
+
+# Read back, so that a reported success means the file really holds the offsets
+with open(path) as f:
+    saved = yaml.safe_load(f)
+if profile_name:
+    saved_gpus = ((saved.get("profiles") or {}).get(profile_name) or {}).get("gpus") or {}
+else:
+    saved_gpus = saved.get("gpus") or {}
+for gpu_id in gpu_ids:
+    gpu = saved_gpus.get(gpu_id) or {}
+    if gpu.get("gpu_clock_offsets") != {0: core_off} or gpu.get("mem_clock_offsets") != {0: mem_off}:
+        sys.exit(f"{path}: wrote the offsets but could not read them back")
+
+print(f"core {core_off:+d} MHz, VRAM {mem_off:+d} MHz for {', '.join(gpu_ids)} in {where}")
+PY
+)" || rc=$?
+
+  if (( rc == 0 )); then
+    echo -e "${C_GREEN}LACT: ${out}${C_RESET}"
+    run_root systemctl restart lactd.service 2>/dev/null || true
+    sleep 1
+    if ! unit_active lactd.service; then
+      echo -e "${C_YELLOW}lactd is not running after the config change:${C_RESET}"
+      run_root journalctl -u lactd.service -n 5 --no-pager 2>/dev/null | sed 's/^/  /' || true
     fi
+  else
+    echo -e "${C_YELLOW}Could not auto-edit ${cfg}; configure in LACT GUI.${C_RESET}"
+    [[ -n "$out" ]] && printf '%s\n' "$out" | sed 's/^/  /'
+    return 1
   fi
 }
 revert_lact_overclock() {
