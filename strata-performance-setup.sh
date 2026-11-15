@@ -28,8 +28,8 @@ fi
 TARGET_USER="${SUDO_USER:-${USER:-$(id -un)}}"
 TARGET_HOME="$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6 || true)"
 [[ -n "$TARGET_HOME" ]] || TARGET_HOME="$HOME"
-STRATA_BIN="" STRATA_VERSION="" STRATA_RUNNING_PRESET="" STRATA_RUNNING_URL=""
-DISTRO_FAMILY="unknown" DISTRO_ID="unknown" OS_PRETTY="" KERNEL_VER="" AUR_HELPER="" HAS_SYSTEMD=true
+STRATA_BIN="" STRATA_VERSION="" STRATA_RUNNING_PRESET="" STRATA_RUNNING_URL="" STRATA_DOCKER_CONTAINER=""
+DISTRO_FAMILY="unknown" DISTRO_ID="unknown" OS_PRETTY="" KERNEL_VER="" AUR_HELPER="" HAS_SYSTEMD=true IS_UNRAID=false
 HAS_NVIDIA=false HAS_NVIDIA_POWERD=false HAS_AMD=false HAS_INTEL_GPU=false HAS_INTEL_ARC=false
 HAS_NVIDIA_TESLA=false HAS_NVIDIA_NON_TESLA=false NVIDIA_COMPUTE_MODE_NON_DEFAULT=false
 GPU_SUMMARY="" GPU_RAW="" CPU_SUMMARY="" RAM_GB=0 RAM_DETAILS="" NVIDIA_VRAM_MB=0 TOTAL_VRAM_MB=0
@@ -105,12 +105,23 @@ unit_exists() {
   awk -v u="$1" '$1 == u {found=1; exit} END {exit !found}' <<< "$UNIT_FILES_CACHE"
 }
 
+resolve_rc_script() {
+  local name="${1%.service}"
+  if [[ -x "/etc/rc.d/rc.strata.${name}" ]]; then
+    echo "/etc/rc.d/rc.strata.${name}"
+  elif [[ "$IS_UNRAID" == true && -x "/boot/config/strata/rc.strata.${name}" ]]; then
+    echo "/boot/config/strata/rc.strata.${name}"
+  else
+    return 1
+  fi
+}
+
 service_installed() {
   local unit="$1"
   if [[ "$HAS_SYSTEMD" == true ]]; then
     [[ -f "/etc/systemd/system/${unit}" ]]
   else
-    [[ -x "/etc/rc.d/rc.strata.${unit%.service}" ]]
+    resolve_rc_script "$unit" >/dev/null
   fi
 }
 
@@ -127,6 +138,40 @@ unit_active() {
     systemctl is-active "$1" >/dev/null 2>&1
   else
     service_installed "$1"
+  fi
+}
+
+service_ctl() {
+  local action="$1" unit="$2"
+  if [[ "$HAS_SYSTEMD" == true ]]; then
+    run_root systemctl "$action" "$unit"
+  else
+    local rc_script
+    rc_script="$(resolve_rc_script "$unit")" || return 1
+    run_root "$rc_script" "$action"
+  fi
+}
+
+add_boot_hook() {
+  local file="$1" tag="$2" hook="$3" shebang="${4:-#!/bin/sh}"
+  if [[ ! -f "$file" ]]; then
+    printf '%s\n' "$shebang" | run_root tee "$file" >/dev/null
+  fi
+  if ! grep -qF "$tag" "$file" 2>/dev/null; then
+    [[ -s "$file" && -n "$(tail -c1 "$file" 2>/dev/null)" ]] && printf '\n' | run_root tee -a "$file" >/dev/null
+    printf '%s\n' "$hook" | run_root tee -a "$file" >/dev/null
+  fi
+}
+
+remove_boot_hook() {
+  local file="$1" tag="$2" tmp
+  [[ -f "$file" ]] && grep -qF "$tag" "$file" 2>/dev/null || return 0
+  if tmp="$(awk -v t="$tag" 'index($0, t) == 0 {print}' "$file")"; then
+    if [[ -n "$tmp" ]]; then
+      printf '%s\n' "$tmp" | run_root tee "$file" >/dev/null
+    else
+      : | run_root tee "$file" >/dev/null
+    fi
   fi
 }
 
@@ -178,14 +223,16 @@ ${stop_cmds:-    :}
 esac
 EOF
   run_root chmod +x "$rc_script"
-  if [[ ! -f /etc/rc.d/rc.local ]]; then
-    printf '#!/bin/sh\n' | run_root tee /etc/rc.d/rc.local >/dev/null
-  fi
-  run_root chmod +x /etc/rc.d/rc.local
-  local hook="[ -x ${rc_script} ] && ${rc_script} start # strata:${name}"
-  if ! grep -qF "# strata:${name}" /etc/rc.d/rc.local 2>/dev/null; then
-    [[ -s /etc/rc.d/rc.local && -n "$(tail -c1 /etc/rc.d/rc.local 2>/dev/null)" ]] && printf '\n' | run_root tee -a /etc/rc.d/rc.local >/dev/null
-    printf '%s\n' "$hook" | run_root tee -a /etc/rc.d/rc.local >/dev/null
+  if [[ "$IS_UNRAID" == true && -d /boot/config ]]; then
+    # Unraid's rootfs lives in RAM; persist scripts on the USB flash drive via /boot/config/go
+    local flash_dir="/boot/config/strata" flash_script="/boot/config/strata/rc.strata.${name}"
+    run_root mkdir -p "$flash_dir"
+    run_root cp "$rc_script" "$flash_script"
+    run_root chmod +x "$flash_script"
+    add_boot_hook "/boot/config/go" "# strata:${name}" "[ -x ${flash_script} ] && ${flash_script} start # strata:${name}" "#!/bin/bash"
+  else
+    add_boot_hook "/etc/rc.d/rc.local" "# strata:${name}" "[ -x ${rc_script} ] && ${rc_script} start # strata:${name}" "#!/bin/sh"
+    run_root chmod +x /etc/rc.d/rc.local
   fi
   run_root "$rc_script" start
 }
@@ -200,16 +247,16 @@ remove_service() {
     return 0
   fi
 
-  local name="${unit%.service}" rc_script="/etc/rc.d/rc.strata.${unit%.service}"
-  if [[ -x "$rc_script" ]]; then
+  local name="${unit%.service}" rc_script
+  if rc_script="$(resolve_rc_script "$unit")"; then
     run_root "$rc_script" stop >/dev/null 2>&1 || true
   fi
-  run_root rm -f "$rc_script"
-  if [[ -f /etc/rc.d/rc.local ]] && grep -qF "# strata:${name}" /etc/rc.d/rc.local 2>/dev/null; then
-    local tmp_rc
-    tmp_rc="$(awk -v tag="# strata:${name}" 'index($0, tag) == 0 {print}' /etc/rc.d/rc.local)"
-    printf '%s\n' "$tmp_rc" | run_root tee /etc/rc.d/rc.local >/dev/null
+  run_root rm -f "/etc/rc.d/rc.strata.${name}"
+  if [[ "$IS_UNRAID" == true ]]; then
+    run_root rm -f "/boot/config/strata/rc.strata.${name}"
+    remove_boot_hook "/boot/config/go" "# strata:${name}"
   fi
+  remove_boot_hook "/etc/rc.d/rc.local" "# strata:${name}"
 }
 
 pkg_installed() {
@@ -628,6 +675,10 @@ refresh_strata_bin() {
   else
     STRATA_VERSION=""
   fi
+  STRATA_DOCKER_CONTAINER=""
+  if [[ -z "$STRATA_BIN" && -S /var/run/docker.sock ]] && command -v docker >/dev/null 2>&1; then
+    STRATA_DOCKER_CONTAINER="$(timeout 1 docker ps --format '{{.Names}}' 2>/dev/null | grep -i strata | head -n1 || true)"
+  fi
 }
 
 refresh_strata_running() {
@@ -729,13 +780,24 @@ detect_platform_basics() {
       DISTRO_FAMILY="debian"
     elif [[ "$DISTRO_ID" =~ ^(opensuse.*|sles|sled|suse)$ ]] || [[ "$id_like" == *suse* ]]; then
       DISTRO_FAMILY="suse"
-    elif [[ "$DISTRO_ID" == "slackware" ]] || [[ "$id_like" == *slackware* ]]; then
+    elif [[ "$DISTRO_ID" =~ ^(slackware|unraid)$ ]] || [[ "$id_like" == *slackware* ]]; then
       DISTRO_FAMILY="slackware"
     fi
   elif [[ -r /etc/slackware-version ]]; then
     DISTRO_ID="slackware"
     DISTRO_FAMILY="slackware"
     OS_PRETTY="$(cat /etc/slackware-version 2>/dev/null || echo "Slackware Linux")"
+  fi
+
+  if [[ -r /etc/unraid-version ]] || [[ "$DISTRO_ID" == "unraid" ]]; then
+    IS_UNRAID=true
+    DISTRO_FAMILY="slackware"
+    HAS_SYSTEMD=false
+    local unraid_ver=""
+    if [[ -r /etc/unraid-version ]]; then
+      unraid_ver="$(sed -n 's/.*version="\([^"]*\)".*/\1/p' /etc/unraid-version 2>/dev/null | head -n1)"
+      [[ -n "$unraid_ver" ]] && OS_PRETTY="Unraid ${unraid_ver} (Slackware)" || OS_PRETTY="Unraid (Slackware)"
+    fi
   fi
 
   if [[ "$DISTRO_FAMILY" == "arch" ]]; then
@@ -1550,13 +1612,17 @@ applicable_memlock_realtime() { return 0; }
 title_memlock_realtime() { echo "Unlimited Memory Lock & Realtime Privileges (memlock=unlimited)"; }
 status_memlock_realtime() {
   [[ -f /etc/security/limits.d/99-strata-memlock.conf ]] && return 0
-  [[ -f /etc/security/limits.d/99-realtime-privileges.conf ]] && id -nG "$TARGET_USER" 2>/dev/null | grep -qw realtime
+  [[ -f /etc/security/limits.d/99-realtime-privileges.conf ]] && id -nG "$TARGET_USER" 2>/dev/null | grep -qw realtime && return 0
+  [[ "$IS_UNRAID" == true && "$(ulimit -l 2>/dev/null || true)" == "unlimited" ]]
 }
 explain_memlock_realtime() {
   cat <<'EOF'
 Impact:
   Grants unlimited locked memory (memlock unlimited) and rtprio/nice limits so
-  Strata can pin model weights and KV caches in RAM without swapping.
+  Strata can pin model weights and KV caches in RAM without swapping (no-op if
+  ulimit -l is already unlimited).
+  Note: Docker containers do not inherit host /etc/security/limits.d/—pass
+  '--ulimit memlock=-1:-1' (or set Docker default-ulimits) for containerized Strata.
 EOF
 }
 apply_memlock_realtime() {
@@ -1617,7 +1683,7 @@ revert_pcie_aspm() {
 applicable_nvidia_persistenced() { [[ "$HAS_NVIDIA" == true ]] && unit_exists nvidia-persistenced.service; }
 title_nvidia_persistenced() { echo "NVIDIA Persistence Mode (nvidia-persistenced)"; }
 status_nvidia_persistenced() { unit_enabled nvidia-persistenced.service && unit_active nvidia-persistenced.service; }
-explain_nvidia_persistenced() { echo -e "Impact:\n  Keeps the NVIDIA driver initialized on headless servers to avoid cold-start delays."; }
+explain_nvidia_persistenced() { echo -e "Impact:\n  Keeps the NVIDIA driver initialized on headless systemd hosts to avoid cold-start\n  delays (no-op on container/appliance hosts where the driver stays resident)."; }
 apply_nvidia_persistenced() { run_root systemctl enable --now nvidia-persistenced.service; }
 revert_nvidia_persistenced() { run_root systemctl disable --now nvidia-persistenced.service; }
 
@@ -1664,13 +1730,14 @@ status_nvidia_power_limit() {
   [[ "$any" == true ]]
 }
 explain_nvidia_power_limit() {
-  local idxs=() i
+  local idxs=() i svc_desc="systemd service"
+  [[ "$HAS_SYSTEMD" == true ]] || svc_desc="boot service"
   mapfile -t idxs < <(nvidia_tunable_pl_indices)
   if (( ${#idxs[@]} == 1 )); then
     i="${idxs[0]}"
-    echo -e "Impact:\n  Raises GPU power ceiling from ${NVIDIA_GPU_DEF_PL[$i]}W to ${NVIDIA_GPU_MAX_PL[$i]}W via persistent systemd service."
+    echo -e "Impact:\n  Raises GPU power ceiling from ${NVIDIA_GPU_DEF_PL[$i]}W to ${NVIDIA_GPU_MAX_PL[$i]}W via persistent ${svc_desc}.\n  Prevents artificial throttling if the card hits its default cap (no speedup\n  if your workload draws below the default limit)."
   else
-    echo -e "Impact:\n  Raises GPU power ceilings to maximum per GPU via persistent systemd service:"
+    echo -e "Impact:\n  Raises GPU power ceilings to maximum per GPU via persistent ${svc_desc}\n  (prevents throttling when power-limited; no effect below default cap):"
     for i in "${idxs[@]}"; do
       echo -e "  - GPU ${NVIDIA_GPU_INDICES[$i]} (${NVIDIA_GPU_NAMES[$i]}): ${NVIDIA_GPU_DEF_PL[$i]}W -> ${NVIDIA_GPU_MAX_PL[$i]}W"
     done
@@ -3264,6 +3331,7 @@ revert_amd_x3d_mode() {
 
 # 12x. Intel Hybrid P-Core Pinning
 applicable_intel_pcore_pinning() {
+  [[ "$HAS_SYSTEMD" == true ]] || return 1
   [[ -f /etc/systemd/system/strata.service.d/10-pcore-affinity.conf ]] && return 0
   [[ -r /sys/devices/cpu_core/cpus && -r /sys/devices/cpu_atom/cpus ]]
 }
@@ -3300,7 +3368,7 @@ revert_intel_pcore_pinning() {
 # 13. Strata Manager
 applicable_strata_manager() { return 0; }
 title_strata_manager() { echo "Strata: Install, Update, Launch & Systemd Service"; }
-strata_service_installed() { [[ -f /etc/systemd/system/strata.service ]]; }
+strata_service_installed() { service_installed strata.service; }
 
 check_strata_update_sync() {
   [[ -n "$STRATA_BIN" ]] || return 1
@@ -3488,7 +3556,7 @@ perform_strata_update() {
 
   if [[ "$was_active" == true ]]; then
     echo -e "\n${C_CYAN}Stopping strata.service before updating...${C_RESET}"
-    run_root systemctl stop strata.service || true
+    service_ctl stop strata.service || true
     if ! wait_for_strata_stopped 60; then
       start_strata_update_poller
       return 1
@@ -3528,15 +3596,15 @@ perform_strata_update() {
 
   if [[ "$was_active" == true ]]; then
     echo -e "\n${C_CYAN}Restarting strata.service...${C_RESET}"
-    if run_root systemctl start strata.service; then
+    if service_ctl start strata.service; then
       wait_for_strata_model_live 120
     else
-      echo -e "${C_RED}Failed to start strata.service (check 'journalctl -u strata -n 50').${C_RESET}"
+      echo -e "${C_RED}Failed to start strata.service$([[ "$HAS_SYSTEMD" == true ]] && echo " (check 'journalctl -u strata -n 50')").${C_RESET}"
     fi
   elif strata_service_installed; then
     echo ""
     if confirm_yn "strata.service is installed but was stopped. Start it now? [y/N]: " "N"; then
-      if run_root systemctl start strata.service; then
+      if service_ctl start strata.service; then
         wait_for_strata_model_live 120
       else
         echo -e "${C_RED}Failed to start strata.service.${C_RESET}"
@@ -3804,7 +3872,7 @@ start_bench_power_sampler() {
       fi
 
       ((n++))
-      sleep 1 &
+      (sleep 0.25 2>/dev/null || sleep 1) &
       wait $! 2>/dev/null || true
     done
 
@@ -4781,7 +4849,11 @@ strata_action_install() {
 strata_action_update() {
   refresh_strata_bin
   if [[ -z "$STRATA_BIN" ]]; then
-    echo -e "${C_YELLOW}Strata is not installed. Run [s1] to install Strata first.${C_RESET}"
+    if [[ -n "$STRATA_DOCKER_CONTAINER" ]]; then
+      echo -e "${C_YELLOW}Strata is running in Docker (${STRATA_DOCKER_CONTAINER}); manage its lifecycle via Docker/Unraid.${C_RESET}"
+    else
+      echo -e "${C_YELLOW}Strata is not installed. Run [s1] to install Strata first.${C_RESET}"
+    fi
     return 0
   fi
   echo -e "${C_DIM}Checking for Strata updates...${C_RESET}"
@@ -4821,7 +4893,11 @@ strata_action_remove() {
 strata_action_service() {
   refresh_strata_bin
   if [[ -z "$STRATA_BIN" ]]; then
-    echo -e "${C_YELLOW}Strata is not installed. Run [s1] to install Strata first.${C_RESET}"
+    if [[ -n "$STRATA_DOCKER_CONTAINER" ]]; then
+      echo -e "${C_YELLOW}Strata is running in Docker (${STRATA_DOCKER_CONTAINER}); manage its lifecycle via Docker/Unraid.${C_RESET}"
+    else
+      echo -e "${C_YELLOW}Strata is not installed. Run [s1] to install Strata first.${C_RESET}"
+    fi
     return 0
   fi
   if strata_service_installed; then
@@ -4835,14 +4911,14 @@ strata_action_service() {
     read -r -p "Choose [1-5]: " svc_choice
     case "$svc_choice" in
       1)
-        if run_root systemctl restart strata.service; then
+        if service_ctl restart strata.service; then
           wait_for_strata_model_live 120
         else
-          echo -e "${C_RED}Failed to start strata.service (check 'journalctl -u strata -n 50').${C_RESET}"
+          echo -e "${C_RED}Failed to start strata.service$([[ "$HAS_SYSTEMD" == true ]] && echo " (check 'journalctl -u strata -n 50')").${C_RESET}"
         fi
         ;;
       2)
-        run_root systemctl stop strata.service && echo -e "${C_GREEN}strata.service stopped.${C_RESET}"
+        service_ctl stop strata.service && echo -e "${C_GREEN}strata.service stopped.${C_RESET}"
         ;;
       3) install_strata_service_fn ;;
       4) remove_service strata.service && echo -e "${C_GREEN}strata.service uninstalled.${C_RESET}" ;;
@@ -5516,7 +5592,9 @@ truncate_ansi_col() {
 collect_strata_stats_lines() {
   STRATA_STAT_LINES=()
   STRATA_STAT_LINES+=("$(printf "%bStrata:%b" "${C_BOLD}" "${C_RESET}")")
-  STRATA_STAT_LINES+=("$(printf "  %-8s %b%s%b" "Version:" "${C_DIM}" "${STRATA_VERSION:-Not installed}" "${C_RESET}")")
+  local ver_disp="${STRATA_VERSION:-Not installed}"
+  [[ -z "$STRATA_BIN" && -n "$STRATA_DOCKER_CONTAINER" ]] && ver_disp="Docker (${STRATA_DOCKER_CONTAINER}, host-tuning mode)"
+  STRATA_STAT_LINES+=("$(printf "  %-8s %b%s%b" "Version:" "${C_DIM}" "$ver_disp" "${C_RESET}")")
   local svc_str=""
   if strata_service_installed; then
     if unit_active strata.service; then
@@ -6639,7 +6717,7 @@ declare -A STEP_GAIN_PTS=(
   [intel_compute_stack]=4
   [lact_overclock]=4
   [jetson_perf]=4
-  [nvidia_power_limit]=4
+  [nvidia_power_limit]=2
   [amd_gpu_perf]=4
   [intel_gpu_perf]=4
   [ryzenadj_tdp]=4
@@ -6889,7 +6967,7 @@ show_index() {
       a|A) run_recommended_batch "apply" ;;
       x|X) run_recommended_batch "revert" ;;
       r|R)
-        confirm_yn "Reboot this system now? [y/N]: " "N" && { run_root systemctl reboot; exit 0; }
+        confirm_yn "Reboot this system now? [y/N]: " "N" && { if [[ "$HAS_SYSTEMD" == true ]]; then run_root systemctl reboot; else run_root reboot; fi; exit 0; }
         sleep 1
         ;;
       q|Q) exit 0 ;;

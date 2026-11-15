@@ -5,8 +5,8 @@ The script probes your system at startup and enables hardware-specific steps onl
 ## GPUs
 - **NVIDIA** *(any NVIDIA GPU supported by `nvidia-smi` — GeForce GTX/RTX including 50-series, Quadro/RTX Workstation, and Tesla/Datacenter GPUs)*:
   - **All supported NVIDIA GPUs** *(applied per-GPU for mixed or multi-GPU rigs)*:
-    - `nvidia-persistenced` persistence mode (eliminates cold-start delays on headless hosts)
-    - Per-GPU persistent maximum GPU power limit (`nvidia-smi -i <id> -pl`, when the card allows raising above default)
+    - `nvidia-persistenced` persistence mode (eliminates cold-start driver init delays on headless systemd hosts; no-op when the driver already stays resident, e.g. on container hosts)
+    - Per-GPU persistent maximum GPU power limit (`nvidia-smi -i <id> -pl`, when the card allows raising above default; prevents artificial throttling if a GPU hits its default cap, with no effect if your workload draws below the default limit)
     - Per-GPU clock lock (`-lgc`/`-lmc`, with `-ac` application clocks fallback for older Kepler/Maxwell Tesla GPUs)
     - Per-GPU compute mode reset to `Default` (`nvidia-smi -i <id> -c 0`, when in `Exclusive_Process` or `Prohibited` mode)
   - **Card- / platform-specific** *(auto-detected when applicable)*:
@@ -37,9 +37,9 @@ The script probes your system at startup and enables hardware-specific steps onl
 
 ## System-Wide Optimizations (All Hardware)
 - **Server Uptime:** Masks `sleep`, `suspend`, `hibernate`, and `hybrid-sleep` targets, and ignores laptop lid-close suspend
-- **Memory & Realtime:** Grants unlimited `memlock`, `nice -11`, and `rtprio 98` so model weights and KV caches stay pinned in RAM
+- **Memory & Realtime:** Grants unlimited `memlock`, `nice -11`, and `rtprio 98` so model weights and KV caches stay pinned in RAM (Dockerized Strata needs `--ulimit memlock=-1:-1` or Docker `default-ulimits`, as containers do not inherit host `/etc/security/limits.d/`)
 - **CPU & PCIe:** Optional CPU `performance` governor / `power-profiles-daemon` and PCIe ASPM `performance` policy
 - **Kernel & Swap:** `sysctl` VM tuning (`vfs_cache_pressure=50`, `dirty_ratio=10`, `zone_reclaim_mode=0`), `ananicy-cpp` / `bpftune` on Arch/CachyOS, `sched_ext` BPF CPU scheduler (`scx_loader` / `scx` with `bpfland`), `zstd`-compressed `zram` swap, and `irqbalance`
-- **Strata Management & Benchmarking:** Installs or updates [Strata](https://github.com/Niko1221/Strata), runs `strata launch`, manages `strata.service` from a saved preset, runs Strata benchmarks with coupled host-option/power tracking, and lets you inspect and restore past benchmark configurations
+- **Strata Management & Benchmarking:** Installs or updates [Strata](https://github.com/Niko1221/Strata), runs `strata launch`, manages `strata.service` from a saved preset, runs Strata benchmarks with coupled host-option/power tracking, and lets you inspect and restore past benchmark configurations. *(Tip: on VRAM-constrained GPUs, check Strata's serving/prefill chunk configuration—e.g. `auto` vs. a lower pinned value—before chasing marginal OS tweaks.)*
 
 > **Recommended Specs:** The wizard will warn if your system has under **32 GiB RAM** or under **6 GiB NVIDIA VRAM** (or no dedicated NVIDIA/AMD/Intel Arc GPU), as larger models may not fit in memory, though you can still apply any applicable host optimizations.

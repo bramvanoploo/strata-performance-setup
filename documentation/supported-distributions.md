@@ -9,5 +9,6 @@ The wizard supports Linux distributions across systemd and Slackware SysVinit fa
 | **Debian-based** | Debian, Ubuntu (including **Jetson Linux R32 / L4T R32.x**), Pop!\_OS, Linux Mint, KDE neon (and `ID_LIKE=debian` / `ubuntu`) | `apt-get` |
 | **openSUSE / SLES** | openSUSE Leap/Tumbleweed, SLES, SLED (and `ID_LIKE=suse`) | `zypper` |
 | **Slackware** | Slackware 15.0 / -current (SysVinit `/etc/rc.d/rc.strata.*` + `/etc/rc.d/rc.local`) | `slackpkg` |
+| **Unraid** | Unraid (Slackware-based SysVinit; persists boot hooks via `/boot/config/strata/` + `/boot/config/go`, host-tuning mode when Strata runs in Docker) | `slackpkg` / host-only |
 
 > **Bootloaders:** Kernel command-line parameters (used when BIOS locks runtime PCIe ASPM writes or for `gpu-unlock`) are automatically configured for **Limine** (`/etc/default/limine`), **GRUB** (`/etc/default/grub` via `grub-mkconfig` or `grub2-mkconfig`), **systemd-boot** (`/etc/kernel/cmdline`), **ELILO** (`/boot/efi/EFI/Slackware/elilo.conf` or `/etc/elilo.conf`), or **LILO** (`/etc/lilo.conf`).
