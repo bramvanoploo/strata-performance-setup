@@ -28,7 +28,8 @@ fi
 TARGET_USER="${SUDO_USER:-${USER:-$(id -un)}}"
 TARGET_HOME="$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6 || true)"
 [[ -n "$TARGET_HOME" ]] || TARGET_HOME="$HOME"
-STRATA_BIN="" STRATA_VERSION="" STRATA_RUNNING_PRESET="" STRATA_RUNNING_URL="" STRATA_DOCKER_CONTAINER=""
+STRATA_BIN="" STRATA_VERSION="" STRATA_RUNNING_PRESET="" STRATA_RUNNING_URL="" STRATA_DOCKER_CONTAINER="" STRATA_DOCKER_IMAGE=""
+CHECK_ONLY=false
 DISTRO_FAMILY="unknown" DISTRO_ID="unknown" OS_PRETTY="" KERNEL_VER="" AUR_HELPER="" HAS_SYSTEMD=true IS_UNRAID=false IS_TRUENAS=false IS_SYNOLOGY=false
 HAS_NVIDIA=false HAS_NVIDIA_POWERD=false HAS_AMD=false HAS_INTEL_GPU=false HAS_INTEL_ARC=false
 HAS_NVIDIA_TESLA=false HAS_NVIDIA_NON_TESLA=false NVIDIA_COMPUTE_MODE_NON_DEFAULT=false
@@ -61,6 +62,7 @@ declare -A PKG_AVAIL_CACHE PKG_INST_CACHE
 # Core Helpers (Privileges, Packages, Services, Bootloader)
 # ------------------------------------------------------------------------------
 run_root() {
+  [[ "${CHECK_ONLY:-false}" == true ]] && return 1
   if [[ $EUID -eq 0 ]]; then "$@"
   else sudo "$@"; fi
 }
@@ -109,7 +111,7 @@ resolve_rc_script() {
   local name="${1%.service}"
   if [[ -x "/etc/rc.d/rc.strata.${name}" ]]; then
     echo "/etc/rc.d/rc.strata.${name}"
-  elif [[ "$IS_UNRAID" == true && -x "/boot/config/strata/rc.strata.${name}" ]]; then
+  elif [[ "$IS_UNRAID" == true && -f "/boot/config/strata/rc.strata.${name}" ]]; then
     echo "/boot/config/strata/rc.strata.${name}"
   elif [[ "$IS_SYNOLOGY" == true && -x "/usr/local/etc/rc.d/strata-${name}.sh" ]]; then
     echo "/usr/local/etc/rc.d/strata-${name}.sh"
@@ -150,7 +152,7 @@ service_ctl() {
   else
     local rc_script
     rc_script="$(resolve_rc_script "$unit")" || return 1
-    run_root "$rc_script" "$action"
+    run_root sh "$rc_script" "$action"
   fi
 }
 
@@ -158,6 +160,9 @@ add_boot_hook() {
   local file="$1" tag="$2" hook="$3" shebang="${4:-#!/bin/sh}"
   if [[ ! -f "$file" ]]; then
     printf '%s\n' "$shebang" | run_root tee "$file" >/dev/null
+  fi
+  if [[ -f "$file" ]] && grep -qF "$tag" "$file" 2>/dev/null && ! grep -qxF "$hook" "$file" 2>/dev/null; then
+    remove_boot_hook "$file" "$tag"
   fi
   if ! grep -qF "$tag" "$file" 2>/dev/null; then
     [[ -s "$file" && -n "$(tail -c1 "$file" 2>/dev/null)" ]] && printf '\n' | run_root tee -a "$file" >/dev/null
@@ -230,8 +235,8 @@ EOF
     local flash_dir="/boot/config/strata" flash_script="/boot/config/strata/rc.strata.${name}"
     run_root mkdir -p "$flash_dir"
     run_root cp "$rc_script" "$flash_script"
-    run_root chmod +x "$flash_script"
-    add_boot_hook "/boot/config/go" "# strata:${name}" "[ -x ${flash_script} ] && ${flash_script} start # strata:${name}" "#!/bin/bash"
+    run_root chmod +x "$flash_script" 2>/dev/null || true
+    add_boot_hook "/boot/config/go" "# strata:${name}" "[ -f ${flash_script} ] && sh ${flash_script} start # strata:${name}" "#!/bin/bash"
   elif [[ "$IS_SYNOLOGY" == true && -d /usr/local/etc/rc.d ]]; then
     local syno_script="/usr/local/etc/rc.d/strata-${name}.sh"
     run_root cp "$rc_script" "$syno_script"
@@ -255,7 +260,7 @@ remove_service() {
 
   local name="${unit%.service}" rc_script
   if rc_script="$(resolve_rc_script "$unit")"; then
-    run_root "$rc_script" stop >/dev/null 2>&1 || true
+    run_root sh "$rc_script" stop >/dev/null 2>&1 || true
   fi
   run_root rm -f "/etc/rc.d/rc.strata.${name}"
   if [[ "$IS_UNRAID" == true ]]; then
@@ -672,6 +677,17 @@ for p in glob.glob("/sys/bus/i2c/drivers/ee1004/*/eeprom") + glob.glob("/sys/bus
   [[ ${#parts[@]} -gt 0 ]] && RAM_DETAILS=" (${parts[*]})" || RAM_DETAILS=""
 }
 
+_docker_ro() {
+  [[ -S /var/run/docker.sock ]] && command -v docker >/dev/null 2>&1 || return 1
+  if [[ $EUID -eq 0 || ( -r /var/run/docker.sock && -w /var/run/docker.sock ) ]]; then
+    timeout 3 docker "$@" 2>/dev/null
+  elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+    sudo -n timeout 3 docker "$@" 2>/dev/null
+  else
+    return 1
+  fi
+}
+
 refresh_strata_bin() {
   if command -v strata >/dev/null 2>&1; then STRATA_BIN="$(command -v strata)"
   elif [[ -x "$TARGET_HOME/.local/bin/strata" ]]; then STRATA_BIN="$TARGET_HOME/.local/bin/strata"
@@ -690,8 +706,13 @@ refresh_strata_bin() {
     STRATA_VERSION=""
   fi
   STRATA_DOCKER_CONTAINER=""
-  if [[ -z "$STRATA_BIN" && -S /var/run/docker.sock ]] && command -v docker >/dev/null 2>&1; then
-    STRATA_DOCKER_CONTAINER="$(timeout 1 docker ps --format '{{.Names}}' 2>/dev/null | grep -i strata | head -n1 || true)"
+  STRATA_DOCKER_IMAGE=""
+  if [[ -z "$STRATA_BIN" ]]; then
+    local _dc_line=""
+    _dc_line="$(_docker_ro ps --format '{{.Names}}|{{.Image}}' | awk -F'|' 'tolower($2) ~ /(^|[\/_-])strata(:|@|$)/ {print $1 "|" $2; exit}' || true)"
+    if [[ -n "$_dc_line" ]]; then
+      IFS='|' read -r STRATA_DOCKER_CONTAINER STRATA_DOCKER_IMAGE <<< "$_dc_line"
+    fi
   fi
 }
 
@@ -1641,6 +1662,10 @@ revert_cpu_performance() {
 applicable_memlock_realtime() { return 0; }
 title_memlock_realtime() { echo "Unlimited Memory Lock & Realtime Privileges (memlock=unlimited)"; }
 status_memlock_realtime() {
+  if [[ -n "$STRATA_DOCKER_CONTAINER" ]]; then
+    _docker_ro inspect --format '{{range .HostConfig.Ulimits}}{{.Name}}={{.Soft}}:{{.Hard}} {{end}}' "$STRATA_DOCKER_CONTAINER" | grep -qE '(^|[[:space:]])memlock=-1:-1([[:space:]]|$)'
+    return $?
+  fi
   [[ -f /etc/security/limits.d/99-strata-memlock.conf ]] && return 0
   [[ -f /etc/security/limits.d/99-realtime-privileges.conf ]] && id -nG "$TARGET_USER" 2>/dev/null | grep -qw realtime && return 0
   [[ "$IS_UNRAID" == true && "$(ulimit -l 2>/dev/null || true)" == "unlimited" ]]
@@ -1656,6 +1681,10 @@ Impact:
 EOF
 }
 apply_memlock_realtime() {
+  if [[ -n "$STRATA_DOCKER_CONTAINER" ]]; then
+    echo -e "${C_YELLOW}Note: Docker containers ignore host /etc/security/limits.d/ — add '--ulimit memlock=-1:-1' to container '${STRATA_DOCKER_CONTAINER}' (or configure Docker default-ulimits).${C_RESET}"
+    [[ "$IS_UNRAID" == true ]] && return 0
+  fi
   if [[ "$DISTRO_FAMILY" == "arch" ]] && ! pkg_installed realtime-privileges; then
     prompt_install_deps repo realtime-privileges && run_root usermod -aG realtime "$TARGET_USER" 2>/dev/null || true
   fi
@@ -5064,6 +5093,7 @@ run_strata_option() {
 
   while true; do
     refresh_strata_bin
+    refresh_strata_running
     build_strata_options
     total="${#ACTIVE_STRATA_OPTIONS[@]}"
     (( s_idx >= total )) && s_idx=$(( total - 1 ))
@@ -5124,7 +5154,6 @@ run_strata_option() {
         echo ""
         "strata_action_${opt}" || true
         if [[ "$opt" == "benchmark" && "${LAST_BENCH_COMPLETED:-false}" == true ]]; then
-          show_stats_page
           return 0
         fi
         [[ "$opt" != "history" ]] && pause_prompt
@@ -5908,59 +5937,62 @@ for e in reversed(hist_list):
     if rec and rec["key"] not in seen:
         seen.add(rec["key"])
         items.append(rec)
-    if len(items) >= 2:
-        break
 
-# Fill remaining slots from raw results.json files on disk (newest mtime first)
-if len(items) < 2:
-    found_files = []
-    for d in search_dirs:
-        if not os.path.isdir(d):
-            continue
-        for pat in (os.path.join(d, "*", "results.json"), os.path.join(d, "results.json")):
-            for p in glob.glob(pat):
-                try:
-                    found_files.append((os.path.getmtime(p), os.path.realpath(p), p))
-                except Exception:
-                    pass
-    found_files.sort(reverse=True)
-    for _, rp, p in found_files:
-        if rp in seen:
-            continue
-        rec = from_results_file(p, hist_by_file)
-        if rec:
-            seen.add(rp)
-            items.append(rec)
-        if len(items) >= 2:
-            break
+# Include raw results.json files on disk (newest mtime first)
+found_files = []
+for d in search_dirs:
+    if not os.path.isdir(d):
+        continue
+    for pat in (os.path.join(d, "*", "results.json"), os.path.join(d, "results.json")):
+        for p in glob.glob(pat):
+            try:
+                found_files.append((os.path.getmtime(p), os.path.realpath(p), p))
+            except Exception:
+                pass
+found_files.sort(reverse=True)
+for _, rp, p in found_files:
+    if rp in seen:
+        continue
+    rec = from_results_file(p, hist_by_file)
+    if rec:
+        seen.add(rp)
+        items.append(rec)
 
 if not items:
     sys.exit(0)
 
-def fmt_rec(kind, rec, d_pct="", p_pct=""):
+def fmt_rec(kind, rec, d_pct="", p_pct="", prev_d_pct="", prev_p_pct=""):
     dec_s = f"{rec['dec']:.1f} tok/s" if rec["dec"] is not None else "—"
     pre_s = f"{rec['pre']:.1f} tok/s" if rec["pre"] is not None else "—"
     avg_dec_s = f"{rec['avg_dec']:.1f} tok/s" if rec.get("avg_dec") is not None else ""
     avg_pre_s = f"{rec['avg_pre']:.1f} tok/s" if rec.get("avg_pre") is not None else ""
-    cols = [kind, rec["ts"], rec["tag"], rec["model"], dec_s, pre_s, rec["req_s"], rec["qual_s"], rec["sw"], rec["gw"], rec["cw"], d_pct, p_pct, avg_dec_s, avg_pre_s]
+    cols = [kind, rec["ts"], rec["tag"], rec["model"], dec_s, pre_s, rec["req_s"], rec["qual_s"], rec["sw"], rec["gw"], rec["cw"], d_pct, p_pct, avg_dec_s, avg_pre_s, prev_d_pct, prev_p_pct]
     return "|".join(str(c).replace("|", "/").replace("\n", " ").replace("\r", "") for c in cols)
 
-d_pct = ""
-p_pct = ""
-if len(items) >= 2:
-    cur, prev = items[0], items[1]
-    cur_d = cur.get("avg_dec") if cur.get("avg_dec") is not None else cur.get("dec")
-    prev_d = prev.get("avg_dec") if prev.get("avg_dec") is not None else prev.get("dec")
-    cur_p = cur.get("avg_pre") if cur.get("avg_pre") is not None else cur.get("pre")
-    prev_p = prev.get("avg_pre") if prev.get("avg_pre") is not None else prev.get("pre")
-    if cur_d is not None and prev_d is not None and prev_d > 0:
-        d_pct = f"{((cur_d - prev_d) / prev_d) * 100.0:.1f}"
-    if cur_p is not None and prev_p is not None and prev_p > 0:
-        p_pct = f"{((cur_p - prev_p) / prev_p) * 100.0:.1f}"
+def score_key(rec):
+    d = rec.get("avg_dec") if rec.get("avg_dec") is not None else rec.get("dec")
+    p = rec.get("avg_pre") if rec.get("avg_pre") is not None else rec.get("pre")
+    return (d if isinstance(d, (int, float)) else -1.0, p if isinstance(p, (int, float)) else -1.0)
 
-print(fmt_rec("CUR", items[0], d_pct, p_pct))
+def pct_vs_ref(rec, ref_rec):
+    rec_d = rec.get("avg_dec") if rec.get("avg_dec") is not None else rec.get("dec")
+    ref_d = ref_rec.get("avg_dec") if ref_rec.get("avg_dec") is not None else ref_rec.get("dec")
+    rec_p = rec.get("avg_pre") if rec.get("avg_pre") is not None else rec.get("pre")
+    ref_p = ref_rec.get("avg_pre") if ref_rec.get("avg_pre") is not None else ref_rec.get("pre")
+    dp = f"{((rec_d - ref_d) / ref_d) * 100.0:.1f}" if (isinstance(rec_d, (int, float)) and isinstance(ref_d, (int, float)) and ref_d > 0) else ""
+    pp = f"{((rec_p - ref_p) / ref_p) * 100.0:.1f}" if (isinstance(rec_p, (int, float)) and isinstance(ref_p, (int, float)) and ref_p > 0) else ""
+    return dp, pp
+
+best = max(items, key=score_key)
 if len(items) >= 2:
-    print(fmt_rec("PREV", items[1]))
+    cur_dp, cur_pp = pct_vs_ref(items[0], best)
+    cur_prev_dp, cur_prev_pp = pct_vs_ref(items[0], items[1])
+    print(fmt_rec("CUR", items[0], cur_dp, cur_pp, cur_prev_dp, cur_prev_pp))
+    prev_dp, prev_pp = pct_vs_ref(items[1], best)
+    print(fmt_rec("PREV", items[1], prev_dp, prev_pp))
+    print(fmt_rec("BEST", best))
+else:
+    print(fmt_rec("CUR", items[0]))
 PY
 )"
   fi
@@ -5973,13 +6005,15 @@ PY
     return 0
   fi
 
-  local line kind b_ts b_tag b_model b_dec b_pre b_req b_qual b_sw b_gw b_cw b_dpct b_ppct b_avg_dec b_avg_pre
-  while IFS='|' read -r kind b_ts b_tag b_model b_dec b_pre b_req b_qual b_sw b_gw b_cw b_dpct b_ppct b_avg_dec b_avg_pre; do
+  local line kind b_ts b_tag b_model b_dec b_pre b_req b_qual b_sw b_gw b_cw b_dpct b_ppct b_avg_dec b_avg_pre b_pdpct b_pppct
+  while IFS='|' read -r kind b_ts b_tag b_model b_dec b_pre b_req b_qual b_sw b_gw b_cw b_dpct b_ppct b_avg_dec b_avg_pre b_pdpct b_pppct; do
     [[ -n "$kind" ]] || continue
     if [[ "$kind" == "CUR" ]]; then
       STRATA_BENCH_LINES+=("$(printf "%bLatest Benchmark:%b" "${C_BOLD}" "${C_RESET}")")
-    else
+    elif [[ "$kind" == "PREV" ]]; then
       STRATA_BENCH_LINES+=("$(printf "%bPrevious Benchmark:%b" "${C_BOLD}" "${C_RESET}")")
+    else
+      STRATA_BENCH_LINES+=("$(printf "%bBest Benchmark:%b" "${C_BOLD}" "${C_RESET}")")
     fi
     local date_disp="${b_ts:-Unknown}"
     [[ -n "$b_tag" ]] && date_disp+=" (${b_tag})"
@@ -6001,8 +6035,21 @@ PY
       STRATA_BENCH_LINES+=("$(printf "  %-8s %bn/a (not recorded)%b" "Power:" "${C_DIM}" "${C_RESET}")")
     fi
     STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b | Prefill: %b%s%b" "Decode:" "${C_CYAN}" "$b_dec" "${C_RESET}" "${C_CYAN}" "$b_pre" "${C_RESET}")")
-    local has_diff=false
     if [[ "$kind" == "CUR" ]]; then
+      local pdiff_parts=()
+      [[ -n "$b_pdpct" ]] && pdiff_parts+=("Decode $(format_pct_delta "$b_pdpct")")
+      [[ -n "$b_pppct" ]] && pdiff_parts+=("Prefill $(format_pct_delta "$b_pppct")")
+      if (( ${#pdiff_parts[@]} > 0 )); then
+        local pdiff_str="" pdi=0
+        for ((pdi=0; pdi<${#pdiff_parts[@]}; pdi++)); do
+          (( pdi > 0 )) && pdiff_str+=" | "
+          pdiff_str+="${pdiff_parts[$pdi]}"
+        done
+        pdiff_str+=" ${C_DIM}(vs prev)${C_RESET}"
+        STRATA_BENCH_LINES+=("$(printf "  %-8s %b" "Diff:" "$pdiff_str")")
+      fi
+    fi
+    if [[ "$kind" == "CUR" || "$kind" == "PREV" ]]; then
       local diff_parts=()
       [[ -n "$b_dpct" ]] && diff_parts+=("Decode $(format_pct_delta "$b_dpct")")
       [[ -n "$b_ppct" ]] && diff_parts+=("Prefill $(format_pct_delta "$b_ppct")")
@@ -6012,8 +6059,8 @@ PY
           (( di > 0 )) && diff_str+=" | "
           diff_str+="${diff_parts[$di]}"
         done
-        STRATA_BENCH_LINES+=("$(printf "  %-8s %s" "Diff:" "$diff_str")")
-        has_diff=true
+        diff_str+=" ${C_DIM}(vs best)${C_RESET}"
+        STRATA_BENCH_LINES+=("$(printf "  %-8s %b" "Diff:" "$diff_str")")
       fi
     fi
     local summary_tail=""
@@ -6023,9 +6070,7 @@ PY
       summary_tail+="$b_qual"
     fi
     [[ -n "$summary_tail" ]] && STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b" "Checks:" "${C_DIM}" "$summary_tail" "${C_RESET}")")
-    if [[ "$has_diff" == true || -n "$summary_tail" ]]; then
-      STRATA_BENCH_LINES+=("")
-    fi
+    STRATA_BENCH_LINES+=("")
   done <<< "$parsed"
 }
 
@@ -6056,11 +6101,9 @@ print_stats_and_info_grid() {
     done
   }
   collect_strata_stats_lines
-  collect_strata_bench_lines
   _append_grid_section "${SYS_INFO_LINES[@]}"
   _append_grid_section "${LIVE_STAT_LINES[@]}"
   _append_grid_section "${STRATA_STAT_LINES[@]}"
-  _append_grid_section "${STRATA_BENCH_LINES[@]}"
   unset -f _append_grid_section
   LIVE_STATS_COUNT="$total_lines"
   printf "%s\n" "$out"
@@ -6068,12 +6111,23 @@ print_stats_and_info_grid() {
 
 format_stats_toggle_row() {
   local selected="${1:-false}"
-  local ptr=" " tag="[STATS]" title="View Live System, Strata & Benchmark Statistics" sub="(CPU / RAM / GPU / Power / Live tok/s)"
+  local ptr=" " tag="[STATS]" title="View Live System & Strata Statistics" sub="(CPU / RAM / GPU / Power / Live tok/s)"
   if [[ "$selected" == true ]]; then
     ptr="${C_CYAN}>${C_RESET}"
     printf "%b %b%s%b  %b%s%b  %b%s%b" "$ptr" "${C_BGREEN}${C_BOLD}" "$tag" "${C_RESET}" "${C_CYAN}${C_BOLD}" "$title" "${C_RESET}" "${C_CYAN}" "$sub" "${C_RESET}"
   else
     printf "%b %b%s%b  %b%s%b  %b%s%b" "$ptr" "${C_YELLOW}${C_BOLD}" "$tag" "${C_RESET}" "${C_BOLD}" "$title" "${C_RESET}" "${C_DIM}" "$sub" "${C_RESET}"
+  fi
+}
+
+format_strata_toggle_row() {
+  local selected="${1:-false}"
+  local ptr=" " tag="[STRATA]" title="Strata Options & Management" sub="(Install / Update / Service / Benchmark / History)"
+  if [[ "$selected" == true ]]; then
+    ptr="${C_CYAN}>${C_RESET}"
+    printf "%b %b%s%b %b%s%b  %b%s%b" "$ptr" "${C_BGREEN}${C_BOLD}" "$tag" "${C_RESET}" "${C_CYAN}${C_BOLD}" "$title" "${C_RESET}" "${C_CYAN}" "$sub" "${C_RESET}"
+  else
+    printf "%b %b%s%b %b%s%b  %b%s%b" "$ptr" "${C_YELLOW}${C_BOLD}" "$tag" "${C_RESET}" "${C_BOLD}" "$title" "${C_RESET}" "${C_DIM}" "$sub" "${C_RESET}"
   fi
 }
 
@@ -6118,18 +6172,21 @@ print_header() {
   printf "${C_BOLD}${C_CYAN}%*s%s${C_RESET}\n" "$_title_pad" "" "$_title"
   echo -e "${C_BOLD}${C_CYAN}${_hdr_eq}${C_RESET}"
   load_strata_update_state
-  refresh_strata_running
   if [[ "$hdr_mode" == "toggle" ]]; then
     LIVE_STATS_COUNT=0
     LIVE_STAT_LINES=()
     echo ""
-    local _tgl_sel=false
+    local _tgl_sel=false _str_sel=false
     (( INDEX_SELECTED == 0 )) && _tgl_sel=true
+    (( INDEX_SELECTED == 1 )) && _str_sel=true
     printf "%s\n" "$(format_stats_toggle_row "$_tgl_sel")"
     echo ""
-    POST_HEADER_LINES=3
-    UPDATE_BANNER_OFFSET=3
+    printf "%s\n" "$(format_strata_toggle_row "$_str_sel")"
+    echo ""
+    POST_HEADER_LINES=5
+    UPDATE_BANNER_OFFSET=5
   elif [[ "$hdr_mode" == "stats" ]]; then
+    refresh_strata_running
     build_sys_info_lines
     print_stats_and_info_grid false
     POST_HEADER_LINES=2
@@ -6565,9 +6622,8 @@ run_step_view() {
 
 read_choice_with_live_stats() {
   local -n _out_var="$1"
-  local lines_up="$2"
-  local footer_lines="${3:-0}"
-  local toggle_up="${4:-0}"
+  local footer_lines="${2:-0}"
+  local toggle_up="${3:-0}"
   local term_lines=40
   if [[ ! -t 1 || ! -t 0 ]]; then
     read -r -p "Select action: " _out_var || exit 0
@@ -6576,34 +6632,27 @@ read_choice_with_live_stats() {
 
   term_lines="$(tput lines 2>/dev/null || echo 40)"
 
-  local tmp_file="" sampler_pid=""
-  local cur_running_url="$STRATA_RUNNING_URL" cur_svc_active="0"
-  unit_active strata.service && cur_svc_active="1"
-
   local saved_tty=""
   saved_tty="$(stty -g 2>/dev/null || true)"
   stty -echo 2>/dev/null || true
 
-  _cleanup_live_sampler() {
-    [[ -n "$sampler_pid" ]] && { kill "$sampler_pid" 2>/dev/null || true; wait "$sampler_pid" 2>/dev/null || true; sampler_pid=""; }
-    [[ -n "$tmp_file" ]] && { rm -f "$tmp_file" "${tmp_file}.tmp" "${tmp_file}.bar" "${tmp_file}.bar.tmp" "${tmp_file}.meta" "${tmp_file}.meta.tmp" 2>/dev/null || true; tmp_file=""; }
-    ACTIVE_SAMPLER_PID="" ACTIVE_SAMPLER_TMP=""
+  _restore_index_tty() {
     if [[ -n "$saved_tty" ]]; then
       stty "$saved_tty" 2>/dev/null || stty echo 2>/dev/null || true
     else
       stty echo 2>/dev/null || true
     fi
   }
-  trap '_cleanup_live_sampler; exit 0' INT TERM
+  trap '_restore_index_tty; exit 0' INT TERM
 
-  local buf="" ch="" rc=0 stats_block=""
+  local buf="" ch="" rc=0 init_upd="$STRATA_UPDATE_AVAILABLE"
   printf "Select action: "
   while true; do
     rc=0
     IFS= read -rsn1 -t 1 ch || rc=$?
     if (( rc == 0 )); then
       if [[ -z "$ch" ]]; then
-        _cleanup_live_sampler
+        _restore_index_tty
         trap - INT TERM
         printf "\n"
         _out_var="$buf"
@@ -6629,8 +6678,8 @@ read_choice_with_live_stats() {
             [[ "$_esc_ch" =~ [A-Za-z~] ]] && break
           done
         fi
-        local n_opt="${#ACTIVE_STEPS[@]}" n_str="${#ACTIVE_STRATA_OPTIONS[@]}"
-        local total_rows=$(( 1 + n_opt + n_str ))
+        local n_opt="${#ACTIVE_STEPS[@]}"
+        local total_rows=$(( 2 + n_opt ))
         if (( footer_lines > 0 && total_rows > 0 )); then
           local old_idx="$INDEX_SELECTED" new_idx="$INDEX_SELECTED"
           if [[ "$esc_seq" == "[A" || "$esc_seq" == "OA" ]]; then
@@ -6641,8 +6690,8 @@ read_choice_with_live_stats() {
           if (( new_idx != old_idx )); then
             INDEX_SELECTED="$new_idx"
             local old_up new_up
-            old_up="$(index_row_up_offset "$old_idx" "$n_opt" "$n_str" "$footer_lines" "$toggle_up")"
-            new_up="$(index_row_up_offset "$new_idx" "$n_opt" "$n_str" "$footer_lines" "$toggle_up")"
+            old_up="$(index_row_up_offset "$old_idx" "$n_opt" 0 "$footer_lines" "$toggle_up")"
+            new_up="$(index_row_up_offset "$new_idx" "$n_opt" 0 "$footer_lines" "$toggle_up")"
             if (( old_up < term_lines && new_up < term_lines )); then
               local old_row new_row
               old_row="$(render_any_index_row "$old_idx" false)"
@@ -6650,7 +6699,7 @@ read_choice_with_live_stats() {
               printf "\033[?2026h\033[?25l\033[s\033[%dA\r\033[2K%s\033[u\033[s\033[%dA\r\033[2K%s\033[u\033[?25h\033[?2026l" \
                 "$old_up" "$old_row" "$new_up" "$new_row"
             else
-              _cleanup_live_sampler
+              _restore_index_tty
               trap - INT TERM
               printf "\n"
               _out_var="__refresh__"
@@ -6661,11 +6710,7 @@ read_choice_with_live_stats() {
       else
         local accept=false
         if [[ -z "$buf" ]]; then
-          if [[ "$ch" =~ ^[wWuUhHaAxXrRqQsS]$ ]] || [[ "$ch" =~ ^[1-9]$ ]]; then
-            accept=true
-          fi
-        elif [[ "$buf" =~ ^[sS]$ ]]; then
-          if [[ "$ch" =~ ^[1-9]$ ]] && (( 10#$ch <= ${#ACTIVE_STRATA_OPTIONS[@]} )); then
+          if [[ "$ch" =~ ^[wWcCuUhHaAxXrRqQ]$ ]] || [[ "$ch" =~ ^[1-9]$ ]]; then
             accept=true
           fi
         elif [[ "$buf" =~ ^[0-9]{1,2}$ ]] && [[ "$ch" =~ ^[0-9]$ ]]; then
@@ -6678,58 +6723,21 @@ read_choice_with_live_stats() {
         fi
       fi
     elif (( rc > 128 )); then
-      local prev_upd="$STRATA_UPDATE_AVAILABLE"
       load_strata_update_state
-      if [[ "$prev_upd" == false && "$STRATA_UPDATE_AVAILABLE" == true ]]; then
+      if [[ "$init_upd" == false && "$STRATA_UPDATE_AVAILABLE" == true ]]; then
         local _b_up=$(( toggle_up - UPDATE_BANNER_OFFSET ))
-        if ! _render_update_banner_inplace "$_b_up" "$term_lines" && [[ -z "$buf" ]]; then
-          _cleanup_live_sampler
+        if _render_update_banner_inplace "$_b_up" "$term_lines"; then
+          init_upd=true
+        elif [[ -z "$buf" ]]; then
+          _restore_index_tty
           trap - INT TERM
           printf "\n"
           _out_var="__refresh__"
           return 0
         fi
       fi
-      local new_lines="$LIVE_STATS_COUNT" new_running_url="$cur_running_url" new_svc_active="$cur_svc_active"
-      if [[ -n "$tmp_file" && -s "${tmp_file}.meta" ]]; then
-        IFS='|' read -r new_lines new_running_url new_svc_active < "${tmp_file}.meta" || true
-      fi
-      if [[ "$new_lines" =~ ^[0-9]+$ ]] && (( new_lines != LIVE_STATS_COUNT )); then
-        if [[ -z "$buf" ]]; then
-          _cleanup_live_sampler
-          trap - INT TERM
-          printf "\n"
-          _out_var="__refresh__"
-          return 0
-        fi
-      else
-        if [[ -n "$tmp_file" && -s "$tmp_file" ]]; then
-          stats_block="$(<"$tmp_file")"
-          _render_live_stats_inplace "$lines_up" "$term_lines" "$stats_block"
-        fi
-      fi
-      if [[ "$new_running_url" != "$cur_running_url" || "$new_svc_active" != "$cur_svc_active" ]]; then
-          cur_running_url="$new_running_url"
-          cur_svc_active="$new_svc_active"
-          STRATA_RUNNING_URL="$new_running_url"
-          local n_opt="${#ACTIVE_STEPS[@]}" n_str="${#ACTIVE_STRATA_OPTIONS[@]}" s_i abs_i row_up row_str is_sel
-          if (( footer_lines > 0 && n_str > 0 )); then
-            for (( s_i = 0; s_i < n_str; s_i++ )); do
-              if [[ "${ACTIVE_STRATA_OPTIONS[$s_i]}" == "service" || "${ACTIVE_STRATA_OPTIONS[$s_i]}" == "benchmark" ]]; then
-                abs_i=$(( 1 + n_opt + s_i ))
-                row_up="$(index_row_up_offset "$abs_i" "$n_opt" "$n_str" "$footer_lines" "$toggle_up")"
-                if (( row_up > 0 && row_up < term_lines )); then
-                  is_sel=false
-                  (( abs_i == INDEX_SELECTED )) && is_sel=true
-                  row_str="$(render_any_index_row "$abs_i" "$is_sel")"
-                  printf "\033[?2026h\033[?25l\033[s\033[%dA\r\033[2K%s\033[u\033[?25h\033[?2026l" "$row_up" "$row_str"
-                fi
-              fi
-            done
-          fi
-        fi
     else
-      _cleanup_live_sampler
+      _restore_index_tty
       trap - INT TERM
       printf "\n"
       exit 0
@@ -6847,13 +6855,12 @@ format_strata_row() {
 
 render_any_index_row() {
   local idx="$1" selected="${2:-false}"
-  local n_opt="${#ACTIVE_STEPS[@]}"
   if (( idx == 0 )); then
     format_stats_toggle_row "$selected"
-  elif (( idx <= n_opt )); then
-    format_index_row "$((idx - 1))" "$selected"
+  elif (( idx == 1 )); then
+    format_strata_toggle_row "$selected"
   else
-    format_strata_row "$((idx - 1 - n_opt))" "$selected"
+    format_index_row "$((idx - 2))" "$selected"
   fi
 }
 
@@ -6861,13 +6868,12 @@ index_row_up_offset() {
   local idx="$1" n_opt="$2" n_str="$3" footer_menu_lines="$4" toggle_up="${5:-0}"
   if (( idx == 0 )); then
     echo "$toggle_up"
-  elif (( idx <= n_opt )); then
-    local o_idx=$(( idx - 1 ))
-    # Below opt table: blank + legend + blank + Strata title + blank + header + sep (7 lines) + n_str rows + footer_menu_lines
-    echo $(( (n_opt - o_idx) + 7 + n_str + footer_menu_lines ))
+  elif (( idx == 1 )); then
+    echo $(( toggle_up - 2 ))
   else
-    local s_idx=$(( idx - 1 - n_opt ))
-    echo $(( (n_str - s_idx) + footer_menu_lines ))
+    local o_idx=$(( idx - 2 ))
+    # Below opt table: blank + legend (2 lines) + footer_menu_lines
+    echo $(( (n_opt - o_idx) + 2 + footer_menu_lines ))
   fi
 }
 
@@ -6895,12 +6901,279 @@ show_stats_page() {
   done
 }
 
+STRATA_PAGE_SELECTED=0
+
+read_strata_page_choice() {
+  local -n _out_var="$1"
+  local footer_lines="${2:-0}"
+  local n_str="${#ACTIVE_STRATA_OPTIONS[@]}"
+  if [[ ! -t 1 || ! -t 0 ]]; then
+    read -r -p "Select action: " _out_var || exit 0
+    return 0
+  fi
+
+  local term_lines=40
+  term_lines="$(tput lines 2>/dev/null || echo 40)"
+
+  local init_upd="$STRATA_UPDATE_AVAILABLE"
+  local cur_running_url="$STRATA_RUNNING_URL" cur_running_preset="$STRATA_RUNNING_PRESET" cur_svc_active="0"
+  unit_active strata.service && cur_svc_active="1"
+
+  local tmp_file="" poller_pid=""
+  tmp_file="$(mktemp /tmp/strata-page.XXXXXX 2>/dev/null || echo "")"
+  if [[ -n "$tmp_file" ]]; then
+    (
+      trap 'exit 0' TERM INT
+      while true; do
+        sleep 2 &
+        wait $! 2>/dev/null || exit 0
+        refresh_strata_running
+        local _svc="0"
+        unit_active strata.service && _svc="1"
+        printf '%s|%s|%s\n' "$STRATA_RUNNING_URL" "$STRATA_RUNNING_PRESET" "$_svc" > "${tmp_file}.tmp" 2>/dev/null || true
+        mv -f "${tmp_file}.tmp" "$tmp_file" 2>/dev/null || true
+      done
+    ) &
+    poller_pid=$!
+    ACTIVE_SAMPLER_PID="$poller_pid"
+    ACTIVE_SAMPLER_TMP="$tmp_file"
+  fi
+
+  local saved_tty=""
+  saved_tty="$(stty -g 2>/dev/null || true)"
+  stty -echo 2>/dev/null || true
+
+  _cleanup_strata_tty() {
+    [[ -n "$poller_pid" ]] && { kill "$poller_pid" 2>/dev/null || true; wait "$poller_pid" 2>/dev/null || true; poller_pid=""; }
+    [[ -n "$tmp_file" ]] && { rm -f "$tmp_file" "${tmp_file}.tmp" 2>/dev/null || true; tmp_file=""; }
+    ACTIVE_SAMPLER_PID="" ACTIVE_SAMPLER_TMP=""
+    if [[ -n "$saved_tty" ]]; then
+      stty "$saved_tty" 2>/dev/null || stty echo 2>/dev/null || true
+    else
+      stty echo 2>/dev/null || true
+    fi
+  }
+  trap '_cleanup_strata_tty; exit 0' INT TERM
+
+  local buf="" ch="" rc=0
+  printf "Select action: "
+  while true; do
+    rc=0
+    IFS= read -rsn1 -t 1 ch || rc=$?
+    if (( rc == 0 )); then
+      if [[ -z "$ch" ]]; then
+        _cleanup_strata_tty
+        trap - INT TERM
+        printf "\n"
+        _out_var="$buf"
+        return 0
+      elif [[ "$ch" == $'\177' || "$ch" == $'\b' ]]; then
+        if [[ -n "$buf" ]]; then
+          buf="${buf%?}"
+          printf "\b \b"
+        fi
+      elif [[ "$ch" == $'\e' ]]; then
+        local esc_seq=""
+        IFS= read -rsn2 -t 0.01 esc_seq || true
+        if [[ -z "$esc_seq" ]]; then
+          if [[ -n "$buf" ]]; then
+            while [[ -n "$buf" ]]; do
+              buf="${buf%?}"
+              printf "\b \b"
+            done
+            continue
+          fi
+          _cleanup_strata_tty
+          trap - INT TERM
+          printf "\n"
+          _out_var="__esc__"
+          return 0
+        fi
+        if [[ "$esc_seq" == \[* || "$esc_seq" == O* ]] && [[ ! "$esc_seq" =~ [A-Za-z~]$ ]]; then
+          local _esc_ch="" _esc_n=0
+          while (( _esc_n++ < 8 )) && IFS= read -rsn1 -t 0.01 _esc_ch; do
+            [[ "$_esc_ch" =~ [A-Za-z~] ]] && break
+          done
+        fi
+        if (( footer_lines > 0 && n_str > 0 )); then
+          local old_idx="$STRATA_PAGE_SELECTED" new_idx="$STRATA_PAGE_SELECTED"
+          if [[ "$esc_seq" == "[A" || "$esc_seq" == "OA" ]]; then
+            new_idx=$(( (old_idx - 1 + n_str) % n_str ))
+          elif [[ "$esc_seq" == "[B" || "$esc_seq" == "OB" ]]; then
+            new_idx=$(( (old_idx + 1) % n_str ))
+          fi
+          if (( new_idx != old_idx )); then
+            STRATA_PAGE_SELECTED="$new_idx"
+            local old_up=$(( (n_str - old_idx) + footer_lines ))
+            local new_up=$(( (n_str - new_idx) + footer_lines ))
+            if (( old_up < term_lines && new_up < term_lines )); then
+              local old_row new_row
+              old_row="$(format_strata_row "$old_idx" false)"
+              new_row="$(format_strata_row "$new_idx" true)"
+              printf "\033[?2026h\033[?25l\033[s\033[%dA\r\033[2K%s\033[u\033[s\033[%dA\r\033[2K%s\033[u\033[?25h\033[?2026l" \
+                "$old_up" "$old_row" "$new_up" "$new_row"
+            else
+              _cleanup_strata_tty
+              trap - INT TERM
+              printf "\n"
+              _out_var="__refresh__"
+              return 0
+            fi
+          fi
+        fi
+      else
+        local accept=false
+        if [[ -z "$buf" ]]; then
+          if [[ "$ch" =~ ^[uUhHiIbBqQsS]$ ]] || { [[ "$ch" =~ ^[1-9]$ ]] && (( 10#$ch <= n_str )); }; then
+            accept=true
+          fi
+        elif [[ "$buf" =~ ^[sS]$ ]]; then
+          if [[ "$ch" =~ ^[1-9]$ ]] && (( 10#$ch <= n_str )); then
+            accept=true
+          fi
+        fi
+        if [[ "$accept" == true ]]; then
+          buf+="$ch"
+          printf "%s" "$ch"
+        fi
+      fi
+    elif (( rc > 128 )); then
+      load_strata_update_state
+      if [[ "$init_upd" == false && "$STRATA_UPDATE_AVAILABLE" == true ]] && [[ -z "$buf" ]]; then
+        _cleanup_strata_tty
+        trap - INT TERM
+        printf "\n"
+        _out_var="__refresh__"
+        return 0
+      fi
+      if [[ -n "$tmp_file" && -s "$tmp_file" ]]; then
+        local new_running_url="$cur_running_url" new_running_preset="$cur_running_preset" new_svc_active="$cur_svc_active"
+        IFS='|' read -r new_running_url new_running_preset new_svc_active < "$tmp_file" || true
+        if [[ "$new_running_url" != "$cur_running_url" || "$new_running_preset" != "$cur_running_preset" || "$new_svc_active" != "$cur_svc_active" ]]; then
+          cur_running_url="$new_running_url"
+          cur_running_preset="$new_running_preset"
+          cur_svc_active="$new_svc_active"
+          STRATA_RUNNING_URL="$new_running_url"
+          STRATA_RUNNING_PRESET="$new_running_preset"
+          local s_i row_up row_str is_sel
+          for (( s_i = 0; s_i < n_str; s_i++ )); do
+            if [[ "${ACTIVE_STRATA_OPTIONS[$s_i]}" == "service" || "${ACTIVE_STRATA_OPTIONS[$s_i]}" == "benchmark" ]]; then
+              row_up=$(( (n_str - s_i) + footer_lines ))
+              if (( row_up > 0 && row_up < term_lines )); then
+                is_sel=false
+                (( s_i == STRATA_PAGE_SELECTED )) && is_sel=true
+                row_str="$(format_strata_row "$s_i" "$is_sel")"
+                printf "\033[?2026h\033[?25l\033[s\033[%dA\r\033[2K%s\033[u\033[?25h\033[?2026l" "$row_up" "$row_str"
+              fi
+            fi
+          done
+        fi
+      fi
+    else
+      _cleanup_strata_tty
+      trap - INT TERM
+      printf "\n"
+      exit 0
+    fi
+  done
+}
+
+show_strata_options_page() {
+  while true; do
+    refresh_strata_bin
+    refresh_strata_running
+    build_strata_options
+    local n_str="${#ACTIVE_STRATA_OPTIONS[@]}"
+    if (( n_str == 0 )); then
+      STRATA_PAGE_SELECTED=0
+    elif (( STRATA_PAGE_SELECTED >= n_str )); then
+      STRATA_PAGE_SELECTED=$(( n_str - 1 ))
+    elif (( STRATA_PAGE_SELECTED < 0 )); then
+      STRATA_PAGE_SELECTED=0
+    fi
+    print_header
+
+    collect_strata_bench_lines
+    local body="" _sl
+    for _sl in "${STRATA_BENCH_LINES[@]}"; do
+      body+="${_sl}"$'\n'
+    done
+    if (( ${#STRATA_BENCH_LINES[@]} > 0 )) && [[ -n "${STRATA_BENCH_LINES[-1]}" ]]; then
+      body+=$'\n'
+    fi
+    body+="$(echo -e "${C_BOLD}Strata Options:${C_RESET}")"$'\n\n'
+    body+="$(printf "  ${C_BOLD}%-3s | %-15s | %s${C_RESET}" "#" "Status" "Option")"$'\n'
+    body+="$(printf "  %s" "----+-----------------+-------------------------------------------------------")"$'\n'
+    local s_idx
+    for (( s_idx = 0; s_idx < n_str; s_idx++ )); do
+      if (( s_idx == STRATA_PAGE_SELECTED )); then
+        body+="$(format_strata_row "$s_idx" true)"$'\n'
+      else
+        body+="$(format_strata_row "$s_idx" false)"$'\n'
+      fi
+    done
+
+    local footer_lines=5 hist_count s_range="s1" num_range="1"
+    (( n_str > 1 )) && { s_range="s1-${n_str}"; num_range="1-${n_str}"; }
+    hist_count="$(count_bench_history)"
+    body+=$'\n'"$(echo -e "  ${C_BOLD}[${s_range} / ${num_range} / ↑↓+Enter]${C_RESET} Select an option")"$'\n'
+    if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
+      body+="$(echo -e "  ${C_BGREEN}[u]${C_RESET} Install Strata update (${STRATA_UPDATE_SUMMARY})")"$'\n'
+      ((footer_lines++))
+    fi
+    if (( hist_count > 0 )); then
+      body+="$(echo -e "  ${C_CYAN}[h]${C_RESET} Benchmark history & restore coupled options (${hist_count})")"$'\n'
+      ((footer_lines++))
+    fi
+    body+="$(echo -e "  ${C_DIM}[i / b / Esc]${C_RESET} Back to Index")"$'\n'
+    body+="$(echo -e "  ${C_BOLD}[q]${C_RESET} Quit")"$'\n\n'
+
+    printf "%s" "$body"
+    local choice=""
+    read_strata_page_choice choice "$footer_lines"
+    case "$choice" in
+      __refresh__) ;;
+      __esc__|i|I|b|B) return 0 ;;
+      "")
+        (( STRATA_PAGE_SELECTED >= 0 && STRATA_PAGE_SELECTED < n_str )) && run_strata_option "${ACTIVE_STRATA_OPTIONS[$STRATA_PAGE_SELECTED]}"
+        ;;
+      u|U)
+        if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
+          run_strata_option "update" true
+        else
+          echo -e "${C_YELLOW}No Strata update available.${C_RESET}"; sleep 1
+        fi
+        ;;
+      h|H) show_benchmark_history ;;
+      q|Q) exit 0 ;;
+      s[1-9]|S[1-9])
+        local sn=$(( 10#${choice:1} - 1 ))
+        if (( sn >= 0 && sn < n_str )); then
+          run_strata_option "${ACTIVE_STRATA_OPTIONS[$sn]}"
+        else
+          echo -e "${C_RED}Invalid choice '${choice}'. Cancelled.${C_RESET}"; sleep 1
+        fi
+        ;;
+      [1-9])
+        local sn=$(( 10#$choice - 1 ))
+        if (( sn >= 0 && sn < n_str )); then
+          run_strata_option "${ACTIVE_STRATA_OPTIONS[$sn]}"
+        else
+          echo -e "${C_RED}Invalid choice '${choice}'. Cancelled.${C_RESET}"; sleep 1
+        fi
+        ;;
+      *)
+        echo -e "${C_RED}Invalid choice '${choice}'. Cancelled.${C_RESET}"; sleep 1
+        ;;
+    esac
+  done
+}
+
 show_index() {
   while true; do
     refresh_strata_bin
     build_active_steps
-    build_strata_options
-    local total_rows=$(( 1 + ${#ACTIVE_STEPS[@]} + ${#ACTIVE_STRATA_OPTIONS[@]} ))
+    local total_rows=$(( 2 + ${#ACTIVE_STEPS[@]} ))
     if (( total_rows == 0 )); then
       INDEX_SELECTED=0
     elif (( INDEX_SELECTED >= total_rows )); then
@@ -6922,7 +7195,7 @@ show_index() {
     body+="$(printf "  %s" "----+---------------+----------------------------------------------------------------------------+-----------+-----")"$'\n'
     local idx
     for (( idx = 0; idx < ${#ACTIVE_STEPS[@]}; idx++ )); do
-      if (( idx + 1 == INDEX_SELECTED )); then
+      if (( idx + 2 == INDEX_SELECTED )); then
         body+="$(format_index_row "$idx" true)"$'\n'
       else
         body+="$(format_index_row "$idx" false)"$'\n'
@@ -6934,23 +7207,10 @@ show_index() {
     fi
     body+=$'\n'"$(echo -e "$legend_line")"$'\n'
 
-    body+=$'\n'"$(echo -e "${C_BOLD}Strata Options:${C_RESET}")"$'\n\n'
-    body+="$(printf "  ${C_BOLD}%-3s | %-15s | %s${C_RESET}" "#" "Status" "Option")"$'\n'
-    body+="$(printf "  %s" "----+-----------------+-------------------------------------------------------")"$'\n'
-    local s_idx abs_idx
-    for (( s_idx = 0; s_idx < ${#ACTIVE_STRATA_OPTIONS[@]}; s_idx++ )); do
-      abs_idx=$(( 1 + ${#ACTIVE_STEPS[@]} + s_idx ))
-      if (( abs_idx == INDEX_SELECTED )); then
-        body+="$(format_strata_row "$s_idx" true)"$'\n'
-      else
-        body+="$(format_strata_row "$s_idx" false)"$'\n'
-      fi
-    done
-
-    local footer_lines=8 hist_count s_range="s1"
-    (( ${#ACTIVE_STRATA_OPTIONS[@]} > 1 )) && s_range="s1-${#ACTIVE_STRATA_OPTIONS[@]}"
+    local footer_lines=9 hist_count
     hist_count="$(count_bench_history)"
     body+=$'\n'"$(echo -e "  ${C_BOLD}[w]${C_RESET} Start guided wizard from Step 1")"$'\n'
+    body+="$(echo -e "  ${C_CYAN}[c]${C_RESET} Check / detection summary (read-only)")"$'\n'
     if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
       body+="$(echo -e "  ${C_BGREEN}[u]${C_RESET} Install Strata update (${STRATA_UPDATE_SUMMARY})")"$'\n'
       ((footer_lines++))
@@ -6963,7 +7223,7 @@ show_index() {
     [[ "$DISTRO_FAMILY" != "arch" ]] && rec_excl="excludes high-idle-power and experimental options"
     body+="$(echo -e "  ${C_GREEN}[a]${C_RESET} Apply all recommended optimizations (${rec_excl})")"$'\n'
     body+="$(echo -e "  ${C_RED}[x]${C_RESET} Revert all recommended optimizations")"$'\n'
-    body+="$(echo -e "  ${C_BOLD}[1-${#ACTIVE_STEPS[@]}, ${s_range} / ↑↓+Enter]${C_RESET} Select an option")"$'\n'
+    body+="$(echo -e "  ${C_BOLD}[1-${#ACTIVE_STEPS[@]} / ↑↓+Enter]${C_RESET} Select an option")"$'\n'
     body+="$(echo -e "  ${C_BOLD}[r]${C_RESET} Reboot system")"$'\n'
     body+="$(echo -e "  ${C_BOLD}[q]${C_RESET} Quit")"$'\n\n'
 
@@ -6971,20 +7231,20 @@ show_index() {
     local body_lines toggle_up
     body_lines="$(printf "%s" "$body" | wc -l)"
     toggle_up=$(( 1 + POST_HEADER_LINES + body_lines ))
-    read_choice_with_live_stats choice 0 "$footer_lines" "$toggle_up"
+    read_choice_with_live_stats choice "$footer_lines" "$toggle_up"
 
     case "$choice" in
       __refresh__) ;;
       "")
         if (( INDEX_SELECTED == 0 )); then
           show_stats_page
-        elif (( INDEX_SELECTED <= ${#ACTIVE_STEPS[@]} )); then
-          run_step_view $(( INDEX_SELECTED - 1 )) "single"
+        elif (( INDEX_SELECTED == 1 )); then
+          show_strata_options_page
         else
-          local sel_s=$(( INDEX_SELECTED - 1 - ${#ACTIVE_STEPS[@]} ))
-          (( sel_s >= 0 && sel_s < ${#ACTIVE_STRATA_OPTIONS[@]} )) && run_strata_option "${ACTIVE_STRATA_OPTIONS[$sel_s]}"
+          run_step_view $(( INDEX_SELECTED - 2 )) "single"
         fi
         ;;
+      c|C) show_check_page ;;
       u|U)
         if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
           run_strata_option "update" true
@@ -7001,14 +7261,6 @@ show_index() {
         sleep 1
         ;;
       q|Q) exit 0 ;;
-      s[1-9]|S[1-9])
-        local sn=$(( 10#${choice:1} - 1 ))
-        if (( sn >= 0 && sn < ${#ACTIVE_STRATA_OPTIONS[@]} )); then
-          run_strata_option "${ACTIVE_STRATA_OPTIONS[$sn]}"
-        else
-          echo -e "${C_RED}Invalid choice '${choice}'. Cancelled.${C_RESET}"; sleep 1
-        fi
-        ;;
       *)
         if [[ "$choice" =~ ^[0-9]+$ ]] && (( ${#choice} <= 3 && 10#$choice >= 1 && 10#$choice <= ${#ACTIVE_STEPS[@]} )); then
           run_step_view $((10#$choice - 1)) "single"
@@ -7039,7 +7291,155 @@ cleanup_all_on_exit() {
   fi
 }
 
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [OPTIONS]
+
+Interactive TUI wizard to inspect, apply, and revert host-level performance
+optimizations for running Strata LLM inference.
+
+Options:
+  --check       Run hardware, OS, Strata, and step-applicability detection in
+                read-only mode, print a summary, and exit without modifying
+                the system or prompting for sudo.
+  -h, --help    Show this help message and exit.
+EOF
+}
+
+print_check_summary() {
+  build_active_steps
+
+  local init_desc="systemd"
+  [[ "$HAS_SYSTEMD" != true ]] && init_desc="non-systemd"
+  local platform_tags=()
+  [[ "$IS_UNRAID" == true ]] && platform_tags+=("Unraid")
+  [[ "$IS_TRUENAS" == true ]] && platform_tags+=("TrueNAS")
+  [[ "$IS_SYNOLOGY" == true ]] && platform_tags+=("Synology")
+  [[ "$IS_JETSON" == true ]] && platform_tags+=("Jetson")
+  [[ -n "$IS_VIRT" ]] && platform_tags+=("VM:${IS_VIRT}")
+  local tag_str=""
+  [[ ${#platform_tags[@]} -gt 0 ]] && tag_str=" (${platform_tags[*]})"
+
+  local strata_desc="not detected"
+  if [[ -n "$STRATA_BIN" ]]; then
+    strata_desc="installed (${STRATA_VERSION:-unknown} at ${STRATA_BIN})"
+  elif [[ -n "$STRATA_DOCKER_CONTAINER" ]]; then
+    local memlock_st="not set (pass --ulimit memlock=-1:-1)"
+    status_memlock_realtime && memlock_st="unlimited (-1:-1)"
+    local img_part=""
+    [[ -n "$STRATA_DOCKER_IMAGE" ]] && img_part=", image: ${STRATA_DOCKER_IMAGE}"
+    strata_desc="Docker container (${STRATA_DOCKER_CONTAINER}${img_part}, memlock: ${memlock_st})"
+  fi
+
+  echo -e "${C_BOLD}System:${C_RESET}"
+  echo "  OS:       ${OS_PRETTY:-Unknown} (family: ${DISTRO_FAMILY}, kernel: ${KERNEL_VER:-unknown})"
+  echo "  Init:     ${init_desc}${tag_str}"
+  echo "  CPU:      ${CPU_SUMMARY:-Unknown} (sockets: ${CPU_SOCKETS}, NUMA nodes: ${NUMA_NODES})"
+  echo "  RAM:      ${RAM_GB} GiB${RAM_DETAILS}"
+  echo "  GPU(s):   ${GPU_SUMMARY:-Unknown}"
+  if [[ "$HAS_NVIDIA" == true && ${#NVIDIA_GPU_INDICES[@]} -gt 0 ]]; then
+    local i
+    for (( i = 0; i < ${#NVIDIA_GPU_INDICES[@]}; i++ )); do
+      local pl_info="PL n/a"
+      if [[ "${NVIDIA_GPU_PL_SUPPORTED[$i]}" == true ]]; then
+        pl_info="PL ${NVIDIA_GPU_CUR_PL[$i]}W (default ${NVIDIA_GPU_DEF_PL[$i]}W, max ${NVIDIA_GPU_MAX_PL[$i]}W)"
+      fi
+      echo "    NVIDIA[${NVIDIA_GPU_INDICES[$i]}]: ${NVIDIA_GPU_NAMES[$i]} (${NVIDIA_GPU_VRAM[$i]} MiB, ${pl_info}, compute=${NVIDIA_GPU_COMPUTE_MODE[$i]})"
+    done
+  fi
+  local _hl
+  for _hl in "${RAM_HEALTH_LINES[@]}" "${GPU_TOPO_LINES[@]}"; do
+    [[ -n "$_hl" ]] && printf "  %s\n" "$_hl"
+  done
+  echo "  Strata:   ${strata_desc}"
+  echo ""
+  echo -e "${C_BOLD}Applicable Steps (${#ACTIVE_STEPS[@]}):${C_RESET}"
+
+  local applied_count=0 rec_pending=0 opt_pending=0
+  local idx=1 step pts title status_lbl note_lbl
+  for step in "${ACTIVE_STEPS[@]}"; do
+    pts="${STEP_GAIN_PTS[$step]:-1}"
+    title="$("title_${step}")"
+    note_lbl=""
+    if is_experimental_step "$step"; then
+      note_lbl=" [EXP]"
+    elif ! is_recommended_step "$step"; then
+      note_lbl=" [opt-in]"
+    fi
+
+    if "status_${step}"; then
+      status_lbl="${C_GREEN}[APPLIED]${C_RESET}    "
+      ((applied_count++))
+    elif is_recommended_step "$step"; then
+      status_lbl="${C_YELLOW}[WOULD APPLY]${C_RESET}"
+      ((rec_pending++))
+    else
+      status_lbl="${C_DIM}[SKIPPED]${C_RESET}    "
+      ((opt_pending++))
+    fi
+
+    echo -e "  $(printf '%2d' "$idx")) ${status_lbl} [${pts}★] ${title}${C_DIM}${note_lbl}${C_RESET}"
+    ((idx++))
+  done
+
+  echo ""
+  echo "Summary: ${applied_count} applied, ${rec_pending} recommended to apply, ${opt_pending} optional/excluded."
+}
+
+run_check_mode() {
+  echo -e "${C_BOLD}Strata Host Performance Setup — Read-Only Check${C_RESET}"
+  echo ""
+  print_check_summary
+  echo -e "${C_DIM}Read-only check complete. No changes were made to the system.${C_RESET}"
+}
+
+show_check_page() {
+  while true; do
+    refresh_strata_bin
+    print_header
+    local body=""
+    body+="$(echo -e "${C_BOLD}Read-Only Detection & Applicability Summary${C_RESET}")"$'\n\n'
+    body+="$(print_check_summary)"$'\n\n'
+    body+="$(echo -e "  ${C_DIM}Read-only summary. Press ${C_BOLD}[i / b / Enter / Esc]${C_RESET}${C_DIM} to return to Index, or ${C_BOLD}[q]${C_RESET}${C_DIM} to Quit.${C_RESET}")"$'\n\n'
+    printf "%s" "$body"
+    local body_lines lines_up action=""
+    body_lines="$(printf "%s" "$body" | wc -l)"
+    lines_up=$(( LIVE_STATS_COUNT + POST_HEADER_LINES + body_lines ))
+    read_step_action action "$lines_up"
+    case "$action" in
+      __refresh__) ;;
+      __esc__|""|b|B|i|I) return 0 ;;
+      q|Q) exit 0 ;;
+      u|U)
+        if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
+          run_strata_option "update" true
+        fi
+        ;;
+      *) ;;
+    esac
+  done
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --check) CHECK_ONLY=true ;;
+    -h|--help) usage; exit 0 ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
 trap 'cleanup_all_on_exit' EXIT
+if [[ "$CHECK_ONLY" == true ]]; then
+  detect_environment
+  run_check_mode
+  exit 0
+fi
+
 if [[ $EUID -ne 0 && -t 0 ]] && command -v sudo >/dev/null 2>&1 && ! sudo -n true >/dev/null 2>&1; then
   echo -e "${C_DIM}Sudo access is used for hardware sensors (RAPL CPU power, DMI RAM info) and applying optimizations.${C_RESET}"
   sudo -v || true

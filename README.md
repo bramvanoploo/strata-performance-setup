@@ -42,6 +42,14 @@ chmod +x strata-performance-setup.sh
 ./strata-performance-setup.sh
 ```
 
+### Read-only detection check (`--check`)
+
+Inspect detected OS/init, hardware, Strata installation or Docker container, and which optimization steps would apply without prompting for `sudo` or making any changes:
+
+```bash
+./strata-performance-setup.sh --check
+```
+
 ---
 
 ## Documentation
