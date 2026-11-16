@@ -29,6 +29,8 @@ TARGET_USER="${SUDO_USER:-${USER:-$(id -un)}}"
 TARGET_HOME="$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6 || true)"
 [[ -n "$TARGET_HOME" ]] || TARGET_HOME="$HOME"
 STRATA_BIN="" STRATA_VERSION="" STRATA_RUNNING_PRESET="" STRATA_RUNNING_URL="" STRATA_DOCKER_CONTAINER="" STRATA_DOCKER_IMAGE=""
+STRATA_API_KEY="${STRATA_API_KEY:-}"
+[[ -n "$STRATA_API_KEY" ]] && export STRATA_API_KEY
 CHECK_ONLY=false
 DISTRO_FAMILY="unknown" DISTRO_ID="unknown" OS_PRETTY="" KERNEL_VER="" AUR_HELPER="" HAS_SYSTEMD=true IS_UNRAID=false IS_TRUENAS=false IS_SYNOLOGY=false
 HAS_NVIDIA=false HAS_NVIDIA_POWERD=false HAS_AMD=false HAS_INTEL_GPU=false HAS_INTEL_ARC=false
@@ -68,29 +70,33 @@ run_root() {
 }
 
 run_as_user() {
+  local env_prefix=""
+  [[ -n "${STRATA_API_KEY:-}" ]] && printf -v env_prefix 'export STRATA_API_KEY=%q; ' "$STRATA_API_KEY"
   if [[ $EUID -eq 0 && "$TARGET_USER" != "root" ]]; then
     if command -v runuser >/dev/null 2>&1; then
-      runuser -u "$TARGET_USER" -- bash -c "$*"
+      runuser -u "$TARGET_USER" -- bash -c "${env_prefix}$*"
     else
-      su - "$TARGET_USER" -c "$*"
+      su - "$TARGET_USER" -c "${env_prefix}$*"
     fi
   else
-    bash -c "$*"
+    bash -c "${env_prefix}$*"
   fi
 }
 
 # Argument-safe execution as TARGET_USER without extra shell interpolation.
 run_as_user_exec() {
+  local -a env_cmd=()
+  [[ -n "${STRATA_API_KEY:-}" ]] && env_cmd=(env "STRATA_API_KEY=${STRATA_API_KEY}")
   if [[ $EUID -eq 0 && "$TARGET_USER" != "root" ]]; then
     if command -v runuser >/dev/null 2>&1; then
-      runuser -u "$TARGET_USER" -- "$@"
+      runuser -u "$TARGET_USER" -- ${env_cmd[@]+"${env_cmd[@]}"} "$@"
     else
       local cmd=""
-      printf -v cmd '%q ' "$@"
+      printf -v cmd '%q ' ${env_cmd[@]+"${env_cmd[@]}"} "$@"
       su - "$TARGET_USER" -c "$cmd"
     fi
   else
-    "$@"
+    ${env_cmd[@]+"${env_cmd[@]}"} "$@"
   fi
 }
 
@@ -954,7 +960,7 @@ detect_environment() {
       refresh_nvidia_ecc
     fi
   fi
-  local gpu_lines
+  local gpu_lines gpu_render_lines gpu_src gpu_suffix=""
   gpu_lines="$(lspci 2>/dev/null | grep -iE "vga|3d|display" || true)"
   if [[ "$HAS_NVIDIA" == false ]] && grep -qi "nvidia" <<< "$gpu_lines"; then
     HAS_NVIDIA=true
@@ -963,7 +969,17 @@ detect_environment() {
     HAS_NVIDIA_TESLA=true
   fi
   GPU_RAW="$gpu_lines"
-  GPU_SUMMARY="$(echo "$gpu_lines" | sed -E 's/^[^ ]+ [^:]+: //; s/ \((rev|prog-if)[^)]*\)//g; s/.*\[([^][]+)\][[:space:]]*$/\1/' | awk 'NF {s = (s ? s "; " $0 : $0)} END {print s}')"
+  gpu_render_lines="$(grep -viE "aspeed|matrox.*g200|g200e|serverengines|pilot[0-9 ]|hi171[0-9]|xgi.*volari" <<< "$gpu_lines" || true)"
+  gpu_src="$gpu_render_lines"
+  if [[ -z "$gpu_src" && -n "$gpu_lines" ]]; then
+    gpu_src="$gpu_lines"
+    gpu_suffix=" (BMC video, not used)"
+  fi
+  if [[ -n "$gpu_src" ]]; then
+    GPU_SUMMARY="$(echo "$gpu_src" | sed -E 's/^[^ ]+ [^:]+: //; s/ \((rev|prog-if)[^)]*\)//g; s/.*\[([^][]+)\][[:space:]]*$/\1/' | awk 'NF {s = (s ? s "; " $0 : $0)} END {print s}')${gpu_suffix}"
+  else
+    GPU_SUMMARY=""
+  fi
   [[ -z "$GPU_SUMMARY" ]] && GPU_SUMMARY="Unknown"
   echo "$gpu_lines" | grep -qiE "amd|ati|radeon" && HAS_AMD=true
   if [[ "$HAS_AMD" == true ]]; then
@@ -1772,9 +1788,9 @@ title_nvidia_power_limit() {
   mapfile -t idxs < <(nvidia_tunable_pl_indices)
   if (( ${#idxs[@]} == 1 )); then
     local i="${idxs[0]}"
-    echo "NVIDIA Persistent Max GPU Power Limit (${NVIDIA_GPU_DEF_PL[$i]}W -> ${NVIDIA_GPU_MAX_PL[$i]}W)"
+    echo "NVIDIA Persistent Max GPU Power Limit (${NVIDIA_GPU_DEF_PL[$i]}W -> ${NVIDIA_GPU_MAX_PL[$i]}W, headroom only)"
   else
-    echo "NVIDIA Persistent Max GPU Power Limit (${#idxs[@]} GPUs)"
+    echo "NVIDIA Persistent Max GPU Power Limit (${#idxs[@]} GPUs, headroom only)"
   fi
 }
 status_nvidia_power_limit() {
@@ -4779,6 +4795,9 @@ run_strata_benchmark() {
       return 1
       ;;
   esac
+  if [[ -n "${STRATA_API_KEY:-}" ]]; then
+    bench_args+=(--credential-env STRATA_API_KEY --telemetry-credential-env STRATA_API_KEY)
+  fi
 
   build_active_steps
   local active_csv="" applicable_csv="" st
@@ -5677,8 +5696,9 @@ collect_strata_stats_lines() {
 
   local model="" live_str="0.0 tok/s (idle)" avg_str="—"
   if [[ -n "$STRATA_RUNNING_URL" ]] && command -v curl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
-    local m_json
-    m_json="$(curl -fsS --max-time 0.3 "${STRATA_RUNNING_URL}/metrics" 2>/dev/null || true)"
+    local m_json curl_args=(-fsS --max-time 1)
+    [[ -n "${STRATA_API_KEY:-}" ]] && curl_args+=(-H "Authorization: Bearer ${STRATA_API_KEY}" -H "X-API-Key: ${STRATA_API_KEY}")
+    m_json="$(curl "${curl_args[@]}" "${STRATA_RUNNING_URL}/metrics" 2>/dev/null || true)"
     if [[ -n "$m_json" ]]; then
       local parsed=""
       parsed="$(python3 -c '
@@ -7299,11 +7319,32 @@ Interactive TUI wizard to inspect, apply, and revert host-level performance
 optimizations for running Strata LLM inference.
 
 Options:
-  --check       Run hardware, OS, Strata, and step-applicability detection in
-                read-only mode, print a summary, and exit without modifying
-                the system or prompting for sudo.
-  -h, --help    Show this help message and exit.
+  --check                 Run hardware, OS, Strata, and step-applicability
+                          detection in read-only mode, print a summary, and exit
+                          without modifying the system or prompting for sudo.
+  --strata-api-key KEY    API key used for all requests to Strata (live /metrics
+                          polling, 'strata bench run' benchmarking, and Strata
+                          CLI calls); overrides the STRATA_API_KEY environment
+                          variable if set.
+  -h, --help              Show this help message and exit.
+
+Environment:
+  STRATA_API_KEY          Fallback API key used for all Strata requests when
+                          --strata-api-key is not provided.
 EOF
+}
+
+is_step_managed_by_wizard() {
+  case "$1" in
+    cpu_performance)   service_installed strata-cpu-perf.service ;;
+    memlock_realtime)  [[ -n "$STRATA_DOCKER_CONTAINER" || -f /etc/security/limits.d/99-strata-memlock.conf || -f /etc/security/limits.d/99-realtime-privileges.conf ]] ;;
+    numa_balancing)    [[ -f /etc/sysctl.d/99-strata-numa.conf ]] ;;
+    amd_gpu_perf)      service_installed strata-amd-gpu-perf.service ;;
+    intel_gpu_perf)    service_installed strata-intel-gpu-perf.service ;;
+    cstate_limit)      service_installed strata-cstate-limit.service ;;
+    pcie_aspm)         [[ -f /etc/udev/rules.d/99-strata-pcie-aspm.rules ]] || grep -q "pcie_aspm=off" /proc/cmdline 2>/dev/null ;;
+    *)                 return 0 ;;
+  esac
 }
 
 print_check_summary() {
@@ -7366,10 +7407,12 @@ print_check_summary() {
     elif ! is_recommended_step "$step"; then
       note_lbl=" [opt-in]"
     fi
+    [[ "$step" == "nvidia_power_limit" ]] && note_lbl+=" (no measured speedup at default PL)"
 
     if "status_${step}"; then
       status_lbl="${C_GREEN}[APPLIED]${C_RESET}    "
       ((applied_count++))
+      is_step_managed_by_wizard "$step" || note_lbl+=" (already active on host)"
     elif is_recommended_step "$step"; then
       status_lbl="${C_YELLOW}[WOULD APPLY]${C_RESET}"
       ((rec_pending++))
@@ -7423,6 +7466,25 @@ show_check_page() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --check) CHECK_ONLY=true ;;
+    --strata-api-key)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        echo "Error: --strata-api-key requires a non-empty value." >&2
+        usage >&2
+        exit 2
+      fi
+      STRATA_API_KEY="$2"
+      export STRATA_API_KEY
+      shift
+      ;;
+    --strata-api-key=*)
+      STRATA_API_KEY="${1#*=}"
+      if [[ -z "$STRATA_API_KEY" ]]; then
+        echo "Error: --strata-api-key requires a non-empty value." >&2
+        usage >&2
+        exit 2
+      fi
+      export STRATA_API_KEY
+      ;;
     -h|--help) usage; exit 0 ;;
     *)
       echo "Unknown option: $1" >&2

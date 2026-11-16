@@ -50,6 +50,8 @@ Inspect detected OS/init, hardware, Strata installation or Docker container, and
 ./strata-performance-setup.sh --check
 ```
 
+> **API-key-protected Strata instances:** Pass `--strata-api-key <key>` (overrides `STRATA_API_KEY` in the environment) or export `STRATA_API_KEY` so live `/metrics` telemetry polling, `strata bench run` benchmarks, and Strata CLI calls authenticate against your running instance.
+
 ---
 
 ## Documentation

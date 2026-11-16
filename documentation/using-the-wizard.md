@@ -1,6 +1,6 @@
 # Using the Wizard
 
-To inspect detected hardware, OS/init, Strata or Docker container status, and which steps would apply without launching the TUI or making changes, run `./strata-performance-setup.sh --check` (see `--help` for CLI options).
+To inspect detected hardware, OS/init, Strata or Docker container status, and which steps would apply without launching the TUI or making changes, run `./strata-performance-setup.sh --check`. For API-key-protected Strata instances, pass `--strata-api-key <key>` (overrides `STRATA_API_KEY`) or export `STRATA_API_KEY` so live `/metrics` telemetry, `strata bench run` benchmarks, and Strata CLI requests authenticate automatically (see `--help` for CLI options).
 
 Once launched, the main index lists `[STATS]` (live system & Strata metrics), `[STRATA]` (Strata options & benchmark summaries), and every optimization applicable to your machine along with its live `[APPLIED]` / `[NOT APPLIED]` status:
 
