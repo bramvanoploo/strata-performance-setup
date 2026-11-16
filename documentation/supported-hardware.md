@@ -37,7 +37,7 @@ The script probes your system at startup and enables hardware-specific steps onl
 
 ## System-Wide Optimizations (All Hardware)
 - **Server Uptime:** Masks `sleep`, `suspend`, `hibernate`, and `hybrid-sleep` targets, and ignores laptop lid-close suspend
-- **Memory & Realtime:** Grants unlimited `memlock`, `nice -11`, and `rtprio 98` so model weights and KV caches stay pinned in RAM (Dockerized Strata needs `--ulimit memlock=-1:-1` or Docker `default-ulimits`, as containers do not inherit host `/etc/security/limits.d/`)
+- **Memory & Realtime:** Grants unlimited `memlock`, `nice -11`, and `rtprio 98` so model weights and KV caches stay pinned in RAM (Dockerized Strata is detected by container image name and checked via `docker inspect` `HostConfig.Ulimits` for `memlock=-1:-1`, since containers do not inherit host `/etc/security/limits.d/`)
 - **CPU & PCIe:** Optional CPU `performance` governor / `power-profiles-daemon` and PCIe ASPM `performance` policy
 - **Kernel & Swap:** `sysctl` VM tuning (`vfs_cache_pressure=50`, `dirty_ratio=10`, `zone_reclaim_mode=0`), `ananicy-cpp` / `bpftune` on Arch/CachyOS, `sched_ext` BPF CPU scheduler (`scx_loader` / `scx` with `bpfland`), `zstd`-compressed `zram` swap, and `irqbalance`
 - **Strata Management & Benchmarking:** Installs or updates [Strata](https://github.com/Niko1221/Strata), runs `strata launch`, manages `strata.service` from a saved preset, runs Strata benchmarks with coupled host-option/power tracking, and lets you inspect and restore past benchmark configurations. *(Tip: on VRAM-constrained GPUs, check Strata's serving/prefill chunk configuration—e.g. `auto` vs. a lower pinned value—before chasing marginal OS tweaks.)*
