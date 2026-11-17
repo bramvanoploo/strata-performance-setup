@@ -8,6 +8,7 @@ Once launched, the main index lists `[STATS]` (live system & Strata metrics), `[
 - Press `c` on the index to view the read-only **Check / detection summary** inside the TUI (same OS, hardware, Strata, and step-applicability summary as `--check`)
 - Open `[STRATA]` for Strata lifecycle management (`s1`–`s6` / `1`–`6`: Install, Update, Remove, Service, Benchmark, and Benchmark History) along with Latest, Previous, and Best benchmark summaries
 - Press `a` to **apply all recommended optimizations** for your hardware in one action (with confirmation; excludes Strata setup, experimental options, and minimal-gain/higher-idle-power options like CPU Performance and PCIe ASPM)
+- Press `l` (shown on laptops) to **apply laptop-recommended optimizations** (`[LAP]`) for minimal idle battery power impact and comfortable unplugged usage across any laptop vendor (additionally excludes sleep/lid-close masking, idle high-clock/persistence GPU settings, and platform/vendor performance profiles). When applying via `a` or `l`, any currently applied options outside that scope are listed so you can choose to revert them or leave them as is
 - Press `x` to **revert all recommended optimizations** in one action (with confirmation)
 - Press `u` (when shown) to open the **Update Strata** page, install a pending Strata update, and restart `strata.service`
 - Press `r` on the index to **reboot** the system (the wizard also prompts automatically whenever applying or reverting a change requires a reboot)

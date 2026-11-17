@@ -1349,57 +1349,118 @@ is_recommended_step() {
   esac
 }
 
+is_laptop_recommended_step() {
+  is_recommended_step "$1" || return 1
+  case "$1" in
+    prevent_sleep|acpi_platform_profile|msi_cooling|asus_perf|dell_thermal|lenovo_legion|system76_perf|tuxedo_perf|amd_gpu_perf|intel_gpu_perf|nvidia_persistenced)
+      return 1 ;;
+    *)
+      return 0 ;;
+  esac
+}
+
 run_recommended_batch() {
-  local mode="$1" step targets=()
+  local mode="$1" scope="${2:-all}" step targets=() out_of_scope=()
+  local filter_fn="is_recommended_step"
+  local scope_title="Recommended" scope_label="recommended"
+  if [[ "$scope" == "laptop" ]]; then
+    filter_fn="is_laptop_recommended_step"
+    scope_title="Laptop-Recommended"
+    scope_label="laptop-recommended"
+  fi
+
   for step in "${ACTIVE_STEPS[@]}"; do
-    is_recommended_step "$step" || continue
-    if [[ "$mode" == "apply" ]]; then
-      "status_${step}" || targets+=("$step")
-    else
-      "status_${step}" && targets+=("$step")
+    if "$filter_fn" "$step"; then
+      if [[ "$mode" == "apply" ]]; then
+        "status_${step}" || targets+=("$step")
+      else
+        "status_${step}" && targets+=("$step")
+      fi
+    elif [[ "$mode" == "apply" ]] && "status_${step}"; then
+      out_of_scope+=("$step")
     fi
   done
 
   print_header
   if [[ "$mode" == "apply" ]]; then
-    echo -e "${C_BOLD}Apply Recommended Performance Optimizations${C_RESET}"
+    echo -e "${C_BOLD}Apply ${scope_title} Performance Optimizations${C_RESET}"
   else
-    echo -e "${C_BOLD}Revert Recommended Performance Optimizations${C_RESET}"
+    echo -e "${C_BOLD}Revert ${scope_title} Performance Optimizations${C_RESET}"
   fi
   local exp_excl=""
   [[ "$DISTRO_FAMILY" != "arch" ]] && exp_excl=", experimental options"
-  echo -e "${C_DIM}Excluded: CPU Performance, PCIe ASPM, CPU C-State Limit, NVIDIA Clock Lock, tuned profile (minimal gain / higher idle power), 1 GiB hugepages (reserves RAM)${exp_excl}, Strata setup.${C_RESET}\n"
+  if [[ "$scope" == "laptop" ]]; then
+    echo -e "${C_DIM}Excluded: high-idle-power options ([!]), 1 GiB hugepages, prevent sleep, GPU high-idle-clock/persistence, platform & vendor performance profiles${exp_excl}, Strata setup.${C_RESET}\n"
+  else
+    echo -e "${C_DIM}Excluded: CPU Performance, PCIe ASPM, CPU C-State Limit, NVIDIA Clock Lock, tuned profile (minimal gain / higher idle power), 1 GiB hugepages (reserves RAM)${exp_excl}, Strata setup.${C_RESET}\n"
+  fi
 
-  if [[ ${#targets[@]} -eq 0 ]]; then
+  if [[ ${#targets[@]} -eq 0 && ${#out_of_scope[@]} -eq 0 ]]; then
     if [[ "$mode" == "apply" ]]; then
-      echo -e "${C_GREEN}All recommended optimizations for this machine are already applied.${C_RESET}"
+      echo -e "${C_GREEN}All ${scope_label} optimizations for this machine are already applied.${C_RESET}"
     else
-      echo -e "${C_YELLOW}No applied recommended optimizations found to revert.${C_RESET}"
+      echo -e "${C_YELLOW}No applied ${scope_label} optimizations found to revert.${C_RESET}"
     fi
     pause_prompt
     return 0
   fi
 
   local i=1
-  for step in "${targets[@]}"; do
-    echo -e "  $i) $("title_${step}")"
-    ((i++))
-  done
-  echo ""
+  if (( ${#targets[@]} > 0 )); then
+    for step in "${targets[@]}"; do
+      echo -e "  $i) $("title_${step}")"
+      ((i++))
+    done
+    echo ""
+  elif [[ "$mode" == "apply" ]]; then
+    echo -e "${C_GREEN}All ${scope_label} optimizations for this machine are already applied.${C_RESET}\n"
+  fi
 
-  local prompt_verb="Apply"
+  if [[ "$mode" == "apply" ]] && (( ${#out_of_scope[@]} > 0 )); then
+    echo -e "${C_YELLOW}Currently applied option(s) outside the ${scope_label} scope:${C_RESET}"
+    i=1
+    for step in "${out_of_scope[@]}"; do
+      echo -e "  $i) $("title_${step}")"
+      ((i++))
+    done
+    echo ""
+  fi
+
+  local prompt_verb="Apply" revert_out_of_scope=false
   [[ "$mode" == "revert" ]] && prompt_verb="Revert"
-  if ! confirm_yn "${prompt_verb} these ${#targets[@]} recommended optimization(s)? [y/N]: " "N"; then
-    echo -e "${C_DIM}Cancelled.${C_RESET}"
-    pause_prompt
-    return 0
+
+  if (( ${#targets[@]} > 0 )); then
+    if ! confirm_yn "${prompt_verb} these ${#targets[@]} ${scope_label} optimization(s)? [y/N]: " "N"; then
+      echo -e "${C_DIM}Cancelled.${C_RESET}"
+      pause_prompt
+      return 0
+    fi
+    if [[ "$mode" == "apply" ]] && (( ${#out_of_scope[@]} > 0 )); then
+      if confirm_yn "Also revert the ${#out_of_scope[@]} out-of-scope optimization(s) listed above (default: leave as is)? [y/N]: " "N"; then
+        revert_out_of_scope=true
+      fi
+    fi
+  elif [[ "$mode" == "apply" ]] && (( ${#out_of_scope[@]} > 0 )); then
+    if confirm_yn "Revert these ${#out_of_scope[@]} out-of-scope optimization(s) (default: leave as is)? [y/N]: " "N"; then
+      revert_out_of_scope=true
+    else
+      echo -e "${C_DIM}Left out-of-scope optimizations as is.${C_RESET}"
+      pause_prompt
+      return 0
+    fi
   fi
 
   for step in "${targets[@]}"; do
     echo -e "\n${C_BOLD}${C_CYAN}>>> ${prompt_verb}ing: $("title_${step}")${C_RESET}"
     "${mode}_${step}" || echo -e "${C_YELLOW}Step '${step}' exited with a warning or was skipped.${C_RESET}"
   done
-  echo -e "\n${C_GREEN}Finished ${mode}ing recommended optimizations.${C_RESET}"
+  if [[ "$revert_out_of_scope" == true ]]; then
+    for step in "${out_of_scope[@]}"; do
+      echo -e "\n${C_BOLD}${C_YELLOW}>>> Reverting out-of-scope: $("title_${step}")${C_RESET}"
+      "revert_${step}" || echo -e "${C_YELLOW}Step '${step}' exited with a warning or was skipped.${C_RESET}"
+    done
+  fi
+  echo -e "\n${C_GREEN}Finished ${mode}ing ${scope_label} optimizations.${C_RESET}"
   prompt_reboot_if_needed
   pause_prompt
 }
@@ -3366,7 +3427,7 @@ EOF
     run_root systemctl daemon-reload
     run_root systemctl enable --now "$u"
     if [[ "$(cat /sys/kernel/sched_ext/state 2>/dev/null)" != "enabled" ]]; then
-      run_root "$scxctl_bin" start -s bpfland
+      run_root "$scxctl_bin" start -s bpfland 2>/dev/null || run_root "$scxctl_bin" switch -s bpfland
     fi
   elif [[ -n "$u" && "$u" != "strata-scx.service" ]]; then
     run_root systemctl enable --now "$u"
@@ -6770,7 +6831,7 @@ read_choice_with_live_stats() {
       else
         local accept=false
         if [[ -z "$buf" ]]; then
-          if [[ "$ch" =~ ^[wWcCuUhHaAxXrRqQ]$ ]] || [[ "$ch" =~ ^[1-9]$ ]]; then
+          if [[ "$ch" =~ ^[wWcCuUhHaAlLxXrRqQ]$ ]] || [[ "$ch" =~ ^[1-9]$ ]]; then
             accept=true
           fi
         elif [[ "$buf" =~ ^[0-9]{1,2}$ ]] && [[ "$ch" =~ ^[0-9]$ ]]; then
@@ -6875,7 +6936,9 @@ format_index_row() {
   local num=$(( idx + 1 ))
   local badge note_txt title_txt gain_txt ptr row_num
   "status_${step}" && badge="${C_GREEN}[APPLIED]    ${C_RESET}" || badge="${C_YELLOW}[NOT APPLIED]${C_RESET}"
-  if declare -F "note_${step}" >/dev/null 2>&1; then
+  if [[ "$IS_LAPTOP" == true ]] && is_laptop_recommended_step "$step"; then
+    note_txt="${C_CYAN}[LAP]${C_RESET}"
+  elif declare -F "note_${step}" >/dev/null 2>&1; then
     note_txt="$("note_${step}")"
   else
     note_txt="${C_DIM}-${C_RESET}"
@@ -7265,6 +7328,9 @@ show_index() {
     if [[ "$DISTRO_FAMILY" != "arch" ]]; then
       legend_line+="   ${C_MAGENTA}[EXP]${C_RESET} ${C_DIM}Experimental for this distribution, might not work properly${C_RESET}"
     fi
+    if [[ "$IS_LAPTOP" == true ]]; then
+      legend_line+="   ${C_CYAN}[LAP]${C_RESET} ${C_DIM}Laptop-recommended (low idle battery impact)${C_RESET}"
+    fi
     body+=$'\n'"$(echo -e "$legend_line")"$'\n'
 
     local footer_lines=9 hist_count
@@ -7282,6 +7348,10 @@ show_index() {
     local rec_excl="excludes high-idle-power options"
     [[ "$DISTRO_FAMILY" != "arch" ]] && rec_excl="excludes high-idle-power and experimental options"
     body+="$(echo -e "  ${C_GREEN}[a]${C_RESET} Apply all recommended optimizations (${rec_excl})")"$'\n'
+    if [[ "$IS_LAPTOP" == true ]]; then
+      body+="$(echo -e "  ${C_CYAN}[l]${C_RESET} Apply laptop-recommended optimizations (minimal idle battery impact)")"$'\n'
+      ((footer_lines++))
+    fi
     body+="$(echo -e "  ${C_RED}[x]${C_RESET} Revert all recommended optimizations")"$'\n'
     body+="$(echo -e "  ${C_BOLD}[1-${#ACTIVE_STEPS[@]} / ↑↓+Enter]${C_RESET} Select an option")"$'\n'
     body+="$(echo -e "  ${C_BOLD}[r]${C_RESET} Reboot system")"$'\n'
@@ -7315,6 +7385,13 @@ show_index() {
       h|H) show_benchmark_history ;;
       w|W) run_step_view 0 "wizard" ;;
       a|A) run_recommended_batch "apply" ;;
+      l|L)
+        if [[ "$IS_LAPTOP" == true ]]; then
+          run_recommended_batch "apply" "laptop"
+        else
+          echo -e "${C_RED}Invalid choice '${choice}'. Cancelled.${C_RESET}"; sleep 1
+        fi
+        ;;
       x|X) run_recommended_batch "revert" ;;
       r|R)
         confirm_yn "Reboot this system now? [y/N]: " "N" && { if [[ "$HAS_SYSTEMD" == true ]]; then run_root systemctl reboot; else run_root reboot; fi; exit 0; }
@@ -7446,6 +7523,8 @@ print_check_summary() {
       note_lbl=" [EXP]"
     elif ! is_recommended_step "$step"; then
       note_lbl=" [opt-in]"
+    elif [[ "$IS_LAPTOP" == true ]] && is_laptop_recommended_step "$step"; then
+      note_lbl=" [LAP]"
     fi
     [[ "$step" == "nvidia_power_limit" ]] && note_lbl+=" (no measured speedup at default PL)"
 
