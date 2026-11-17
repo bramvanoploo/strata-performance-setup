@@ -6937,7 +6937,7 @@ format_index_row() {
   local badge note_txt title_txt gain_txt ptr row_num
   "status_${step}" && badge="${C_GREEN}[APPLIED]    ${C_RESET}" || badge="${C_YELLOW}[NOT APPLIED]${C_RESET}"
   if [[ "$IS_LAPTOP" == true ]] && is_laptop_recommended_step "$step"; then
-    note_txt="${C_CYAN}[LAP]${C_RESET}"
+    note_txt="${C_CYAN}[L]${C_RESET}"
   elif declare -F "note_${step}" >/dev/null 2>&1; then
     note_txt="$("note_${step}")"
   else
@@ -7329,7 +7329,7 @@ show_index() {
       legend_line+="   ${C_MAGENTA}[EXP]${C_RESET} ${C_DIM}Experimental for this distribution, might not work properly${C_RESET}"
     fi
     if [[ "$IS_LAPTOP" == true ]]; then
-      legend_line+="   ${C_CYAN}[LAP]${C_RESET} ${C_DIM}Laptop-recommended (low idle battery impact)${C_RESET}"
+      legend_line+="   ${C_CYAN}[L]${C_RESET} ${C_DIM}Laptop-recommended (low idle battery impact)${C_RESET}"
     fi
     body+=$'\n'"$(echo -e "$legend_line")"$'\n'
 
@@ -7524,7 +7524,7 @@ print_check_summary() {
     elif ! is_recommended_step "$step"; then
       note_lbl=" [opt-in]"
     elif [[ "$IS_LAPTOP" == true ]] && is_laptop_recommended_step "$step"; then
-      note_lbl=" [LAP]"
+      note_lbl=" [L]"
     fi
     [[ "$step" == "nvidia_power_limit" ]] && note_lbl+=" (no measured speedup at default PL)"
 
