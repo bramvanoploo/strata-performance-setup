@@ -1510,13 +1510,13 @@ apply_acpi_platform_profile() {
   install_service strata-acpi-profile.service <<'EOF'
 [Unit]
 Description=Set ACPI Platform Thermal Profile to Performance for Strata
-After=multi-user.target
+After=multi-user.target power-profiles-daemon.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c '[ -w /sys/firmware/acpi/platform_profile ] && echo performance > /sys/firmware/acpi/platform_profile || true'
-ExecStop=/bin/sh -c '[ -w /sys/firmware/acpi/platform_profile ] && echo balanced > /sys/firmware/acpi/platform_profile || true'
+ExecStart=/bin/sh -c 'if command -v powerprofilesctl >/dev/null 2>&1 && systemctl is-active --quiet power-profiles-daemon.service; then powerprofilesctl set performance; elif [ -w /sys/firmware/acpi/platform_profile ]; then echo performance > /sys/firmware/acpi/platform_profile; fi || true'
+ExecStop=/bin/sh -c 'if command -v powerprofilesctl >/dev/null 2>&1 && systemctl is-active --quiet power-profiles-daemon.service; then powerprofilesctl set balanced; elif [ -w /sys/firmware/acpi/platform_profile ]; then echo balanced > /sys/firmware/acpi/platform_profile; fi || true'
 
 [Install]
 WantedBy=multi-user.target
@@ -1524,7 +1524,11 @@ EOF
 }
 revert_acpi_platform_profile() {
   remove_service strata-acpi-profile.service
-  run_root sh -c '[ -w /sys/firmware/acpi/platform_profile ] && echo balanced > /sys/firmware/acpi/platform_profile' 2>/dev/null || true
+  if command -v powerprofilesctl >/dev/null 2>&1 && unit_active power-profiles-daemon.service; then
+    powerprofilesctl set balanced 2>/dev/null || true
+  else
+    run_root sh -c '[ -w /sys/firmware/acpi/platform_profile ] && echo balanced > /sys/firmware/acpi/platform_profile' 2>/dev/null || true
+  fi
 }
 
 # 3c. ASUS
@@ -1545,6 +1549,9 @@ revert_asus_perf() { command -v asusctl >/dev/null 2>&1 && asusctl profile -P Ba
 # 3d. Dell
 applicable_dell_thermal() {
   grep -qi "Dell" <<< "$SYS_VENDOR" || return 1
+  # Modern kernels (dell_pc) expose /sys/firmware/acpi/platform_profile and
+  # filter legacy userspace smbios-thermal-ctl SMI calls; prefer acpi_platform_profile.
+  applicable_acpi_platform_profile && return 1
   command -v smbios-thermal-ctl >/dev/null 2>&1 || pkg_available repo libsmbios || pkg_available repo smbios-utils
 }
 title_dell_thermal() { echo "Dell BIOS Ultra-Performance Thermal Mode (smbios-thermal-ctl)"; }
@@ -1559,7 +1566,9 @@ apply_dell_thermal() {
       suse)   prompt_install_deps repo smbios-utils-bin || prompt_install_deps repo libsmbios || return 0 ;;
     esac
   fi
-  run_root smbios-thermal-ctl --set-thermal-mode=performance 2>/dev/null || true
+  if ! run_root smbios-thermal-ctl --set-thermal-mode=performance; then
+    echo -e "${C_YELLOW}smbios-thermal-ctl failed (kernel may filter SMI calls or SMM mitigations are enabled in BIOS).${C_RESET}"
+  fi
 }
 revert_dell_thermal() { command -v smbios-thermal-ctl >/dev/null 2>&1 && run_root smbios-thermal-ctl --set-thermal-mode=balanced 2>/dev/null || true; }
 
@@ -3321,7 +3330,7 @@ revert_hugepages_1g() {
 # 12v. sched_ext scheduler
 scx_unit() {
   local u
-  for u in scx.service scx_loader.service; do
+  for u in scx.service scx_loader.service strata-scx.service; do
     if unit_exists "$u" || systemctl cat "$u" >/dev/null 2>&1; then
       echo "$u"; return 0
     fi
@@ -3330,15 +3339,22 @@ scx_unit() {
 }
 applicable_scx_scheduler() {
   [[ -d /sys/kernel/sched_ext ]] || return 1
-  scx_unit >/dev/null 2>&1 || pkg_available repo scx-scheds
+  scx_unit >/dev/null 2>&1 || command -v scx_bpfland >/dev/null 2>&1 || pkg_available repo scx-scheds
 }
 title_scx_scheduler() { echo "sched_ext BPF CPU Scheduler (scx, lower scheduling latency)"; }
 status_scx_scheduler() { [[ "$(cat /sys/kernel/sched_ext/state 2>/dev/null)" == "enabled" ]]; }
 explain_scx_scheduler() { echo -e "Impact:\n  Installs scx-scheds (if needed) and enables its service so a sched_ext BPF\n  scheduler (default: scx_bpfland) replaces the kernel CPU scheduler, improving\n  responsiveness of the API/server threads when CPU cores are saturated."; }
 apply_scx_scheduler() {
-  scx_unit >/dev/null 2>&1 || prompt_install_deps repo scx-scheds || return 0
+  if ! scx_unit >/dev/null 2>&1; then
+    local pkgs=()
+    command -v scx_bpfland >/dev/null 2>&1 || pkgs+=(scx-scheds)
+    pkg_available repo scx-tools && pkgs+=(scx-tools)
+    if (( ${#pkgs[@]} > 0 )); then
+      prompt_install_deps repo "${pkgs[@]}" || true
+    fi
+  fi
   local u
-  u="$(scx_unit)" || { echo -e "${C_YELLOW}No scx service found after installation.${C_RESET}"; return 1; }
+  u="$(scx_unit 2>/dev/null || true)"
   if [[ "$u" == "scx_loader.service" ]] && command -v scxctl >/dev/null 2>&1; then
     local scxctl_bin
     scxctl_bin="$(command -v scxctl)"
@@ -3352,8 +3368,28 @@ EOF
     if [[ "$(cat /sys/kernel/sched_ext/state 2>/dev/null)" != "enabled" ]]; then
       run_root "$scxctl_bin" start -s bpfland
     fi
-  else
+  elif [[ -n "$u" && "$u" != "strata-scx.service" ]]; then
     run_root systemctl enable --now "$u"
+  elif command -v scx_bpfland >/dev/null 2>&1; then
+    local bpfland_bin
+    bpfland_bin="$(command -v scx_bpfland)"
+    install_service strata-scx.service <<EOF
+[Unit]
+Description=Strata sched_ext BPF CPU Scheduler (scx_bpfland)
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=${bpfland_bin}
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  else
+    echo -e "${C_YELLOW}No scx service or scx_bpfland binary found after installation.${C_RESET}"
+    return 1
   fi
 }
 revert_scx_scheduler() {
@@ -3363,8 +3399,12 @@ revert_scx_scheduler() {
     run_root rmdir /etc/systemd/system/scx_loader.service.d 2>/dev/null || true
     run_root systemctl daemon-reload
   fi
+  if service_installed strata-scx.service; then
+    remove_service strata-scx.service
+  fi
   local u
-  u="$(scx_unit)" && run_root systemctl disable --now "$u" 2>/dev/null || true
+  u="$(scx_unit 2>/dev/null || true)"
+  [[ -n "$u" ]] && run_root systemctl disable --now "$u" 2>/dev/null || true
 }
 
 # 12w. AMD X3D V-Cache Mode
