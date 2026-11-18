@@ -2559,12 +2559,12 @@ applicable_numa_balancing() {
   [[ -e /proc/sys/kernel/numa_balancing ]] || return 1
   (( $(numa_node_count) > 1 || $(cpu_socket_count) > 1 ))
 }
-title_numa_balancing() { echo "Disable Automatic NUMA Balancing ($(cpu_socket_count) socket(s), $(numa_node_count) NUMA nodes)"; }
+title_numa_balancing() { echo "Disable Automatic NUMA Balancing ($(cpu_socket_count) socket(s), $(numa_node_count) NUMA nodes, page-migration hygiene)"; }
 status_numa_balancing() {
   [[ -f /etc/sysctl.d/99-strata-numa.conf ]] && [[ "$(cat /proc/sys/kernel/numa_balancing 2>/dev/null)" == "0" ]]
 }
 explain_numa_balancing() {
-  echo -e "Impact:\n  Sets kernel.numa_balancing=0 (persistent via /etc/sysctl.d/99-strata-numa.conf).\n  Stops the kernel from periodically unmapping pages to migrate them between NUMA\n  nodes, which causes page-fault stalls and jitter for large, pinned model memory."
+  echo -e "Impact:\n  Sets kernel.numa_balancing=0 (persistent via /etc/sysctl.d/99-strata-numa.conf).\n  Stops the kernel from periodically unmapping pages to migrate them between NUMA\n  nodes (jitter/stall hygiene for large model memory; no measured prefill/decode\n  speedup once allocations are resident)."
 }
 apply_numa_balancing() {
   run_root tee /etc/sysctl.d/99-strata-numa.conf >/dev/null <<'EOF2'
@@ -3326,6 +3326,8 @@ revert_jetson_fan() { remove_service strata-jetson-fan.service; }
 
 # 12t. numactl interleave
 applicable_numactl_interleave() {
+  [[ "$HAS_SYSTEMD" == true ]] || return 1
+  [[ -z "$STRATA_BIN" && -n "$STRATA_DOCKER_CONTAINER" ]] && return 1
   (( $(numa_node_count) > 1 )) || return 1
   [[ -f "$NUMACTL_MARKER" ]] || command -v numactl >/dev/null 2>&1 || pkg_available repo numactl
 }
@@ -3334,10 +3336,10 @@ status_numactl_interleave() { [[ -f "$NUMACTL_MARKER" ]] && command -v numactl >
 explain_numactl_interleave() {
   cat <<'EOF'
 Impact:
-  Installs numactl and starts Strata (strata.service) under 'numactl --interleave=all',
-  spreading CPU-resident model weights across all NUMA nodes so memory bandwidth
-  from every socket is used. Helps CPU/offload inference on multi-socket servers;
-  restart strata.service after applying.
+  Installs numactl and starts native Strata (strata.service) under
+  'numactl --interleave=all', spreading CPU-resident model weights across all
+  NUMA nodes so memory bandwidth from every socket is used (primarily benefits
+  multi-socket CPU/MoE-offload inference; restart strata.service after applying).
 EOF
 }
 apply_numactl_interleave() {
@@ -5180,6 +5182,9 @@ Impact:
   Runs Strata's built-in benchmark ('strata bench run') against the currently
   running Strata instance, measures average GPU/CPU/system power consumption,
   and stores results + active host optimizations in persistent host history.
+  Tip: After a cold model load, run a warmup pass before A/B comparing host
+  settings—decode throughput can ramp over the first several requests as the
+  engine warms up.
 EOF
   if [[ -n "$STRATA_RUNNING_URL" ]]; then
     echo -e "\nActive target: ${STRATA_RUNNING_PRESET:-active} (${STRATA_RUNNING_URL})"
@@ -6883,7 +6888,7 @@ declare -A STEP_GAIN_PTS=(
   [nvidia_ecc]=4
   [nvidia_compute_mode]=3
   [headless_target]=4
-  [numactl_interleave]=4
+  [numactl_interleave]=3
   [amd_x3d_mode]=4
   [intel_rapl]=4
   [msi_cooling]=4
@@ -6896,7 +6901,7 @@ declare -A STEP_GAIN_PTS=(
   [acpi_platform_profile]=3
   [intel_pcore_pinning]=3
   [zram_swap]=3
-  [numa_balancing]=3
+  [numa_balancing]=2
   [sysctl_tuning]=3
   [memlock_realtime]=3
   [nvme_tuning]=3
@@ -7527,6 +7532,7 @@ print_check_summary() {
       note_lbl=" [L]"
     fi
     [[ "$step" == "nvidia_power_limit" ]] && note_lbl+=" (no measured speedup at default PL)"
+    [[ "$step" == "numa_balancing" ]] && note_lbl+=" (no measured throughput gain on containerised host)"
 
     if "status_${step}"; then
       status_lbl="${C_GREEN}[APPLIED]${C_RESET}    "
