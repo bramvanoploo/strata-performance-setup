@@ -6,7 +6,7 @@ The wizard supports Linux distributions across systemd, Slackware SysVinit, and 
 | :--- | :--- | :--- |
 | **Arch-based** | Arch Linux, CachyOS, EndeavourOS, Manjaro, Garuda (and `ID_LIKE=arch`) | `pacman` (plus `yay` or `paru` for AUR packages) |
 | **Fedora-based** | Fedora, Nobara, RHEL, CentOS, Rocky Linux, AlmaLinux (and `ID_LIKE=fedora` / `rhel`) | `dnf` |
-| **Debian-based** | Debian, Ubuntu (including **Jetson Linux R32 / L4T R32.x**), Pop!\_OS, Linux Mint, KDE neon (and `ID_LIKE=debian` / `ubuntu`) | `apt-get` |
+| **Debian-based** | Debian, Ubuntu (including **NVIDIA Jetson Linux L4T R32 / R35 / R36+**), Pop!\_OS, Linux Mint, KDE neon (and `ID_LIKE=debian` / `ubuntu`) | `apt-get` |
 | **openSUSE / SLES** | openSUSE Leap/Tumbleweed, SLES, SLED (and `ID_LIKE=suse`) | `zypper` |
 | **Slackware** | Slackware 15.0 / -current (SysVinit `/etc/rc.d/rc.strata.*` + `/etc/rc.d/rc.local`) | `slackpkg` |
 | **Unraid** | Unraid (Slackware-based SysVinit; persists boot hooks via `/boot/config/strata/` + `/boot/config/go` invoked with `sh` so `vfat` mounts without execute bits survive reboots, host-tuning mode when Strata runs in Docker) | `slackpkg` / host-only |

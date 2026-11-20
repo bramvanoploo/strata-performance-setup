@@ -19,10 +19,10 @@ set -uo pipefail
 # ------------------------------------------------------------------------------
 if [[ -t 1 ]]; then
   C_RESET='\033[0m' C_BOLD='\033[1m' C_DIM='\033[2m'
-  C_RED='\033[0;31m' C_GREEN='\033[0;32m' C_BGREEN='\033[1;32m' C_YELLOW='\033[0;33m' C_MAGENTA='\033[0;35m' C_CYAN='\033[0;36m'
+  C_RED='\033[0;31m' C_GREEN='\033[0;32m' C_BGREEN='\033[1;32m' C_YELLOW='\033[0;33m' C_BLUE='\033[1;34m' C_MAGENTA='\033[0;35m' C_CYAN='\033[0;36m'
   C_UPDATE_BANNER='\033[1;30;102m'
 else
-  C_RESET='' C_BOLD='' C_DIM='' C_RED='' C_GREEN='' C_BGREEN='' C_YELLOW='' C_MAGENTA='' C_CYAN='' C_UPDATE_BANNER=''
+  C_RESET='' C_BOLD='' C_DIM='' C_RED='' C_GREEN='' C_BGREEN='' C_YELLOW='' C_BLUE='' C_MAGENTA='' C_CYAN='' C_UPDATE_BANNER=''
 fi
 
 TARGET_USER="${SUDO_USER:-${USER:-$(id -un)}}"
@@ -35,22 +35,37 @@ CHECK_ONLY=false
 DISTRO_FAMILY="unknown" DISTRO_ID="unknown" OS_PRETTY="" KERNEL_VER="" AUR_HELPER="" HAS_SYSTEMD=true IS_UNRAID=false IS_TRUENAS=false IS_SYNOLOGY=false
 HAS_NVIDIA=false HAS_NVIDIA_POWERD=false HAS_AMD=false HAS_INTEL_GPU=false HAS_INTEL_ARC=false
 HAS_AMD_APU=false HAS_AMD_PREBUILT_GFX=false AMD_GTT_TOTAL_MB=0
+HAS_AMD_INSTINCT=false HAS_AMD_NON_INSTINCT=false
 HAS_NVIDIA_TESLA=false HAS_NVIDIA_NON_TESLA=false NVIDIA_COMPUTE_MODE_NON_DEFAULT=false
+HAS_NVIDIA_DATACENTER=false HAS_NVIDIA_PASSIVE=false HAS_NVIDIA_LEGACY_PSTATE_CARD=false
+HAS_NVIDIA_KEPLER=false HAS_NVIDIA_MAXWELL=false HAS_NVIDIA_PASCAL=false HAS_NVIDIA_VOLTA_SM70=false
+HAS_NVIDIA_NVSWITCH=false IS_DGX_SPARK=false HAS_NVIDIA_UNIFIED_MEM=false
+NVIDIA_DRIVER_VER="" NVIDIA_DRIVER_MAJOR=0 NVIDIA_LIVE_EXTRA_FIELDS=""
+NVIDIA_MIG_ANY_ENABLED=false NVIDIA_MIG_ANY_PEND_ENABLED=false
 GPU_SUMMARY="" GPU_RAW="" AMD_GFX_SUMMARY="" AMD_MISSING_GFX_SUMMARY="" CPU_SUMMARY="" RAM_GB=0 RAM_DETAILS="" NVIDIA_VRAM_MB=0 TOTAL_VRAM_MB=0
 HAS_MSI_EC=false SYS_VENDOR="" PRODUCT_NAME="" IS_LAPTOP=false HAS_ASPM=false
-IS_JETSON=false IS_JETSON_TX2=false JETSON_MODEL="" JETSON_L4T_REL="" JETSON_SOC=""
+IS_JETSON=false IS_JETSON_TX2=false IS_JETSON_XAVIER=false IS_JETSON_ORIN=false IS_JETSON_THOR=false
+JETSON_MODEL="" JETSON_L4T_REL="" JETSON_SOC=""
 NVIDIA_DEFAULT_PL="" NVIDIA_MAX_PL="" NVIDIA_CURRENT_PL=""
 NVIDIA_MAX_GFX_CLK="" NVIDIA_MAX_MEM_CLK="" NVIDIA_ECC_CUR="" NVIDIA_ECC_PEND=""
 IS_VIRT="" NUMA_NODES=1 CPU_SOCKETS=1 DISCRETE_GPU_COUNT=0 DMI_MEM_CACHE=""
+HAS_FULL_GPU_INTERCONNECT=false PCIE_ACS_ENABLED=false PCIE_ACS_CHECKED=false
 declare -a RAM_HEALTH_LINES=() GPU_TOPO_LINES=()
 declare -a AMD_GFX_ARCHS=() AMD_MISSING_GFX_ARCHS=()
-declare -a NVIDIA_GPU_INDICES=() NVIDIA_GPU_NAMES=() NVIDIA_GPU_CUR_PL=() NVIDIA_GPU_DEF_PL=() NVIDIA_GPU_MAX_PL=() NVIDIA_GPU_VRAM=() NVIDIA_GPU_COMPUTE_MODE=() NVIDIA_GPU_IS_TESLA=() NVIDIA_GPU_PL_SUPPORTED=()
+declare -a NVIDIA_GPU_INDICES=() NVIDIA_GPU_NAMES=() NVIDIA_GPU_CUR_PL=() NVIDIA_GPU_DEF_PL=() NVIDIA_GPU_MAX_PL=() NVIDIA_GPU_MIN_PL=() NVIDIA_GPU_VRAM=() NVIDIA_GPU_COMPUTE_MODE=() NVIDIA_GPU_IS_TESLA=() NVIDIA_GPU_IS_DATACENTER=() NVIDIA_GPU_IS_PASSIVE=() NVIDIA_GPU_PL_SUPPORTED=() NVIDIA_GPU_COMPUTE_CAP=()
 declare -a NVIDIA_GPU_MAX_GFX_CLK=() NVIDIA_GPU_MAX_MEM_CLK=() NVIDIA_ECC_INDICES=()
+declare -a NVIDIA_MIG_INDICES=() NVIDIA_GPU_MIG_CUR=() NVIDIA_GPU_MIG_PEND=()
 RYZENADJ_MARKER="/etc/strata-ryzenadj.prev" RAPL_MARKER="/etc/strata-rapl.prev" TUNED_MARKER="/etc/strata-tuned.prev" NUMACTL_MARKER="/etc/strata-numactl.enabled"
 HEADLESS_MARKER="/etc/strata-headless.prev" PSTATE_MARKER="/etc/strata-pstate.prev" GPU_GROUPS_MARKER="/etc/strata-gpu-groups.added"
 NVIDIA_COMPUTE_PREV_MARKER="/etc/strata-nvidia-compute-mode.prev"
+NVIDIA_MIG_PREV_MARKER="/etc/strata-nvidia-mig.prev"
+NVIDIA_POWER_CAP_MARKER="/etc/strata-nvidia-power-cap.conf"
+NVIDIA_SM70_MARKER="/etc/strata-nvidia-sm70-table.enabled"
+NVIDIA_PSTATE_MARKER="/etc/strata-nvidia-pstate.mode"
+AMD_INSTINCT_PART_MARKER="/etc/strata-amd-instinct-partition.prev"
 REBOOT_REQUIRED=false REBOOT_PROMPT_PENDING=false
-PREV_CPU_TOTAL="" PREV_CPU_IDLE="" PREV_RAPL_UJ="" PREV_RAPL_US="" LIVE_STATS_COUNT=0 POST_HEADER_LINES=0 UPDATE_BANNER_OFFSET=1
+PREV_CPU_TOTAL="" PREV_CPU_IDLE="" PREV_RAPL_UJ="" PREV_RAPL_US="" LIVE_STATS_COUNT=0 POST_HEADER_LINES=0 UPDATE_BANNER_OFFSET=1 INDEX_LEGEND_LINES=1
+declare -A PREV_INTEL_GPU_UJ_MAP=() PREV_INTEL_GPU_US_MAP=()
 TERM_COLS_CACHED=120 LIVE_COMPACT_SYS="" LIVE_COMPACT_STRATA=""
 declare -a LIVE_STAT_LINES=() SYS_INFO_LINES=() STRATA_STAT_LINES=() STRATA_BENCH_LINES=()
 STRATA_BENCH_CACHE_KEY=""
@@ -73,16 +88,13 @@ run_root() {
 }
 
 run_as_user() {
-  local env_prefix="" _ag _has_1150=false _has_1103=false
+  local env_prefix="" _kv=""
+  local -a _rt_env=()
   [[ -n "${STRATA_API_KEY:-}" ]] && printf -v env_prefix 'export STRATA_API_KEY=%q; ' "$STRATA_API_KEY"
-  if (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )); then
-    for _ag in "${AMD_MISSING_GFX_ARCHS[@]}"; do
-      case "$_ag" in
-        gfx1150) [[ "$_has_1150" == false ]] && { env_prefix+="export STRATA_EXPERIMENTAL_GFX1150=1; "; _has_1150=true; } ;;
-        gfx1103) [[ "$_has_1103" == false ]] && { env_prefix+="export STRATA_EXPERIMENTAL_GFX1103=1; "; _has_1103=true; } ;;
-      esac
-    done
-  fi
+  _fill_strata_runtime_env_array _rt_env
+  for _kv in ${_rt_env[@]+"${_rt_env[@]}"}; do
+    env_prefix+="export ${_kv}; "
+  done
   if [[ $EUID -eq 0 && "$TARGET_USER" != "root" ]]; then
     if command -v runuser >/dev/null 2>&1; then
       runuser -u "$TARGET_USER" -- bash -c "${env_prefix}$*"
@@ -96,17 +108,10 @@ run_as_user() {
 
 # Argument-safe execution as TARGET_USER without extra shell interpolation.
 run_as_user_exec() {
-  local -a env_args=() env_cmd=()
-  local _ag _has_1150=false _has_1103=false
+  local -a env_args=() env_cmd=() _rt_env=()
   [[ -n "${STRATA_API_KEY:-}" ]] && env_args+=("STRATA_API_KEY=${STRATA_API_KEY}")
-  if (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )); then
-    for _ag in "${AMD_MISSING_GFX_ARCHS[@]}"; do
-      case "$_ag" in
-        gfx1150) [[ "$_has_1150" == false ]] && { env_args+=("STRATA_EXPERIMENTAL_GFX1150=1"); _has_1150=true; } ;;
-        gfx1103) [[ "$_has_1103" == false ]] && { env_args+=("STRATA_EXPERIMENTAL_GFX1103=1"); _has_1103=true; } ;;
-      esac
-    done
-  fi
+  _fill_strata_runtime_env_array _rt_env
+  (( ${#_rt_env[@]} > 0 )) && env_args+=("${_rt_env[@]}")
   (( ${#env_args[@]} > 0 )) && env_cmd=(env "${env_args[@]}")
   if [[ $EUID -eq 0 && "$TARGET_USER" != "root" ]]; then
     if command -v runuser >/dev/null 2>&1; then
@@ -788,10 +793,11 @@ for line in sys.stdin:
 }
 
 detect_jetson_platform() {
-  IS_JETSON=false IS_JETSON_TX2=false JETSON_MODEL="" JETSON_L4T_REL="" JETSON_SOC=""
-  local dt_model="" dt_compat="" tegra_rel=""
-  [[ -r /proc/device-tree/model ]] && dt_model="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || true)"
-  [[ -r /proc/device-tree/compatible ]] && dt_compat="$(tr '\0' ' ' < /proc/device-tree/compatible 2>/dev/null || true)"
+  IS_JETSON=false IS_JETSON_TX2=false IS_JETSON_XAVIER=false IS_JETSON_ORIN=false IS_JETSON_THOR=false
+  JETSON_MODEL="" JETSON_L4T_REL="" JETSON_SOC=""
+  local dt_dir="${STRATA_DT_DIR:-/proc/device-tree}" dt_model="" dt_compat="" tegra_rel=""
+  [[ -r "$dt_dir/model" ]] && dt_model="$(tr -d '\0' < "$dt_dir/model" 2>/dev/null || true)"
+  [[ -r "$dt_dir/compatible" ]] && dt_compat="$(tr '\0' ' ' < "$dt_dir/compatible" 2>/dev/null || true)"
   [[ -r /etc/nv_tegra_release ]] && tegra_rel="$(head -n1 /etc/nv_tegra_release 2>/dev/null || true)"
 
   if [[ -n "$tegra_rel" ]] || grep -qiE "jetson|tegra" <<< "${dt_model} ${dt_compat}"; then
@@ -812,7 +818,19 @@ detect_jetson_platform() {
   fi
 
   JETSON_MODEL="${dt_model:-NVIDIA Jetson}"
-  if grep -qi "nvidia,tegra186" <<< "$dt_compat" || grep -qiE "t186ref|t186" <<< "$tegra_rel" || grep -qiE "TX2|quill|storm|lanai" <<< "$dt_model"; then
+  if grep -qi "nvidia,tegra264" <<< "$dt_compat" || grep -qiE "t264ref|t264" <<< "$tegra_rel" || grep -qi "Thor" <<< "$dt_model"; then
+    IS_JETSON_THOR=true
+    JETSON_SOC="tegra264"
+    [[ -z "$dt_model" ]] && JETSON_MODEL="NVIDIA Jetson AGX Thor"
+  elif grep -qi "nvidia,tegra234" <<< "$dt_compat" || grep -qiE "t234ref|t234" <<< "$tegra_rel" || grep -qi "Orin" <<< "$dt_model"; then
+    IS_JETSON_ORIN=true
+    JETSON_SOC="tegra234"
+    [[ -z "$dt_model" ]] && JETSON_MODEL="NVIDIA Jetson Orin"
+  elif grep -qi "nvidia,tegra194" <<< "$dt_compat" || grep -qiE "t194ref|t194" <<< "$tegra_rel" || grep -qiE "Xavier|galen|jakku" <<< "$dt_model"; then
+    IS_JETSON_XAVIER=true
+    JETSON_SOC="tegra194"
+    [[ -z "$dt_model" ]] && JETSON_MODEL="NVIDIA Jetson Xavier"
+  elif grep -qi "nvidia,tegra186" <<< "$dt_compat" || grep -qiE "t186ref|t186" <<< "$tegra_rel" || grep -qiE "TX2|quill|storm|lanai" <<< "$dt_model"; then
     IS_JETSON_TX2=true
     JETSON_SOC="tegra186"
     if [[ -z "$dt_model" || "$dt_model" =~ ^(quill|storm|lanai|p2771|p3636) ]]; then
@@ -837,11 +855,18 @@ amd_gfx_has_prebuilt() {
   esac
 }
 
+amd_gfx_is_wave64() {
+  case "$1" in
+    gfx906|gfx908|gfx90a|gfx942|gfx950) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 amd_gfx_is_missing_target() {
   amd_gfx_has_prebuilt "$1" && return 1
   case "$1" in
     gfx1036) return 1 ;; # 2-CU Raphael/Granite Ridge desktop display iGPU
-    gfx101[0-9a-f]|gfx103[0-9a-f]|gfx110[0-9a-f]|gfx115[0-9a-f]|gfx120[0-9a-f]|gfx906) return 0 ;;
+    gfx101[0-9a-f]|gfx103[0-9a-f]|gfx110[0-9a-f]|gfx115[0-9a-f]|gfx120[0-9a-f]|gfx906|gfx908|gfx90a|gfx942|gfx950) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -874,6 +899,28 @@ strata_amd_opt_in_env_list() {
   return 0
 }
 
+_fill_strata_runtime_env_array() {
+  local -n _out_env="$1"
+  _out_env=()
+  local _ag _has_1150=false _has_1103=false
+  if (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )); then
+    for _ag in "${AMD_MISSING_GFX_ARCHS[@]}"; do
+      case "$_ag" in
+        gfx1150) [[ "$_has_1150" == false ]] && { _out_env+=("STRATA_EXPERIMENTAL_GFX1150=1"); _has_1150=true; } ;;
+        gfx1103) [[ "$_has_1103" == false ]] && { _out_env+=("STRATA_EXPERIMENTAL_GFX1103=1"); _has_1103=true; } ;;
+      esac
+    done
+  fi
+  [[ -f "$NVIDIA_SM70_MARKER" ]] && _out_env+=("STRATA_SM70_TABLE=1")
+}
+
+strata_runtime_env_list() {
+  local -a _rt_env=()
+  _fill_strata_runtime_env_array _rt_env
+  (( ${#_rt_env[@]} > 0 )) && printf '%s\n' "${_rt_env[@]}"
+  return 0
+}
+
 amd_gfx_label() {
   case "$1" in
     gfx1150) echo "Radeon 890M / 880M (Strix Point APU)" ;;
@@ -887,6 +934,10 @@ amd_gfx_label() {
     gfx1033) echo "Radeon Graphics (Van Gogh APU)" ;;
     gfx1034) echo "Radeon RX 6500 XT / 6400 (RDNA2)" ;;
     gfx906)  echo "Instinct MI50 / MI60 / Radeon VII (Vega 20 wave64)" ;;
+    gfx908)  echo "Instinct MI100 (CDNA 1 wave64)" ;;
+    gfx90a)  echo "Instinct MI210 / MI250 / MI250X (CDNA 2 wave64)" ;;
+    gfx942)  echo "Instinct MI300X / MI300A / MI325X (CDNA 3 wave64)" ;;
+    gfx950)  echo "Instinct MI350X / MI355X (CDNA 4 wave64)" ;;
     gfx1201) echo "Radeon RX 9070 / AI PRO R9700 (RDNA4)" ;;
     gfx1200) echo "Radeon RX 9060 (RDNA4)" ;;
     gfx1100) echo "Radeon RX 7900 / W7900 (RDNA3)" ;;
@@ -913,6 +964,8 @@ amd_gfx_therock_family() {
     gfx101[0-9a-f]) echo "gfx101X-dgpu" ;;
     gfx120[0-9a-f]) echo "gfx120X-all" ;;
     gfx125[0-9a-f]) echo "gfx125X-dcgpu" ;;
+    gfx94[0-9a-f])  echo "gfx94X-dcgpu" ;;
+    gfx95[0-9a-f])  echo "gfx950-dcgpu" ;;
     *) return 1 ;;
   esac
 }
@@ -941,6 +994,10 @@ amd_gfx_from_pci_id() {
     0x7360|0x7362) echo "gfx1011" ;;
     0x7340|0x7341|0x7347|0x734f) echo "gfx1012" ;;
     0x66a0|0x66a1|0x66a2|0x66a3|0x66a7|0x66af) echo "gfx906" ;;
+    0x738c|0x738e) echo "gfx908" ;;
+    0x7408|0x740c|0x740f|0x7410) echo "gfx90a" ;;
+    0x74a0|0x74a1|0x74a2|0x74a5|0x74a9|0x74b5|0x74b9|0x74bd) echo "gfx942" ;;
+    0x75a0|0x75a3) echo "gfx950" ;;
     *) return 1 ;;
   esac
 }
@@ -990,17 +1047,21 @@ amd_gfx_from_name() {
   elif grep -qiE 'Van Gogh' <<<"$name"; then echo "gfx1033"
   elif grep -qiE '\bRX 9070\b|\bR9700\b' <<<"$name"; then echo "gfx1201"
   elif grep -qiE '\bRX 9060\b' <<<"$name"; then echo "gfx1200"
-  elif grep -qiE '\bRX 7900\b' <<<"$name"; then echo "gfx1100"
+  elif grep -qiE '\bRX 7900\b|\bW7[89]00\b' <<<"$name"; then echo "gfx1100"
   elif grep -qiE '\bRX 7[78]00\b' <<<"$name"; then echo "gfx1101"
   elif grep -qiE '\bRX 7600\b' <<<"$name"; then echo "gfx1102"
-  elif grep -qiE '\bRX 6(800|900|950)\b' <<<"$name"; then echo "gfx1030"
+  elif grep -qiE '\bRX 6(800|900|950)\b|\bW6800\b' <<<"$name"; then echo "gfx1030"
   elif grep -qiE '\bRX 67[05]0\b' <<<"$name"; then echo "gfx1031"
-  elif grep -qiE '\bRX 66[05]0\b' <<<"$name"; then echo "gfx1032"
+  elif grep -qiE '\bRX 66[05]0\b|\bW6600\b' <<<"$name"; then echo "gfx1032"
   elif grep -qiE '\bRX 6(400|500)\b' <<<"$name"; then echo "gfx1034"
   elif grep -qiE '\bRX 5[67]00\b' <<<"$name"; then echo "gfx1010"
   elif grep -qiE 'Pro V520|\b5600M\b' <<<"$name"; then echo "gfx1011"
   elif grep -qiE '\bRX 5500\b' <<<"$name"; then echo "gfx1012"
   elif grep -qiE '\bMI50\b|\bMI60\b|Radeon VII' <<<"$name"; then echo "gfx906"
+  elif grep -qiE '\bMI100\b' <<<"$name"; then echo "gfx908"
+  elif grep -qiE '\bMI2(10|50X?)\b' <<<"$name"; then echo "gfx90a"
+  elif grep -qiE '\bMI3(00[XA]?|25X)\b' <<<"$name"; then echo "gfx942"
+  elif grep -qiE '\bMI35[05]X\b' <<<"$name"; then echo "gfx950"
   elif grep -qiE 'Raphael|Granite Ridge' <<<"$name"; then echo "gfx1036"
   else return 1; fi
 }
@@ -1020,10 +1081,13 @@ detect_amd_gfx_archs() {
   AMD_MISSING_GFX_SUMMARY=""
   HAS_AMD_APU=false
   HAS_AMD_PREBUILT_GFX=false
+  HAS_AMD_INSTINCT=false
+  HAS_AMD_NON_INSTINCT=false
   AMD_GTT_TOTAL_MB=0
 
   local kfd_dir="${STRATA_KFD_NODES_DIR:-/sys/class/kfd/kfd/topology/nodes}"
   local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}"
+  local pci_dir="${STRATA_PCI_DIR:-/sys/bus/pci/devices}"
 
   # 1. Primary probe: KFD sysfs topology
   if [[ -d "$kfd_dir" ]]; then
@@ -1048,9 +1112,9 @@ detect_amd_gfx_archs() {
     done < <(awk '/^[[:space:]]*Name:[[:space:]]*gfx[0-9a-fA-F]+/ {print tolower($2)}' <<<"$r_out")
   fi
 
-  # 3. Tertiary probe: PCI device IDs (sysfs DRM, then lspci -nn)
-  local card ven did gfx found_pci=false
-  if (( ${#AMD_GFX_ARCHS[@]} == 0 )) && [[ -d "$drm_dir" ]]; then
+  # 3. Tertiary probe: PCI device IDs (sysfs DRM, sysfs PCI incl. class 0x1200, then lspci -nn)
+  local card dev_p cls ven did gfx found_pci=false has_mi50_60_id=false has_r7_id=false
+  if [[ -d "$drm_dir" ]]; then
     for card in "$drm_dir"/card[0-9]*; do
       [[ -e "$card" ]] || continue
       [[ "$(basename "$card")" == *-* ]] && continue
@@ -1059,18 +1123,43 @@ detect_amd_gfx_archs() {
       did="$(tr '[:upper:]' '[:lower:]' < "$card/device/device" 2>/dev/null || true)"
       [[ "$did" =~ ^0x[0-9a-f]+$ ]] || continue
       found_pci=true
-      _is_amd_apu_pci_id "$did" && HAS_AMD_APU=true
-      gfx="$(amd_gfx_from_pci_id "$did" || true)"
-      _append_unique_amd_gfx "$gfx"
+      [[ "$did" =~ ^0x66a[0123]$ ]] && has_mi50_60_id=true
+      [[ "$did" == "0x66af" || "$did" == "0x66a7" ]] && has_r7_id=true
+      if (( ${#AMD_GFX_ARCHS[@]} == 0 )); then
+        _is_amd_apu_pci_id "$did" && HAS_AMD_APU=true
+        gfx="$(amd_gfx_from_pci_id "$did" || true)"
+        _append_unique_amd_gfx "$gfx"
+      fi
+    done
+  fi
+  if [[ -d "$pci_dir" ]]; then
+    for dev_p in "$pci_dir"/*; do
+      [[ -d "$dev_p" ]] || continue
+      ven="$(tr '[:upper:]' '[:lower:]' < "$dev_p/vendor" 2>/dev/null || true)"
+      [[ "$ven" == "0x1002" ]] || continue
+      cls="$(tr '[:upper:]' '[:lower:]' < "$dev_p/class" 2>/dev/null || true)"
+      [[ "$cls" == 0x03* || "$cls" == 0x12* ]] || continue
+      did="$(tr '[:upper:]' '[:lower:]' < "$dev_p/device" 2>/dev/null || true)"
+      [[ "$did" =~ ^0x[0-9a-f]+$ ]] || continue
+      found_pci=true
+      [[ "$did" =~ ^0x66a[0123]$ ]] && has_mi50_60_id=true
+      [[ "$did" == "0x66af" || "$did" == "0x66a7" ]] && has_r7_id=true
+      if (( ${#AMD_GFX_ARCHS[@]} == 0 )); then
+        _is_amd_apu_pci_id "$did" && HAS_AMD_APU=true
+        gfx="$(amd_gfx_from_pci_id "$did" || true)"
+        _append_unique_amd_gfx "$gfx"
+      fi
     done
   fi
   if (( ${#AMD_GFX_ARCHS[@]} == 0 )) && [[ "$found_pci" == false ]] && command -v lspci >/dev/null 2>&1; then
     local lspci_nn l
-    lspci_nn="$(lspci -nn 2>/dev/null | grep -iE "vga|3d|display" || true)"
+    lspci_nn="$(lspci -nn 2>/dev/null | grep -iE "vga|3d|display|processing accelerators" || true)"
     while IFS= read -r l; do
       [[ -n "$l" ]] || continue
       if [[ "$l" =~ \[1002:([0-9a-fA-F]{4})\] ]]; then
         did="0x${BASH_REMATCH[1],,}"
+        [[ "$did" =~ ^0x66a[0123]$ ]] && has_mi50_60_id=true
+        [[ "$did" == "0x66af" || "$did" == "0x66a7" ]] && has_r7_id=true
         _is_amd_apu_pci_id "$did" && HAS_AMD_APU=true
         gfx="$(amd_gfx_from_pci_id "$did" || true)"
         _append_unique_amd_gfx "$gfx"
@@ -1083,7 +1172,7 @@ detect_amd_gfx_archs() {
     local gline gfx
     while IFS= read -r gline; do
       [[ -n "$gline" ]] || continue
-      grep -qiE "amd|ati|radeon" <<<"$gline" || continue
+      grep -qiE "\b(amd|ati|radeon|instinct)\b" <<<"$gline" || continue
       gfx="$(amd_gfx_from_name "$gline" || true)"
       _append_unique_amd_gfx "$gfx"
     done <<<"$GPU_RAW"
@@ -1114,10 +1203,28 @@ detect_amd_gfx_archs() {
       fi
       if _is_amd_compute_apu_gfx "$a"; then
         HAS_AMD_APU=true
+        HAS_AMD_NON_INSTINCT=true
       elif [[ "$a" == "gfx1036" ]]; then
         has_display_igpu=true
+      elif [[ "$a" == "gfx908" || "$a" == "gfx90a" || "$a" == "gfx942" || "$a" == "gfx950" ]]; then
+        HAS_AMD_INSTINCT=true
+      elif [[ "$a" == "gfx906" ]]; then
+        if [[ "$has_mi50_60_id" == true ]] || grep -qiE "\bMI50\b|\bMI60\b|Instinct" <<<"${GPU_RAW:-$GPU_SUMMARY}"; then
+          HAS_AMD_INSTINCT=true
+        fi
+        if [[ "$has_r7_id" == true ]] || grep -qi "Radeon VII" <<<"${GPU_RAW:-$GPU_SUMMARY}" || [[ "$HAS_AMD_INSTINCT" == false ]]; then
+          HAS_AMD_NON_INSTINCT=true
+        fi
+      else
+        HAS_AMD_NON_INSTINCT=true
       fi
     done
+  elif [[ "$HAS_AMD" == true ]]; then
+    if grep -qiE "Instinct|\bMI50\b|\bMI60\b|\bMI100\b|\bMI2(10|50X?)\b|\bMI3(00[XA]?|25X|5[05]X)\b" <<<"${GPU_RAW:-$GPU_SUMMARY}"; then
+      HAS_AMD_INSTINCT=true
+    else
+      HAS_AMD_NON_INSTINCT=true
+    fi
   fi
 
   if [[ "$HAS_AMD_APU" == false && "$HAS_NVIDIA" == false && "$HAS_INTEL_ARC" == false && "$HAS_AMD_PREBUILT_GFX" == false && ${#AMD_MISSING_GFX_ARCHS[@]} -eq 0 ]]; then
@@ -1272,17 +1379,64 @@ ensure_script_tools() {
   fi
 }
 
+_is_nvidia_datacenter_name() {
+  local n="${1:-}"
+  grep -qiE "tesla" <<<"$n" && return 0
+  grep -qiE "RTX PRO 6000.*Server|CMP [0-9]+HX|P10[246]-100" <<<"$n" && return 0
+  grep -qiE "NVIDIA (T4G?|V100S?|A100|A800|A40|A30|A16|A10G?|A2|L40S?|L20|L4|L2|H100|H200|H800|H20|B100|B200|B300|GB200|GH200)\b" <<<"$n" && return 0
+  grep -qiE "\b(T4G?|V100S?|A100|A800|A40|A30|A16|A10G?|A2|L40S?|L20|L4|L2|H100|H200|H800|H20|B100|B200|B300)\b.*(PCIe|SXM|NVL|HGX|16GB|24GB|32GB|40GB|48GB|80GB|94GB|96GB|141GB|180GB|192GB)" <<<"$n" && return 0
+  return 1
+}
+
+_is_nvidia_consumer_unlock_name() {
+  local n="${1:-}"
+  _is_nvidia_datacenter_name "$n" && return 1
+  grep -qiE "Quadro|RTX A[0-9]|RTX PRO" <<<"$n" && return 1
+  grep -qiE "GTX 16|RTX 20|RTX 30|RTX 40|\b(TU10[246]|TU11[67]|GA10[2467]|AD10[23467])([^G]|$)" <<<"$n"
+}
+
+_is_intel_discrete_pci_id() {
+  case "${1,,}" in
+    0x569*|0x56a*|0x56b*|0x56c*|0x4f8*|0xe20*|0xe21*|0x0bd*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+_intel_dgpu_vram_mb_from_pci_id() {
+  case "${1,,}" in
+    0xe211) echo 24576 ;; # Intel Arc Pro B60 (24 GiB)
+    0xe212) echo 16384 ;; # Intel Arc Pro B50 (16 GiB)
+    0xe20b) echo 12288 ;; # Intel Arc B580 (12 GiB)
+    0xe20c) echo 10240 ;; # Intel Arc B570 (10 GiB)
+    *) return 1 ;;
+  esac
+}
+
 detect_environment() {
   detect_platform_basics
   TOTAL_VRAM_MB=0
   NVIDIA_VRAM_MB=0
+  HAS_NVIDIA=false HAS_NVIDIA_POWERD=false HAS_AMD=false HAS_INTEL_GPU=false HAS_INTEL_ARC=false
+  HAS_NVIDIA_TESLA=false HAS_NVIDIA_NON_TESLA=false NVIDIA_COMPUTE_MODE_NON_DEFAULT=false
+  HAS_NVIDIA_DATACENTER=false HAS_NVIDIA_PASSIVE=false HAS_NVIDIA_LEGACY_PSTATE_CARD=false
+  HAS_NVIDIA_KEPLER=false HAS_NVIDIA_MAXWELL=false HAS_NVIDIA_PASCAL=false HAS_NVIDIA_VOLTA_SM70=false
+  HAS_NVIDIA_NVSWITCH=false IS_DGX_SPARK=false HAS_NVIDIA_UNIFIED_MEM=false
+  NVIDIA_DRIVER_VER="" NVIDIA_DRIVER_MAJOR=0 NVIDIA_LIVE_EXTRA_FIELDS=""
+  SYS_VENDOR="$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || true)"
+  PRODUCT_NAME="$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)"
+  local dt_dir="${STRATA_DT_DIR:-/proc/device-tree}"
+  if grep -qiE "GB10|DGX Spark|Grace Blackwell" "$dt_dir/model" /sys/class/dmi/id/product_name 2>/dev/null; then
+    IS_DGX_SPARK=true
+    HAS_NVIDIA_UNIFIED_MEM=true
+  fi
 
   if command -v nvidia-smi >/dev/null 2>&1; then
-    local nv_q
+    local nv_q cap_installed=false
+    service_installed strata-nvidia-power-cap.service && cap_installed=true
     nv_q="$(nvidia-smi --query-gpu=index,name,power.limit,power.default_limit,power.max_limit,memory.total,compute_mode --format=csv,noheader,nounits 2>/dev/null || true)"
     if [[ -n "$nv_q" ]]; then
       HAS_NVIDIA=true
-      NVIDIA_GPU_INDICES=() NVIDIA_GPU_NAMES=() NVIDIA_GPU_CUR_PL=() NVIDIA_GPU_DEF_PL=() NVIDIA_GPU_MAX_PL=() NVIDIA_GPU_VRAM=() NVIDIA_GPU_COMPUTE_MODE=() NVIDIA_GPU_IS_TESLA=() NVIDIA_GPU_PL_SUPPORTED=()
+      NVIDIA_GPU_INDICES=() NVIDIA_GPU_NAMES=() NVIDIA_GPU_CUR_PL=() NVIDIA_GPU_DEF_PL=() NVIDIA_GPU_MAX_PL=() NVIDIA_GPU_MIN_PL=() NVIDIA_GPU_VRAM=() NVIDIA_GPU_COMPUTE_MODE=() NVIDIA_GPU_IS_TESLA=() NVIDIA_GPU_IS_DATACENTER=() NVIDIA_GPU_IS_PASSIVE=() NVIDIA_GPU_PL_SUPPORTED=() NVIDIA_GPU_COMPUTE_CAP=()
       local nv_vram_sum=0 nv_line g_idx g_name g_cur g_def g_mx g_vram g_cmode is_tesla pl_ok
       while IFS= read -r nv_line; do
         [[ -n "$nv_line" ]] || continue
@@ -1296,16 +1450,21 @@ detect_environment() {
         g_cmode="${g_cmode//[[:space:]]/}"
         [[ "$g_idx" =~ ^[0-9]+$ ]] || continue
         is_tesla=false
-        if grep -qi "tesla" <<<"$g_name"; then
+        if _is_nvidia_datacenter_name "$g_name"; then
           is_tesla=true
           HAS_NVIDIA_TESLA=true
-        else
+          HAS_NVIDIA_DATACENTER=true
+        elif ! grep -qiE "GB10|DGX Spark" <<<"$g_name"; then
           HAS_NVIDIA_NON_TESLA=true
         fi
+        if grep -qiE "GB10|DGX Spark" <<<"$g_name"; then
+          IS_DGX_SPARK=true
+          HAS_NVIDIA_UNIFIED_MEM=true
+        fi
         pl_ok=false
-        if [[ -n "$g_def" && -n "$g_mx" && "$g_mx" -gt "$g_def" ]] && ! grep -qiE "Laptop GPU|Mobile|Max-Q" <<<"$g_name"; then
+        if [[ -n "$g_mx" && "$g_mx" -gt 0 ]] && { [[ -n "$g_def" && "$g_mx" -gt "$g_def" ]] || [[ "$cap_installed" == false && -n "$g_cur" && "$g_cur" -lt "$g_mx" ]]; } && ! grep -qiE "Laptop GPU|Mobile|Max-Q" <<<"$g_name"; then
           pl_ok=true
-          if (( EUID == 0 )) && [[ -n "$g_cur" ]] && grep -qi "not supported" <<<"$(nvidia-smi -i "$g_idx" -pl "$g_cur" 2>&1 || true)"; then
+          if [[ "${CHECK_ONLY:-false}" == false && $EUID -eq 0 ]] && [[ -n "$g_cur" ]] && grep -qi "not supported" <<<"$(nvidia-smi -i "$g_idx" -pl "$g_cur" 2>&1 || true)"; then
             pl_ok=false
           fi
         fi
@@ -1314,13 +1473,17 @@ detect_environment() {
         NVIDIA_GPU_CUR_PL+=("$g_cur")
         NVIDIA_GPU_DEF_PL+=("$g_def")
         NVIDIA_GPU_MAX_PL+=("$g_mx")
+        NVIDIA_GPU_MIN_PL+=("")
         NVIDIA_GPU_VRAM+=("$g_vram")
         NVIDIA_GPU_COMPUTE_MODE+=("$g_cmode")
         NVIDIA_GPU_IS_TESLA+=("$is_tesla")
+        NVIDIA_GPU_IS_DATACENTER+=("$is_tesla")
+        NVIDIA_GPU_IS_PASSIVE+=("$is_tesla")
         NVIDIA_GPU_PL_SUPPORTED+=("$pl_ok")
+        NVIDIA_GPU_COMPUTE_CAP+=("")
         [[ -n "$g_cmode" && "$g_cmode" != "Default" ]] && NVIDIA_COMPUTE_MODE_NON_DEFAULT=true
         [[ "$g_vram" =~ ^[0-9]+$ ]] && nv_vram_sum=$((nv_vram_sum + g_vram))
-        if [[ -n "$g_def" && -n "$g_mx" && "$g_mx" -gt "$g_def" ]]; then
+        if [[ "$pl_ok" == true ]]; then
           if [[ -z "$NVIDIA_MAX_PL" || -z "$NVIDIA_DEFAULT_PL" || "$NVIDIA_MAX_PL" -le "$NVIDIA_DEFAULT_PL" ]]; then
             NVIDIA_CURRENT_PL="$g_cur"
             NVIDIA_DEFAULT_PL="$g_def"
@@ -1336,15 +1499,47 @@ detect_environment() {
       [[ "$nv_vram_sum" -gt 0 ]] && TOTAL_VRAM_MB=$((TOTAL_VRAM_MB + nv_vram_sum))
       refresh_nvidia_clocks
       refresh_nvidia_ecc
+      refresh_nvidia_caps
+      refresh_nvidia_mig
     fi
   fi
-  local gpu_lines gpu_render_lines gpu_src gpu_suffix=""
-  gpu_lines="$(lspci 2>/dev/null | grep -iE "vga|3d|display" || true)"
+  local raw_pci_lines gpu_lines="" gpu_render_lines gpu_src gpu_suffix="" p_line
+  local pci_dir="${STRATA_PCI_DIR:-/sys/bus/pci/devices}"
+  local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}"
+  raw_pci_lines="$(lspci 2>/dev/null | grep -iE "vga|3d|display|processing accelerators" || true)"
+  while IFS= read -r p_line; do
+    [[ -n "$p_line" ]] || continue
+    if grep -qi "processing accelerators" <<<"$p_line"; then
+      if grep -qiE "QuickAssist|QAT|GNA|Gaussian|NPU|Movidius|VPU|Neural|IPU" <<<"$p_line"; then
+        continue
+      fi
+      grep -qiE "\b(amd|ati|radeon|instinct|nvidia|tesla|arc|ponte vecchio|flex|battlemage|alchemist|bmg)\b|data center gpu" <<<"$p_line" || continue
+    fi
+    gpu_lines+="${p_line}"$'\n'
+  done <<< "$raw_pci_lines"
+  gpu_lines="${gpu_lines%$'\n'}"
   if [[ "$HAS_NVIDIA" == false ]] && grep -qi "nvidia" <<< "$gpu_lines"; then
     HAS_NVIDIA=true
   fi
-  if [[ "$HAS_NVIDIA_TESLA" == false ]] && grep -qiE "nvidia.*tesla|tesla.*(k80|k40|k20|m40|m60|m10|p4|p40|p100|v100|t4)" <<< "$gpu_lines"; then
+  if grep -qi "nvidia" <<< "$gpu_lines" && _is_nvidia_datacenter_name "$gpu_lines"; then
     HAS_NVIDIA_TESLA=true
+    HAS_NVIDIA_DATACENTER=true
+  elif [[ "$HAS_NVIDIA_TESLA" == false ]] && grep -qiE "nvidia.*(tesla|k80|k40|k20|m40|m60|m10|p4\b|p40|p100|v100|t4\b|a100|a800|a40|a30|a16|a10g?|a2\b|l40s?|l20|l4\b|h100|h200|b100|b200|cmp.*hx)" <<< "$gpu_lines"; then
+    HAS_NVIDIA_TESLA=true
+    HAS_NVIDIA_DATACENTER=true
+  fi
+  if [[ "$HAS_NVIDIA" == true && ${#NVIDIA_GPU_INDICES[@]} -eq 0 ]]; then
+    grep -qiE "\b(k80|k40|k20)\b" <<<"$gpu_lines" && HAS_NVIDIA_KEPLER=true
+    grep -qiE "\b(m40|m60|m10)\b" <<<"$gpu_lines" && HAS_NVIDIA_MAXWELL=true
+    grep -qiE "\b(p100|p40|p4|gtx 10)\b" <<<"$gpu_lines" && HAS_NVIDIA_PASCAL=true
+    grep -qiE "\b(v100|titan v)\b" <<<"$gpu_lines" && HAS_NVIDIA_VOLTA_SM70=true
+  fi
+  if compgen -G "/dev/nvidia-nvswitch*" >/dev/null 2>&1 || lspci -nn 2>/dev/null | grep -qiE "10de:(1af1|1af2|22a3|22a4|22b1)|NVIDIA.*NVSwitch"; then
+    HAS_NVIDIA_NVSWITCH=true
+  fi
+  if [[ "$IS_DGX_SPARK" == false && "$HAS_NVIDIA" == true ]] && { grep -qiE "GB10|DGX Spark" <<<"${gpu_lines} ${PRODUCT_NAME}" || { [[ "$(uname -m 2>/dev/null)" == "aarch64" && "$NVIDIA_VRAM_MB" -eq 0 ]] && grep -qiE "GB10|DGX Spark|Grace Blackwell" "${STRATA_DT_DIR:-/proc/device-tree}/model" /sys/class/dmi/id/product_name 2>/dev/null; }; }; then
+    IS_DGX_SPARK=true
+    HAS_NVIDIA_UNIFIED_MEM=true
   fi
   GPU_RAW="$gpu_lines"
   gpu_render_lines="$(grep -viE "aspeed|matrox.*g200|g200e|serverengines|pilot[0-9 ]|hi171[0-9]|xgi.*volari" <<< "$gpu_lines" || true)"
@@ -1361,12 +1556,33 @@ detect_environment() {
   [[ -z "$GPU_SUMMARY" ]] && GPU_SUMMARY="Unknown"
   if echo "$gpu_lines" | grep -qi "intel"; then
     HAS_INTEL_GPU=true
-    echo "$gpu_lines" | grep -qiE "Arc|DG2|Battlemage|Alchemist" && HAS_INTEL_ARC=true
+    echo "$gpu_lines" | grep -qiE "\b(Arc|DG2|Battlemage|Alchemist|BMG|Flex)\b|Data Center GPU|Ponte Vecchio" && HAS_INTEL_ARC=true
   fi
-  echo "$gpu_lines" | grep -qiE "amd|ati|radeon" && HAS_AMD=true
+  if [[ -d "$pci_dir" ]]; then
+    local _idev _iven _idid _icls
+    for _idev in "$pci_dir"/*; do
+      [[ -d "$_idev" ]] || continue
+      _icls="$(cat "$_idev/class" 2>/dev/null || true)"
+      [[ "$_icls" == 0x03* || "$_icls" == 0x12* ]] || continue
+      _iven="$(tr '[:upper:]' '[:lower:]' < "$_idev/vendor" 2>/dev/null || true)"
+      if [[ "$_iven" == "0x8086" ]]; then
+        [[ "$_icls" == 0x03* ]] && HAS_INTEL_GPU=true
+        _idid="$(tr '[:upper:]' '[:lower:]' < "$_idev/device" 2>/dev/null || true)"
+        if _is_intel_discrete_pci_id "$_idid"; then
+          HAS_INTEL_GPU=true
+          HAS_INTEL_ARC=true
+        fi
+      elif [[ "$_iven" == "0x1002" ]]; then
+        HAS_AMD=true
+      elif [[ "$_iven" == "0x10de" ]]; then
+        HAS_NVIDIA=true
+      fi
+    done
+  fi
+  echo "$gpu_lines" | grep -qiE "\b(amd|ati|radeon|instinct)\b" && HAS_AMD=true
   detect_amd_gfx_archs
   if [[ "$HAS_AMD" == true ]]; then
-    local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}" card ven vram_file vt
+    local card ven vram_file vt
     for card in "$drm_dir"/card[0-9]*; do
       [[ -e "$card" ]] || continue
       [[ "$(basename "$card")" == *-* ]] && continue
@@ -1380,11 +1596,66 @@ detect_environment() {
       [[ "$vt" =~ ^[0-9]+$ ]] && (( vt > 0 )) && TOTAL_VRAM_MB=$((TOTAL_VRAM_MB + vt / 1048576))
     done
   fi
+  if [[ "$HAS_INTEL_ARC" == true ]]; then
+    local intel_vram_added=false card ven did vt_b v_mb max_b s e f sz
+    for card in "$drm_dir"/card[0-9]*; do
+      [[ -e "$card" ]] || continue
+      [[ "$(basename "$card")" == *-* ]] && continue
+      [[ -r "$card/device/vendor" ]] || continue
+      ven="$(tr '[:upper:]' '[:lower:]' < "$card/device/vendor" 2>/dev/null || true)"
+      [[ "$ven" == "0x8086" ]] || continue
+      did="$(tr '[:upper:]' '[:lower:]' < "$card/device/device" 2>/dev/null || true)"
+      _is_intel_discrete_pci_id "$did" || continue
+      v_mb=""
+      for vt_b in "$card/device/lmem_total_bytes" "$card/device/tile0/memory/vram_size" "$card/device/mem_info_vram_total"; do
+        if [[ -r "$vt_b" ]]; then
+          sz="$(cat "$vt_b" 2>/dev/null || echo 0)"
+          if [[ "$sz" =~ ^[0-9]+$ ]] && (( sz > 0 )); then
+            v_mb=$(( sz / 1048576 ))
+            break
+          fi
+        fi
+      done
+      if [[ -z "$v_mb" ]]; then
+        v_mb="$(_intel_dgpu_vram_mb_from_pci_id "$did" || true)"
+      fi
+      if [[ -z "$v_mb" && -r "$card/device/resource" ]]; then
+        max_b=0
+        while read -r s e f; do
+          [[ "$s" =~ ^0x[0-9a-fA-F]+$ && "$e" =~ ^0x[0-9a-fA-F]+$ ]] || continue
+          sz=$(( e - s + 1 ))
+          (( e > s && sz > max_b )) && max_b=$sz
+        done < "$card/device/resource" 2>/dev/null
+        (( max_b >= 4294967296 )) && v_mb=$(( max_b / 1048576 ))
+      fi
+      if [[ "$v_mb" =~ ^[0-9]+$ ]] && (( v_mb > 0 )); then
+        TOTAL_VRAM_MB=$((TOTAL_VRAM_MB + v_mb))
+        intel_vram_added=true
+      fi
+    done
+    if [[ "$intel_vram_added" == false && -d "$pci_dir" ]]; then
+      for dev in "$pci_dir"/*; do
+        [[ -d "$dev" ]] || continue
+        ven="$(tr '[:upper:]' '[:lower:]' < "$dev/vendor" 2>/dev/null || true)"
+        [[ "$ven" == "0x8086" ]] || continue
+        did="$(tr '[:upper:]' '[:lower:]' < "$dev/device" 2>/dev/null || true)"
+        _is_intel_discrete_pci_id "$did" || continue
+        v_mb="$(_intel_dgpu_vram_mb_from_pci_id "$did" || true)"
+        [[ "$v_mb" =~ ^[0-9]+$ ]] && (( v_mb > 0 )) && TOTAL_VRAM_MB=$((TOTAL_VRAM_MB + v_mb))
+      done
+    fi
+  fi
 
   if [[ "$IS_JETSON" == true && "$HAS_NVIDIA" == false ]]; then
     HAS_NVIDIA=true
     if [[ "$IS_JETSON_TX2" == true ]]; then
       GPU_SUMMARY="NVIDIA Tegra X2 (Pascal, 256 CUDA cores, Unified)"
+    elif [[ "$IS_JETSON_ORIN" == true ]]; then
+      GPU_SUMMARY="${JETSON_MODEL:-NVIDIA Jetson Orin} (Ampere iGPU, Unified)"
+    elif [[ "$IS_JETSON_XAVIER" == true ]]; then
+      GPU_SUMMARY="${JETSON_MODEL:-NVIDIA Jetson Xavier} (Volta iGPU, Unified)"
+    elif [[ "$IS_JETSON_THOR" == true ]]; then
+      GPU_SUMMARY="${JETSON_MODEL:-NVIDIA Jetson AGX Thor} (Blackwell iGPU, Unified)"
     else
       GPU_SUMMARY="${JETSON_MODEL:-NVIDIA Jetson} Integrated GPU (Unified)"
     fi
@@ -1416,16 +1687,23 @@ detect_environment() {
   [[ "$sk" =~ ^[0-9]+$ ]] && (( sk > 0 )) || sk="$(lscpu 2>/dev/null | awk -F: '/^Socket\(s\)/ {gsub(/ /,"",$2); print $2}' || true)"
   CPU_SOCKETS="${sk:-1}"
 
-  local dev cls ven gn=0
-  for dev in /sys/bus/pci/devices/*; do
-    cls="$(cat "$dev/class" 2>/dev/null || true)"; [[ "$cls" == 0x03* ]] || continue
-    ven="$(cat "$dev/vendor" 2>/dev/null || true)"; [[ "$ven" == "0x10de" || "$ven" == "0x1002" ]] && ((gn++))
+  local dev cls ven did gn=0
+  for dev in "$pci_dir"/*; do
+    [[ -d "$dev" ]] || continue
+    cls="$(cat "$dev/class" 2>/dev/null || true)"
+    [[ "$cls" == 0x03* || "$cls" == 0x12* ]] || continue
+    ven="$(tr '[:upper:]' '[:lower:]' < "$dev/vendor" 2>/dev/null || true)"
+    if [[ "$ven" == "0x10de" || "$ven" == "0x1002" ]]; then
+      ((gn++))
+    elif [[ "$ven" == "0x8086" ]]; then
+      did="$(tr '[:upper:]' '[:lower:]' < "$dev/device" 2>/dev/null || true)"
+      _is_intel_discrete_pci_id "$did" && ((gn++))
+    fi
   done
   DISCRETE_GPU_COUNT="$gn"
+  (( DISCRETE_GPU_COUNT < ${#NVIDIA_GPU_INDICES[@]} )) && DISCRETE_GPU_COUNT="${#NVIDIA_GPU_INDICES[@]}"
 
   unit_exists nvidia-powerd.service && HAS_NVIDIA_POWERD=true
-  SYS_VENDOR="$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || true)"
-  PRODUCT_NAME="$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)"
   if [[ -d /sys/class/power_supply/BAT0 || -d /sys/class/power_supply/BAT1 ]] || [[ "$(cat /sys/class/dmi/id/chassis_type 2>/dev/null || true)" =~ ^(8|9|10|14)$ ]]; then
     IS_LAPTOP=true
   fi
@@ -1492,11 +1770,143 @@ refresh_nvidia_power_limits() {
     for (( i = 0; i < ${#NVIDIA_GPU_INDICES[@]}; i++ )); do
       if [[ "${NVIDIA_GPU_INDICES[$i]}" == "$g_idx" ]]; then
         NVIDIA_GPU_CUR_PL[$i]="$g_cur"
-        if [[ -n "${NVIDIA_GPU_MAX_PL[$i]}" && -n "${NVIDIA_GPU_DEF_PL[$i]}" && "${NVIDIA_GPU_MAX_PL[$i]}" -gt "${NVIDIA_GPU_DEF_PL[$i]}" ]]; then
+        if [[ "${NVIDIA_GPU_PL_SUPPORTED[$i]}" == true ]] || [[ -n "${NVIDIA_GPU_MAX_PL[$i]}" && -n "${NVIDIA_GPU_DEF_PL[$i]}" && "${NVIDIA_GPU_MAX_PL[$i]}" -gt "${NVIDIA_GPU_DEF_PL[$i]}" ]]; then
           NVIDIA_CURRENT_PL="$g_cur"
         fi
       fi
     done
+  done <<< "$raw"
+}
+refresh_nvidia_caps() {
+  HAS_NVIDIA_PASSIVE=false HAS_NVIDIA_LEGACY_PSTATE_CARD=false
+  HAS_NVIDIA_KEPLER=false HAS_NVIDIA_MAXWELL=false HAS_NVIDIA_PASCAL=false HAS_NVIDIA_VOLTA_SM70=false
+  NVIDIA_DRIVER_VER="" NVIDIA_DRIVER_MAJOR=0
+  local i
+  for (( i = 0; i < ${#NVIDIA_GPU_INDICES[@]}; i++ )); do
+    NVIDIA_GPU_COMPUTE_CAP[$i]=""
+    NVIDIA_GPU_MIN_PL[$i]=""
+  done
+
+  local -A fan_map=()
+  local raw line g_idx val comb_ok=false c_cc c_min c_fan c_drv
+  raw="$(nvidia-smi --query-gpu=index,compute_cap,power.min_limit,fan.speed,driver_version --format=csv,noheader,nounits 2>/dev/null || true)"
+  if [[ -n "$raw" ]] && ! grep -qiE "not a valid|field.*not" <<<"$raw"; then
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      IFS=',' read -r g_idx c_cc c_min c_fan c_drv <<< "$line"
+      g_idx="${g_idx//[[:space:]]/}"
+      c_cc="${c_cc//[[:space:]]/}"
+      c_min="${c_min#"${c_min%%[![:space:]]*}"}"; c_min="${c_min%"${c_min##*[![:space:]]}"}"
+      c_fan="${c_fan#"${c_fan%%[![:space:]]*}"}"; c_fan="${c_fan%"${c_fan##*[![:space:]]}"}"
+      c_drv="${c_drv//[[:space:]]/}"
+      [[ "$g_idx" =~ ^[0-9]+$ && -n "$c_drv" && "$c_drv" == *.* ]] || continue
+      comb_ok=true
+      [[ -z "$NVIDIA_DRIVER_VER" ]] && NVIDIA_DRIVER_VER="$c_drv"
+      fan_map["$g_idx"]="$c_fan"
+      c_min="$(awk '$1 ~ /^[0-9]+(\.[0-9]+)?$/ {printf "%.0f", $1}' <<<"$c_min")"
+      for (( i = 0; i < ${#NVIDIA_GPU_INDICES[@]}; i++ )); do
+        if [[ "${NVIDIA_GPU_INDICES[$i]}" == "$g_idx" ]]; then
+          [[ "$c_cc" =~ ^[0-9]+\.[0-9]+$ ]] && NVIDIA_GPU_COMPUTE_CAP[$i]="$c_cc"
+          [[ "$c_min" =~ ^[0-9]+$ ]] && NVIDIA_GPU_MIN_PL[$i]="$c_min"
+        fi
+      done
+    done <<< "$raw"
+  fi
+
+  if [[ "$comb_ok" == false ]]; then
+    raw="$(nvidia-smi --query-gpu=index,compute_cap --format=csv,noheader 2>/dev/null || true)"
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      IFS=',' read -r g_idx val <<< "$line"
+      g_idx="${g_idx//[[:space:]]/}"
+      val="${val//[[:space:]]/}"
+      [[ "$val" =~ ^[0-9]+\.[0-9]+$ ]] || continue
+      for (( i = 0; i < ${#NVIDIA_GPU_INDICES[@]}; i++ )); do
+        [[ "${NVIDIA_GPU_INDICES[$i]}" == "$g_idx" ]] && NVIDIA_GPU_COMPUTE_CAP[$i]="$val"
+      done
+    done <<< "$raw"
+
+    raw="$(nvidia-smi --query-gpu=index,power.min_limit --format=csv,noheader,nounits 2>/dev/null || true)"
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      IFS=',' read -r g_idx val <<< "$line"
+      g_idx="${g_idx//[[:space:]]/}"
+      val="$(awk '$1 ~ /^[0-9]+(\.[0-9]+)?$/ {printf "%.0f", $1}' <<<"$val")"
+      [[ "$val" =~ ^[0-9]+$ ]] || continue
+      for (( i = 0; i < ${#NVIDIA_GPU_INDICES[@]}; i++ )); do
+        [[ "${NVIDIA_GPU_INDICES[$i]}" == "$g_idx" ]] && NVIDIA_GPU_MIN_PL[$i]="$val"
+      done
+    done <<< "$raw"
+
+    raw="$(nvidia-smi --query-gpu=index,fan.speed --format=csv,noheader,nounits 2>/dev/null || true)"
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      IFS=',' read -r g_idx val <<< "$line"
+      g_idx="${g_idx//[[:space:]]/}"
+      val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
+      [[ "$g_idx" =~ ^[0-9]+$ ]] && fan_map["$g_idx"]="$val"
+    done <<< "$raw"
+
+    NVIDIA_DRIVER_VER="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
+  fi
+  if [[ -z "$NVIDIA_DRIVER_VER" && -r /sys/module/nvidia/version ]]; then
+    NVIDIA_DRIVER_VER="$(awk '{print $1; exit}' /sys/module/nvidia/version 2>/dev/null || true)"
+  fi
+  if [[ "$NVIDIA_DRIVER_VER" =~ ^([0-9]+)\. ]]; then
+    NVIDIA_DRIVER_MAJOR="${BASH_REMATCH[1]}"
+  fi
+
+  local g_name cc is_dc is_passive fan_val
+  for (( i = 0; i < ${#NVIDIA_GPU_INDICES[@]}; i++ )); do
+    g_idx="${NVIDIA_GPU_INDICES[$i]}"
+    g_name="${NVIDIA_GPU_NAMES[$i]}"
+    cc="${NVIDIA_GPU_COMPUTE_CAP[$i]}"
+    is_dc="${NVIDIA_GPU_IS_DATACENTER[$i]}"
+    fan_val="${fan_map[$g_idx]:-}"
+    is_passive=false
+    if [[ "$is_dc" == true ]]; then
+      is_passive=true
+    elif [[ "$fan_val" == *"Not Supported"* ]] && ! grep -qiE "GeForce|Laptop|Mobile|Max-Q" <<<"$g_name" && [[ "$IS_DGX_SPARK" == false ]]; then
+      is_passive=true
+    fi
+    NVIDIA_GPU_IS_PASSIVE[$i]="$is_passive"
+    [[ "$is_passive" == true ]] && HAS_NVIDIA_PASSIVE=true
+
+    if [[ "$cc" == 3.* ]] || grep -qiE "\b(K80|K40|K20|K10)\b" <<<"$g_name"; then
+      HAS_NVIDIA_KEPLER=true
+    elif [[ "$cc" == 5.* ]] || grep -qiE "\b(M40|M60|M10|M6|M4)\b" <<<"$g_name"; then
+      HAS_NVIDIA_MAXWELL=true
+    elif [[ "$cc" == 6.0 || "$cc" == 6.1 ]] || grep -qiE "\b(P100|P40|P4|P6)\b|P10[246]-100" <<<"$g_name"; then
+      HAS_NVIDIA_PASCAL=true
+    elif [[ "$cc" == 7.0 ]] || grep -qiE "\bV100\b|Titan V" <<<"$g_name"; then
+      HAS_NVIDIA_VOLTA_SM70=true
+    fi
+
+    if [[ "$is_dc" == true ]] && { [[ "$cc" =~ ^(5\.|6\.|7\.0$) ]] || grep -qiE "\b(M40|M60|M10|P4|P40|P100|V100)\b|CMP [0-9]+HX|P10[246]-100" <<<"$g_name"; }; then
+      HAS_NVIDIA_LEGACY_PSTATE_CARD=true
+    fi
+  done
+}
+refresh_nvidia_mig() {
+  NVIDIA_MIG_INDICES=() NVIDIA_GPU_MIG_CUR=() NVIDIA_GPU_MIG_PEND=()
+  NVIDIA_MIG_ANY_ENABLED=false NVIDIA_MIG_ANY_PEND_ENABLED=false
+  local raw line g_idx cur pend
+  raw="$(nvidia-smi --query-gpu=index,mig.mode.current,mig.mode.pending --format=csv,noheader 2>/dev/null || true)"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    IFS=',' read -r g_idx cur pend <<< "$line"
+    g_idx="${g_idx//[[:space:]]/}"
+    cur="${cur//[[:space:]]/}"
+    pend="${pend//[[:space:]]/}"
+    if [[ "$g_idx" =~ ^[0-9]+$ && ( "$cur" == "Enabled" || "$cur" == "Disabled" ) ]]; then
+      NVIDIA_MIG_INDICES+=("$g_idx")
+      NVIDIA_GPU_MIG_CUR+=("$cur")
+      NVIDIA_GPU_MIG_PEND+=("$pend")
+      [[ "$cur" == "Enabled" ]] && NVIDIA_MIG_ANY_ENABLED=true
+      if [[ "$pend" == "Enabled" || ( "$pend" != "Disabled" && "$cur" == "Enabled" ) ]]; then
+        NVIDIA_MIG_ANY_PEND_ENABLED=true
+      fi
+    fi
   done <<< "$raw"
 }
 refresh_nvidia_clocks() {
@@ -1610,29 +2020,111 @@ detect_ram_health() {
   fi
 }
 
+detect_pcie_acs_enabled() {
+  PCIE_ACS_CHECKED=false PCIE_ACS_ENABLED=false
+  command -v lspci >/dev/null 2>&1 || return 0
+  local acs_out="" can_read=false
+  if [[ $EUID -eq 0 ]]; then
+    acs_out="$(lspci -d ::0604 -vv 2>/dev/null || lspci -vv 2>/dev/null || true)"
+    can_read=true
+  elif sudo -n true >/dev/null 2>&1; then
+    acs_out="$(sudo -n lspci -d ::0604 -vv 2>/dev/null || sudo -n lspci -vv 2>/dev/null || true)"
+    can_read=true
+  else
+    acs_out="$(lspci -d ::0604 -vv 2>/dev/null || lspci -vv 2>/dev/null || true)"
+    grep -qiE "Capabilities:|ACSCtl:" <<<"$acs_out" && can_read=true
+  fi
+  if [[ "$can_read" == true ]]; then
+    PCIE_ACS_CHECKED=true
+    if grep -qE "ACSCtl:.*(SrcValid\+|ReqRedir\+|CmpltRedir\+|UpstreamFwd\+)" <<<"$acs_out"; then
+      PCIE_ACS_ENABLED=true
+    fi
+  fi
+}
+
 detect_gpu_topology() {
   GPU_TOPO_LINES=()
-  local dev cls ven numa n_gpu=0 n_nv=0 nodes=() distinct
-  for dev in /sys/bus/pci/devices/*; do
-    cls="$(cat "$dev/class" 2>/dev/null || true)"
-    [[ "$cls" == 0x03* ]] || continue
-    ven="$(cat "$dev/vendor" 2>/dev/null || true)"
-    [[ "$ven" == "0x10de" || "$ven" == "0x1002" ]] || continue
-    ((n_gpu++))
-    [[ "$ven" == "0x10de" ]] && ((n_nv++))
-    numa="$(cat "$dev/numa_node" 2>/dev/null || true)"
-    [[ "$numa" =~ ^[0-9]+$ ]] && nodes+=("$numa")
-  done
+  HAS_FULL_GPU_INTERCONNECT=false
+  PCIE_ACS_CHECKED=false PCIE_ACS_ENABLED=false
+  local pci_dir="${STRATA_PCI_DIR:-/sys/bus/pci/devices}"
+  local kfd_dir="${STRATA_KFD_NODES_DIR:-/sys/class/kfd/kfd/topology/nodes}"
+  local dev cls ven did numa n_gpu=0 n_nv=0 n_amd=0 nodes=() distinct
+  if [[ -d "$pci_dir" ]]; then
+    for dev in "$pci_dir"/*; do
+      [[ -d "$dev" ]] || continue
+      cls="$(cat "$dev/class" 2>/dev/null || true)"
+      [[ "$cls" == 0x03* || "$cls" == 0x12* ]] || continue
+      ven="$(tr '[:upper:]' '[:lower:]' < "$dev/vendor" 2>/dev/null || true)"
+      if [[ "$ven" == "0x10de" ]]; then
+        ((n_nv++))
+      elif [[ "$ven" == "0x1002" ]]; then
+        ((n_amd++))
+      elif [[ "$ven" == "0x8086" ]]; then
+        did="$(tr '[:upper:]' '[:lower:]' < "$dev/device" 2>/dev/null || true)"
+        _is_intel_discrete_pci_id "$did" || continue
+      else
+        continue
+      fi
+      ((n_gpu++))
+      numa="$(cat "$dev/numa_node" 2>/dev/null || true)"
+      [[ "$numa" =~ ^[0-9]+$ ]] && nodes+=("$numa")
+    done
+  fi
+  if (( n_nv == 0 && ${#NVIDIA_GPU_INDICES[@]} > 0 )); then
+    n_nv="${#NVIDIA_GPU_INDICES[@]}"
+    (( n_gpu < n_nv )) && n_gpu="$n_nv"
+  fi
   (( n_gpu >= 2 )) || return 0
   if (( ${#nodes[@]} > 1 )); then
     distinct="$(printf '%s\n' "${nodes[@]}" | sort -u | wc -l)"
     (( distinct > 1 )) && GPU_TOPO_LINES+=("$(printf "%bMulti-GPU: %b[!] GPUs sit on %s NUMA nodes (cross-socket traffic; keep a model on one node)%b" "${C_DIM}" "${C_YELLOW}" "$distinct" "${C_RESET}")")
   fi
   if (( n_nv >= 2 )) && command -v nvidia-smi >/dev/null 2>&1; then
-    if nvidia-smi nvlink -s 2>/dev/null | grep -q "GB/s"; then
-      GPU_TOPO_LINES+=("$(printf "%bMulti-GPU: NVLink active%b" "${C_DIM}" "${C_RESET}")")
+    local nvlink_out="" topo_out=""
+    nvlink_out="$(nvidia-smi nvlink -s 2>/dev/null || true)"
+    topo_out="$(nvidia-smi topo -m 2>/dev/null || true)"
+    if grep -q "GB/s" <<<"$nvlink_out" || grep -qE '\bNV[0-9]+\b' <<<"$topo_out"; then
+      HAS_FULL_GPU_INTERCONNECT=true
+      if [[ "$HAS_NVIDIA_NVSWITCH" == true ]]; then
+        GPU_TOPO_LINES+=("$(printf "%bMulti-GPU: NVLink + NVSwitch active%b" "${C_DIM}" "${C_RESET}")")
+      else
+        GPU_TOPO_LINES+=("$(printf "%bMulti-GPU: NVLink active%b" "${C_DIM}" "${C_RESET}")")
+      fi
+    elif grep -qE '\b(PIX|PXB)\b' <<<"$topo_out"; then
+      GPU_TOPO_LINES+=("$(printf "%bMulti-GPU: no NVLink (PCIe switch P2P: PIX/PXB)%b" "${C_DIM}" "${C_RESET}")")
+    elif grep -qE '\b(PHB|NODE|SYS)\b' <<<"$topo_out"; then
+      GPU_TOPO_LINES+=("$(printf "%bMulti-GPU: no NVLink (PCIe via CPU root/NUMA: PHB/NODE/SYS)%b" "${C_DIM}" "${C_RESET}")")
     else
       GPU_TOPO_LINES+=("$(printf "%bMulti-GPU: no NVLink (GPU-to-GPU traffic uses PCIe)%b" "${C_DIM}" "${C_RESET}")")
+    fi
+  fi
+  if (( n_amd >= 2 )); then
+    local has_xgmi=false io_p
+    if [[ -d "$kfd_dir" ]]; then
+      for io_p in "$kfd_dir"/*/io_links/*/properties; do
+        [[ -r "$io_p" ]] || continue
+        if grep -qE '^type[[:space:]]+11$' "$io_p" 2>/dev/null; then
+          has_xgmi=true
+          break
+        fi
+      done
+    fi
+    if [[ "$has_xgmi" == false ]] && command -v amd-smi >/dev/null 2>&1; then
+      amd-smi topology --link-type 2>/dev/null | grep -qi "XGMI" && has_xgmi=true
+    elif [[ "$has_xgmi" == false ]] && command -v rocm-smi >/dev/null 2>&1; then
+      rocm-smi --showtopo 2>/dev/null | grep -qi "XGMI" && has_xgmi=true
+    fi
+    if [[ "$has_xgmi" == true ]]; then
+      HAS_FULL_GPU_INTERCONNECT=true
+      GPU_TOPO_LINES+=("$(printf "%bMulti-GPU: AMD XGMI / Infinity Fabric active%b" "${C_DIM}" "${C_RESET}")")
+    else
+      GPU_TOPO_LINES+=("$(printf "%bMulti-GPU: no XGMI (GPU-to-GPU traffic uses PCIe)%b" "${C_DIM}" "${C_RESET}")")
+    fi
+  fi
+  if [[ "$HAS_FULL_GPU_INTERCONNECT" == false ]]; then
+    detect_pcie_acs_enabled
+    if [[ "$PCIE_ACS_ENABLED" == true ]]; then
+      GPU_TOPO_LINES+=("$(printf "%bMulti-GPU: %b[!] PCIe ACS enabled on bridges (blocks direct GPU P2P; disable in BIOS or via PCIe ACS step)%b" "${C_DIM}" "${C_YELLOW}" "${C_RESET}")")
     fi
   fi
 }
@@ -1648,12 +2140,21 @@ power_daemon_conflict_line() {
 
 # Appends one "PCIe:" diagnostic line per discrete/integrated GPU (link width/gen + Resizable BAR).
 append_gpu_pcie_lines() {
-  local dev cls ven cs ms cw mw cg mg addr line rebar max_bar s e f size vt
-  for dev in /sys/bus/pci/devices/*; do
+  local pci_dir="${STRATA_PCI_DIR:-/sys/bus/pci/devices}"
+  local dev cls ven did cs ms cw mw cg mg addr line rebar max_bar s e f size vt cap_out dev_desc
+  for dev in "$pci_dir"/*; do
+    [[ -d "$dev" ]] || continue
     cls="$(cat "$dev/class" 2>/dev/null || true)"
-    [[ "$cls" == 0x03* ]] || continue
-    ven="$(cat "$dev/vendor" 2>/dev/null || true)"
-    [[ "$ven" == "0x10de" || "$ven" == "0x1002" || "$ven" == "0x8086" ]] || continue
+    [[ "$cls" == 0x03* || "$cls" == 0x12* ]] || continue
+    ven="$(tr '[:upper:]' '[:lower:]' < "$dev/vendor" 2>/dev/null || true)"
+    did="$(tr '[:upper:]' '[:lower:]' < "$dev/device" 2>/dev/null || true)"
+    if [[ "$cls" == 0x12* ]]; then
+      if [[ "$ven" != "0x1002" && "$ven" != "0x10de" ]] && ! { [[ "$ven" == "0x8086" ]] && _is_intel_discrete_pci_id "$did"; }; then
+        continue
+      fi
+    else
+      [[ "$ven" == "0x10de" || "$ven" == "0x1002" || "$ven" == "0x8086" ]] || continue
+    fi
     cs="$(cat "$dev/current_link_speed" 2>/dev/null || true)"; ms="$(cat "$dev/max_link_speed" 2>/dev/null || true)"
     cw="$(cat "$dev/current_link_width" 2>/dev/null || true)"; mw="$(cat "$dev/max_link_width" 2>/dev/null || true)"
     cg="$(pcie_gen_from_speed "$cs")"; mg="$(pcie_gen_from_speed "$ms")"
@@ -1666,8 +2167,8 @@ append_gpu_pcie_lines() {
     (( cg < mg )) && line+=" (max Gen${mg}; may downshift at idle)"
 
     rebar=""
-    if [[ "$ven" != "0x8086" || "$HAS_INTEL_ARC" == true ]]; then
-      max_bar=0
+    max_bar=0
+    if [[ "$ven" == "0x10de" || "$ven" == "0x1002" ]] || { [[ "$ven" == "0x8086" ]] && _is_intel_discrete_pci_id "$did"; }; then
       while read -r s e f; do
         [[ "$s" =~ ^0x[0-9a-fA-F]+$ && "$e" =~ ^0x[0-9a-fA-F]+$ ]] || continue
         size=$(( e - s + 1 ))
@@ -1680,12 +2181,34 @@ append_gpu_pcie_lines() {
         else
           (( max_bar > 536870912 )) && rebar=on || rebar=off
         fi
+        if [[ "$rebar" == "off" ]]; then
+          cap_out=""
+          if command -v lspci >/dev/null 2>&1; then
+            if [[ $EUID -eq 0 ]]; then
+              cap_out="$(lspci -vv -s "$addr" 2>/dev/null || true)"
+            elif sudo -n true >/dev/null 2>&1; then
+              cap_out="$(sudo -n lspci -vv -s "$addr" 2>/dev/null || true)"
+            else
+              cap_out="$(lspci -vv -s "$addr" 2>/dev/null || true)"
+            fi
+          fi
+          if grep -qiE "Capabilities:|Resizable BAR" <<<"$cap_out"; then
+            grep -qi "Resizable BAR" <<<"$cap_out" || rebar="unsupported"
+          else
+            dev_desc="$(lspci -s "$addr" 2>/dev/null || echo "$GPU_RAW")"
+            if grep -qiE "Tesla|\b(K80|K40|K20|M40|M60|M10|P4|P40|P100|V100|T4)\b|CMP [0-9]+HX|P10[246]-100" <<<"$dev_desc"; then
+              rebar="unsupported"
+            fi
+          fi
+        fi
       fi
     fi
     if [[ "$rebar" == "on" ]]; then
       line+=" | ReBAR: on"
     elif [[ "$rebar" == "off" ]]; then
       line+=" | ${C_YELLOW}[!] ReBAR: off${C_RESET}${C_DIM} (enable Resizable BAR in BIOS)"
+    elif [[ "$rebar" == "unsupported" ]]; then
+      line+=" | BAR1: $(( max_bar / 1048576 )) MiB"
     fi
     SYS_INFO_LINES+=("$(printf "PCIe:   %b%b%b" "${C_DIM}" "$line" "${C_RESET}")")
   done
@@ -1695,9 +2218,11 @@ append_gpu_pcie_lines() {
 # Step Registry
 # ------------------------------------------------------------------------------
 ALL_STEPS=(
-  gpu_unlock amd_apu_memory amd_cwsr_disable
+  nvidia_fabricmanager gpu_unlock amd_apu_memory amd_cwsr_disable
+  nvidia_mig_disable nvidia_sm70_table nvidia_pstate
   gpu_groups intel_compute_stack lact_overclock jetson_perf jetson_fan
   nvidia_power_limit amd_gpu_perf intel_gpu_perf ryzenadj_tdp nvidia_ecc nvidia_compute_mode
+  nvidia_power_cap pcie_acs_disable amd_instinct_partition
   headless_target numactl_interleave amd_x3d_mode intel_rapl msi_cooling lenovo_legion
   asus_perf dell_thermal system76_perf tuxedo_perf acpi_platform_profile intel_pcore_pinning zram_swap numa_balancing
   sysctl_tuning memlock_realtime nvme_tuning
@@ -1708,7 +2233,7 @@ ALL_STEPS=(
 )
 ACTIVE_STEPS=()
 
-VM_HIDDEN_STEPS=" msi_cooling acpi_platform_profile asus_perf dell_thermal lenovo_legion system76_perf tuxedo_perf cpu_performance cstate_limit pcie_aspm ryzenadj_tdp intel_rapl intel_thermald amd_x3d_mode intel_pcore_pinning tuned_profile jetson_perf jetson_fan "
+VM_HIDDEN_STEPS=" nvidia_fabricmanager pcie_acs_disable amd_instinct_partition msi_cooling acpi_platform_profile asus_perf dell_thermal lenovo_legion system76_perf tuxedo_perf cpu_performance cstate_limit pcie_aspm ryzenadj_tdp intel_rapl intel_thermald amd_x3d_mode intel_pcore_pinning tuned_profile jetson_perf jetson_fan "
 build_active_steps() {
   local step candidates=() pts
   for step in "${ALL_STEPS[@]}"; do
@@ -1724,21 +2249,38 @@ build_active_steps() {
 }
 
 is_experimental_step() {
-  [[ "$1" == "gpu_unlock" && "$DISTRO_FAMILY" != "arch" ]]
+  case "$1" in
+    gpu_unlock) [[ "$DISTRO_FAMILY" != "arch" ]] ;;
+    nvidia_pstate|pcie_acs_disable) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_opt_in_step() {
+  case "$1" in
+    nvidia_power_cap|amd_instinct_partition|hugepages_1g) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_high_idle_step() {
+  case "$1" in
+    cpu_performance|pcie_aspm|cstate_limit|nvidia_clock_lock|tuned_profile) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 is_recommended_step() {
   is_experimental_step "$1" && return 1
-  case "$1" in
-    cpu_performance|pcie_aspm|cstate_limit|nvidia_clock_lock|tuned_profile|hugepages_1g) return 1 ;;
-    *) return 0 ;;
-  esac
+  is_opt_in_step "$1" && return 1
+  is_high_idle_step "$1" && return 1
+  return 0
 }
 
 is_laptop_recommended_step() {
   is_recommended_step "$1" || return 1
   case "$1" in
-    prevent_sleep|acpi_platform_profile|msi_cooling|asus_perf|dell_thermal|lenovo_legion|system76_perf|tuxedo_perf|amd_gpu_perf|intel_gpu_perf|nvidia_persistenced)
+    prevent_sleep|acpi_platform_profile|msi_cooling|asus_perf|dell_thermal|lenovo_legion|system76_perf|tuxedo_perf|amd_gpu_perf|intel_gpu_perf|nvidia_persistenced|nvidia_fabricmanager|nvidia_mig_disable)
       return 1 ;;
     *)
       return 0 ;;
@@ -1773,12 +2315,17 @@ run_recommended_batch() {
   else
     echo -e "${C_BOLD}Revert ${scope_title} Performance Optimizations${C_RESET}"
   fi
-  local exp_excl=""
-  [[ "$DISTRO_FAMILY" != "arch" ]] && exp_excl=", experimental options"
+  local has_opt_ex=false has_exp_ex=false extra_excl=""
+  for step in "${ACTIVE_STEPS[@]}"; do
+    is_experimental_step "$step" && has_exp_ex=true
+    is_opt_in_step "$step" && has_opt_ex=true
+  done
+  [[ "$has_opt_ex" == true ]] && extra_excl+=", opt-in trade-offs ([OPT])"
+  [[ "$has_exp_ex" == true ]] && extra_excl+=", experimental options ([EXP])"
   if [[ "$scope" == "laptop" ]]; then
-    echo -e "${C_DIM}Excluded: high-idle-power options ([!]), 1 GiB hugepages, prevent sleep, GPU high-idle-clock/persistence, platform & vendor performance profiles${exp_excl}, Strata setup.${C_RESET}\n"
+    echo -e "${C_DIM}Excluded: high-idle-power options ([!])${extra_excl}, prevent sleep, GPU high-idle-clock/persistence, platform & vendor performance profiles, Strata setup.${C_RESET}\n"
   else
-    echo -e "${C_DIM}Excluded: CPU Performance, PCIe ASPM, CPU C-State Limit, NVIDIA Clock Lock, tuned profile (minimal gain / higher idle power), 1 GiB hugepages (reserves RAM)${exp_excl}, Strata setup.${C_RESET}\n"
+    echo -e "${C_DIM}Excluded: high-idle-power options ([!]: CPU Performance, PCIe ASPM, CPU C-State Limit, NVIDIA Clock Lock, tuned profile)${extra_excl}, Strata setup.${C_RESET}\n"
   fi
 
   if [[ ${#targets[@]} -eq 0 && ${#out_of_scope[@]} -eq 0 ]]; then
@@ -1837,6 +2384,10 @@ run_recommended_batch() {
   fi
 
   for step in "${targets[@]}"; do
+    if [[ "$mode" == "apply" && "$step" == "nvidia_power_limit" ]] && status_nvidia_power_cap && [[ "$revert_out_of_scope" == false ]]; then
+      echo -e "\n${C_YELLOW}Skipping NVIDIA Persistent Max GPU Power Limit because NVIDIA Thermal Power Cap ([OPT]) was kept active.${C_RESET}"
+      continue
+    fi
     echo -e "\n${C_BOLD}${C_CYAN}>>> ${prompt_verb}ing: $("title_${step}")${C_RESET}"
     "${mode}_${step}" || echo -e "${C_YELLOW}Step '${step}' exited with a warning or was skipped.${C_RESET}"
   done
@@ -2211,12 +2762,120 @@ revert_pcie_aspm() {
 }
 
 # 7. NVIDIA Persistenced
-applicable_nvidia_persistenced() { [[ "$HAS_NVIDIA" == true ]] && unit_exists nvidia-persistenced.service; }
+applicable_nvidia_persistenced() {
+  [[ "$HAS_NVIDIA" == true ]] && { unit_exists nvidia-persistenced.service || service_installed strata-nvidia-persistenced.service || command -v nvidia-persistenced >/dev/null 2>&1 || command -v nvidia-smi >/dev/null 2>&1; }
+}
 title_nvidia_persistenced() { echo "NVIDIA Persistence Mode (nvidia-persistenced)"; }
-status_nvidia_persistenced() { unit_enabled nvidia-persistenced.service && unit_active nvidia-persistenced.service; }
-explain_nvidia_persistenced() { echo -e "Impact:\n  Keeps the NVIDIA driver initialized on headless systemd hosts to avoid cold-start\n  delays (no-op on container/appliance hosts where the driver stays resident)."; }
-apply_nvidia_persistenced() { run_root systemctl enable --now nvidia-persistenced.service; }
-revert_nvidia_persistenced() { run_root systemctl disable --now nvidia-persistenced.service; }
+status_nvidia_persistenced() {
+  if unit_exists nvidia-persistenced.service && unit_enabled nvidia-persistenced.service && unit_active nvidia-persistenced.service; then
+    return 0
+  fi
+  if service_installed strata-nvidia-persistenced.service && unit_enabled strata-nvidia-persistenced.service; then
+    return 0
+  fi
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    local pm_out
+    pm_out="$(nvidia-smi --query-gpu=persistence_mode --format=csv,noheader 2>/dev/null || true)"
+    if grep -qi "Enabled" <<<"$pm_out" && ! grep -qi "Disabled" <<<"$pm_out"; then
+      return 0
+    fi
+  fi
+  return 1
+}
+explain_nvidia_persistenced() { echo -e "Impact:\n  Keeps the NVIDIA driver initialized on headless hosts to avoid cold-start\n  delays and ensures persistent power/clock settings stay applied (no-op on\n  container/appliance hosts where the driver already stays resident)."; }
+apply_nvidia_persistenced() {
+  if unit_exists nvidia-persistenced.service; then
+    run_root systemctl enable --now nvidia-persistenced.service
+  elif [[ "$HAS_SYSTEMD" == true ]] && command -v nvidia-persistenced >/dev/null 2>&1; then
+    local npd_bin
+    npd_bin="$(command -v nvidia-persistenced)"
+    install_service strata-nvidia-persistenced.service <<EOF
+[Unit]
+Description=NVIDIA Persistence Daemon (Strata)
+Wants=syslog.target
+
+[Service]
+Type=forking
+PIDFile=/var/run/nvidia-persistenced/nvidia-persistenced.pid
+Restart=always
+ExecStart=${npd_bin} --user root --persistence-mode
+ExecStopPost=/bin/rm -rf /var/run/nvidia-persistenced
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  else
+    local smi_bin
+    smi_bin="$(command -v nvidia-smi)" || return 1
+    install_service strata-nvidia-persistenced.service <<EOF
+[Unit]
+Description=NVIDIA Persistence Mode (Strata)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${smi_bin} -pm 1
+ExecStop=-${smi_bin} -pm 0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  fi
+}
+revert_nvidia_persistenced() {
+  if service_installed strata-nvidia-persistenced.service; then
+    remove_service strata-nvidia-persistenced.service
+    run_root nvidia-smi -pm 0 >/dev/null 2>&1 || true
+  fi
+  if unit_exists nvidia-persistenced.service; then
+    run_root systemctl disable --now nvidia-persistenced.service 2>/dev/null || true
+  fi
+}
+
+# 7b. NVIDIA Fabric Manager (NVSwitch SXM Systems)
+nvidia_fabricmanager_pkg() {
+  if [[ "${NVIDIA_DRIVER_MAJOR:-0}" -gt 0 ]] && pkg_available repo "nvidia-fabricmanager-${NVIDIA_DRIVER_MAJOR}"; then
+    echo "nvidia-fabricmanager-${NVIDIA_DRIVER_MAJOR}"
+  elif pkg_available repo nvidia-fabricmanager; then
+    echo "nvidia-fabricmanager"
+  elif pkg_available repo nvidia-fabric-manager; then
+    echo "nvidia-fabric-manager"
+  else
+    echo ""
+  fi
+}
+applicable_nvidia_fabricmanager() {
+  [[ "$HAS_NVIDIA" == true && "$HAS_NVIDIA_NVSWITCH" == true ]] || return 1
+  unit_exists nvidia-fabricmanager.service || command -v nv-fabricmanager >/dev/null 2>&1 || [[ -n "$(nvidia_fabricmanager_pkg)" ]]
+}
+title_nvidia_fabricmanager() { echo "NVIDIA Fabric Manager (NVSwitch SXM Multi-GPU Fabric)"; }
+status_nvidia_fabricmanager() { unit_enabled nvidia-fabricmanager.service && unit_active nvidia-fabricmanager.service; }
+explain_nvidia_fabricmanager() {
+  cat <<'EOF'
+Impact:
+  Installs/enables nvidia-fabricmanager.service on HGX / DGX NVSwitch SXM
+  servers. Without Fabric Manager running, multi-GPU CUDA initialization fails
+  with Error 802 ('system not yet initialized') across NVSwitch-linked GPUs.
+EOF
+}
+apply_nvidia_fabricmanager() {
+  if ! unit_exists nvidia-fabricmanager.service; then
+    local pkg
+    pkg="$(nvidia_fabricmanager_pkg)"
+    if [[ -n "$pkg" ]]; then
+      prompt_install_deps repo "$pkg" || return 0
+      refresh_unit_files_cache
+    fi
+  fi
+  if unit_exists nvidia-fabricmanager.service; then
+    run_root systemctl enable --now nvidia-fabricmanager.service
+  else
+    echo -e "${C_YELLOW}nvidia-fabricmanager.service is not available; install the matching nvidia-fabricmanager package for driver ${NVIDIA_DRIVER_VER:-installed}.${C_RESET}"
+    return 1
+  fi
+}
+revert_nvidia_fabricmanager() { run_root systemctl disable --now nvidia-fabricmanager.service 2>/dev/null || true; }
 
 # 8. NVIDIA Dynamic Boost
 applicable_nvidia_powerd() {
@@ -2243,8 +2902,9 @@ title_nvidia_power_limit() {
   local idxs=()
   mapfile -t idxs < <(nvidia_tunable_pl_indices)
   if (( ${#idxs[@]} == 1 )); then
-    local i="${idxs[0]}"
-    echo "NVIDIA Persistent Max GPU Power Limit (${NVIDIA_GPU_DEF_PL[$i]}W -> ${NVIDIA_GPU_MAX_PL[$i]}W, headroom only)"
+    local i="${idxs[0]}" from_w="${NVIDIA_GPU_DEF_PL[$i]}"
+    [[ -n "${NVIDIA_GPU_CUR_PL[$i]}" && "${NVIDIA_GPU_CUR_PL[$i]}" -lt "${NVIDIA_GPU_DEF_PL[$i]}" ]] && from_w="${NVIDIA_GPU_CUR_PL[$i]}"
+    echo "NVIDIA Persistent Max GPU Power Limit (${from_w}W -> ${NVIDIA_GPU_MAX_PL[$i]}W, headroom only)"
   else
     echo "NVIDIA Persistent Max GPU Power Limit (${#idxs[@]} GPUs, headroom only)"
   fi
@@ -2261,20 +2921,28 @@ status_nvidia_power_limit() {
   [[ "$any" == true ]]
 }
 explain_nvidia_power_limit() {
-  local idxs=() i svc_desc="systemd service"
+  local idxs=() i from_w svc_desc="systemd service"
   [[ "$HAS_SYSTEMD" == true ]] || svc_desc="boot service"
   mapfile -t idxs < <(nvidia_tunable_pl_indices)
   if (( ${#idxs[@]} == 1 )); then
     i="${idxs[0]}"
-    echo -e "Impact:\n  Raises GPU power ceiling from ${NVIDIA_GPU_DEF_PL[$i]}W to ${NVIDIA_GPU_MAX_PL[$i]}W via persistent ${svc_desc}.\n  Prevents artificial throttling if the card hits its default cap (no speedup\n  if your workload draws below the default limit)."
+    from_w="${NVIDIA_GPU_DEF_PL[$i]}"
+    [[ -n "${NVIDIA_GPU_CUR_PL[$i]}" && "${NVIDIA_GPU_CUR_PL[$i]}" -lt "${NVIDIA_GPU_DEF_PL[$i]}" ]] && from_w="${NVIDIA_GPU_CUR_PL[$i]}"
+    echo -e "Impact:\n  Raises GPU power ceiling from ${from_w}W to ${NVIDIA_GPU_MAX_PL[$i]}W via persistent ${svc_desc}.\n  Prevents artificial throttling if the card hits its current/default cap (no speedup\n  if your workload draws below the default limit)."
   else
     echo -e "Impact:\n  Raises GPU power ceilings to maximum per GPU via persistent ${svc_desc}\n  (prevents throttling when power-limited; no effect below default cap):"
     for i in "${idxs[@]}"; do
-      echo -e "  - GPU ${NVIDIA_GPU_INDICES[$i]} (${NVIDIA_GPU_NAMES[$i]}): ${NVIDIA_GPU_DEF_PL[$i]}W -> ${NVIDIA_GPU_MAX_PL[$i]}W"
+      from_w="${NVIDIA_GPU_DEF_PL[$i]}"
+      [[ -n "${NVIDIA_GPU_CUR_PL[$i]}" && "${NVIDIA_GPU_CUR_PL[$i]}" -lt "${NVIDIA_GPU_DEF_PL[$i]}" ]] && from_w="${NVIDIA_GPU_CUR_PL[$i]}"
+      echo -e "  - GPU ${NVIDIA_GPU_INDICES[$i]} (${NVIDIA_GPU_NAMES[$i]}): ${from_w}W -> ${NVIDIA_GPU_MAX_PL[$i]}W"
     done
   fi
 }
 apply_nvidia_power_limit() {
+  if service_installed strata-nvidia-power-cap.service; then
+    remove_service strata-nvidia-power-cap.service
+    run_root rm -f "$NVIDIA_POWER_CAP_MARKER"
+  fi
   local smi_bin out i idx def mx exec_start="" exec_stop="" applied=0
   smi_bin="$(command -v nvidia-smi)"
   for i in $(nvidia_tunable_pl_indices); do
@@ -2321,13 +2989,119 @@ revert_nvidia_power_limit() {
   refresh_nvidia_power_limits
 }
 
+# 9b. NVIDIA Passive/Datacenter Thermal Power Cap
+nvidia_cappable_pl_indices() {
+  local i mn mx
+  for (( i = 0; i < ${#NVIDIA_GPU_INDICES[@]}; i++ )); do
+    [[ "${NVIDIA_GPU_IS_DATACENTER[$i]}" == true || "${NVIDIA_GPU_IS_PASSIVE[$i]}" == true ]] || continue
+    mn="${NVIDIA_GPU_MIN_PL[$i]}"
+    mx="${NVIDIA_GPU_MAX_PL[$i]:-${NVIDIA_GPU_DEF_PL[$i]}}"
+    [[ "$mn" =~ ^[0-9]+$ && "$mx" =~ ^[0-9]+$ ]] && (( mn > 0 && mx > mn )) && echo "$i"
+  done
+}
+applicable_nvidia_power_cap() {
+  [[ "$HAS_NVIDIA" == true && ( "$HAS_NVIDIA_DATACENTER" == true || "$HAS_NVIDIA_PASSIVE" == true ) ]] || { [[ -f "$NVIDIA_POWER_CAP_MARKER" ]]; return $?; }
+  [[ -n "$(nvidia_cappable_pl_indices)" || -f "$NVIDIA_POWER_CAP_MARKER" ]]
+}
+title_nvidia_power_cap() { echo "NVIDIA Passive/Datacenter Thermal Power Cap (nvidia-smi -pl)"; }
+note_nvidia_power_cap() { echo -e "${C_BLUE}[OPT]${C_RESET}"; }
+status_nvidia_power_cap() { service_installed strata-nvidia-power-cap.service && unit_enabled strata-nvidia-power-cap.service; }
+explain_nvidia_power_cap() {
+  cat <<'EOF'
+Impact:
+  Applies a custom power cap (e.g. ~70% of default TDP, such as 175W on a 250W
+  Tesla P40/P100/V100/A40/A100) via a persistent service. LLM token decode is
+  memory-bandwidth bound rather than TDP-bound, so moderate capping typically
+  retains ~95%+ decode throughput while preventing passive thermal throttling,
+  cutting chassis fan noise, and lowering power draw.
+  Trade-off: Lowers peak compute power ceiling under heavy prefill or batching.
+EOF
+  local i
+  for i in $(nvidia_cappable_pl_indices); do
+    echo -e "  - GPU ${NVIDIA_GPU_INDICES[$i]} (${NVIDIA_GPU_NAMES[$i]}): cur ${NVIDIA_GPU_CUR_PL[$i]:-?}W, range ${NVIDIA_GPU_MIN_PL[$i]}-${NVIDIA_GPU_MAX_PL[$i]:-${NVIDIA_GPU_DEF_PL[$i]}}W (default ${NVIDIA_GPU_DEF_PL[$i]:-?}W)"
+  done
+}
+apply_nvidia_power_cap() {
+  local -a idxs=()
+  mapfile -t idxs < <(nvidia_cappable_pl_indices)
+  if (( ${#idxs[@]} == 0 )); then
+    echo -e "${C_YELLOW}No NVIDIA GPUs report adjustable min/max power limits via nvidia-smi.${C_RESET}"
+    return 1
+  fi
+  local smi_bin first_i def_w min_w max_w rec_w target_w in_w
+  smi_bin="$(command -v nvidia-smi)"
+  first_i="${idxs[0]}"
+  def_w="${NVIDIA_GPU_DEF_PL[$first_i]:-${NVIDIA_GPU_MAX_PL[$first_i]}}"
+  min_w="${NVIDIA_GPU_MIN_PL[$first_i]}"
+  max_w="${NVIDIA_GPU_MAX_PL[$first_i]:-$def_w}"
+  rec_w="$(awk -v d="$def_w" -v mn="$min_w" 'BEGIN {v=int(d*0.7 + 0.5); if (v < mn) v=mn; print v}')"
+  read -r -p "Target GPU power cap in watts (range ${min_w}-${max_w}W) [default: ${rec_w}]: " in_w
+  target_w="${in_w:-$rec_w}"
+  if ! [[ "$target_w" =~ ^[0-9]+$ ]] || (( target_w < min_w || target_w > max_w )); then
+    echo -e "${C_RED}Power cap must be an integer between ${min_w} and ${max_w} W.${C_RESET}"
+    return 1
+  fi
+  service_installed nvidia-power-limit.service && remove_service nvidia-power-limit.service
+  local i idx g_min g_max g_def g_cap out exec_start="" exec_stop="" marker_lines="" applied=0
+  for i in "${idxs[@]}"; do
+    idx="${NVIDIA_GPU_INDICES[$i]}"
+    g_min="${NVIDIA_GPU_MIN_PL[$i]}"
+    g_max="${NVIDIA_GPU_MAX_PL[$i]:-${NVIDIA_GPU_DEF_PL[$i]}}"
+    g_def="${NVIDIA_GPU_DEF_PL[$i]:-$g_max}"
+    g_cap="$target_w"
+    (( g_cap < g_min )) && g_cap="$g_min"
+    (( g_cap > g_max )) && g_cap="$g_max"
+    out="$(run_root "$smi_bin" -i "$idx" -pl "$g_cap" 2>&1 || true)"
+    if grep -qiE "not supported|failed|error|invalid" <<<"$out"; then
+      echo -e "${C_YELLOW}Could not set -pl ${g_cap} on GPU ${idx} (${NVIDIA_GPU_NAMES[$i]}): ${out}${C_RESET}"
+      continue
+    fi
+    exec_start+="ExecStart=${smi_bin} -i ${idx} -pl ${g_cap}"$'\n'
+    exec_stop+="ExecStop=-${smi_bin} -i ${idx} -pl ${g_def}"$'\n'
+    marker_lines+="${idx}:${g_cap}:${g_def}"$'\n'
+    applied=$((applied + 1))
+  done
+  (( applied > 0 )) || return 1
+  printf "%s" "$marker_lines" | run_root tee "$NVIDIA_POWER_CAP_MARKER" >/dev/null
+  install_service strata-nvidia-power-cap.service <<EOF
+[Unit]
+Description=Set NVIDIA Passive/Datacenter Thermal Power Cap for Strata
+After=nvidia-persistenced.service strata-nvidia-persistenced.service
+Wants=nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+${exec_start%$'\n'}
+${exec_stop%$'\n'}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  refresh_nvidia_power_limits
+}
+revert_nvidia_power_cap() {
+  remove_service strata-nvidia-power-cap.service
+  if [[ -f "$NVIDIA_POWER_CAP_MARKER" ]]; then
+    local idx _cap def
+    while IFS=: read -r idx _cap def; do
+      [[ "$idx" =~ ^[0-9]+$ && "$def" =~ ^[0-9]+$ ]] || continue
+      run_root nvidia-smi -i "$idx" -pl "$def" >/dev/null 2>&1 || true
+    done < "$NVIDIA_POWER_CAP_MARKER"
+    run_root rm -f "$NVIDIA_POWER_CAP_MARKER"
+  fi
+  refresh_nvidia_power_limits
+}
+
 # 10. LACT GPU Overclocking
 applicable_lact_overclock() {
   [[ "$IS_JETSON" == true ]] && return 1
-  [[ "$HAS_NVIDIA" == true || "$HAS_AMD" == true ]] || return 1
-  if [[ "$HAS_AMD" == false && "$HAS_INTEL_GPU" == false && "$HAS_NVIDIA_TESLA" == true && "$HAS_NVIDIA_NON_TESLA" == false ]]; then
-    return 1
-  fi
+  [[ "$HAS_NVIDIA" == true || "$HAS_AMD" == true || "$HAS_INTEL_ARC" == true ]] || return 1
+  local has_eligible=false
+  [[ "$HAS_NVIDIA_NON_TESLA" == true && "$IS_DGX_SPARK" == false ]] && has_eligible=true
+  [[ "$HAS_AMD_NON_INSTINCT" == true ]] && has_eligible=true
+  [[ "$HAS_INTEL_ARC" == true ]] && has_eligible=true
+  [[ "$has_eligible" == true ]] || return 1
   command -v lact >/dev/null 2>&1 || pkg_available repo lact || pkg_available aur lact
 }
 title_lact_overclock() { echo "LACT GPU Clock & Memory Offsets (lactd)"; }
@@ -2598,8 +3372,19 @@ gpu_unlock_build_deps() {
 applicable_gpu_unlock() {
   [[ "$HAS_NVIDIA" == true ]] || return 1
   secure_boot_enabled && return 1
-  [[ "$HAS_NVIDIA_TESLA" == true && "$HAS_NVIDIA_NON_TESLA" == false ]] && return 1
-  grep -qiE "TU10|TU11|GA10|AD10|RTX 20|RTX 30|RTX 40|GTX 16|A100|A10|A40|L40|RTX A" <<< "${GPU_RAW:-$GPU_SUMMARY} ${NVIDIA_GPU_NAMES[*]:-}" || return 1
+  [[ "$HAS_NVIDIA_NON_TESLA" == true ]] || return 1
+  local found_consumer=false n
+  if (( ${#NVIDIA_GPU_NAMES[@]} > 0 )); then
+    for n in "${NVIDIA_GPU_NAMES[@]}"; do
+      _is_nvidia_consumer_unlock_name "$n" && { found_consumer=true; break; }
+    done
+  else
+    while IFS= read -r n; do
+      grep -qi "nvidia" <<<"$n" || continue
+      _is_nvidia_consumer_unlock_name "$n" && { found_consumer=true; break; }
+    done <<<"${GPU_RAW:-$GPU_SUMMARY}"
+  fi
+  [[ "$found_consumer" == true ]] || return 1
   if [[ "$DISTRO_FAMILY" == "arch" ]]; then
     pkg_installed gpu-unlock-dkms || pkg_available repo gpu-unlock-dkms || pkg_available aur gpu-unlock-dkms
   else
@@ -2636,7 +3421,7 @@ EOF
     echo -e "${C_MAGENTA}               and might not work properly.${C_RESET}"
   fi
   echo -e "\n${C_BGREEN}[HIGH IMPACT] Big performance gains can be achieved with gpu-unlock on${C_RESET}"
-  echo -e "${C_BGREEN}              supported Turing/Ampere/Ada GPUs (RTX 20/30/40 series),${C_RESET}"
+  echo -e "${C_BGREEN}              supported consumer Turing/Ampere/Ada GPUs (RTX 20/30/40 series),${C_RESET}"
   echo -e "${C_BGREEN}              unlocking hardware compute, clock, and power capabilities.${C_RESET}"
 }
 apply_gpu_unlock() {
@@ -2694,16 +3479,22 @@ apply_gpu_unlock() {
 revert_gpu_unlock() { remove_kernel_param "gpu_unlock.targets=all"; }
 
 # 11b. AMD GPU DPM
-applicable_amd_gpu_perf() { [[ "$HAS_AMD" == true ]] && compgen -G "/sys/class/drm/card*/device/power_dpm_force_performance_level" >/dev/null 2>&1; }
-title_amd_gpu_perf() { echo "AMD Radeon GPU High Performance DPM Level (amdgpu)"; }
+applicable_amd_gpu_perf() {
+  [[ "$HAS_AMD" == true ]] || return 1
+  local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}"
+  compgen -G "${drm_dir}/card*/device/power_dpm_force_performance_level" >/dev/null 2>&1 && return 0
+  [[ "$HAS_AMD_INSTINCT" == true ]] && { command -v amd-smi >/dev/null 2>&1 || command -v rocm-smi >/dev/null 2>&1; }
+}
+title_amd_gpu_perf() { echo "AMD Radeon / Instinct High Performance DPM Level (amdgpu)"; }
 status_amd_gpu_perf() {
-  local f
-  for f in /sys/class/drm/card*/device/power_dpm_force_performance_level; do
+  local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}" f
+  for f in "${drm_dir}"/card*/device/power_dpm_force_performance_level; do
     [[ -f "$f" ]] && grep -q "high" "$f" 2>/dev/null && return 0
   done
+  service_installed strata-amd-gpu-perf.service && unit_enabled strata-amd-gpu-perf.service && return 0
   return 1
 }
-explain_amd_gpu_perf() { echo -e "Impact:\n  Sets amdgpu power_dpm_force_performance_level='high' via systemd for ROCm/HIP."; }
+explain_amd_gpu_perf() { echo -e "Impact:\n  Sets amdgpu power_dpm_force_performance_level='high' (with amd-smi / rocm-smi\n  fallback on Instinct GPUs) via persistent service for ROCm/HIP."; }
 apply_amd_gpu_perf() {
   install_service strata-amd-gpu-perf.service <<'EOF'
 [Unit]
@@ -2713,8 +3504,8 @@ After=multi-user.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c 'for f in /sys/class/drm/card*/device/power_dpm_force_performance_level; do [ -w "$f" ] && echo high > "$f"; done; true'
-ExecStop=/bin/sh -c 'for f in /sys/class/drm/card*/device/power_dpm_force_performance_level; do [ -w "$f" ] && echo auto > "$f"; done; true'
+ExecStart=/bin/sh -c 'w=0; for f in /sys/class/drm/card*/device/power_dpm_force_performance_level; do [ -w "$f" ] && echo high > "$f" 2>/dev/null && w=1; done; if [ "$w" -eq 0 ]; then if command -v amd-smi >/dev/null 2>&1; then amd-smi set --perf-level high >/dev/null 2>&1 || true; elif command -v rocm-smi >/dev/null 2>&1; then rocm-smi --setperflevel high >/dev/null 2>&1 || true; fi; fi; true'
+ExecStop=/bin/sh -c 'w=0; for f in /sys/class/drm/card*/device/power_dpm_force_performance_level; do [ -w "$f" ] && echo auto > "$f" 2>/dev/null && w=1; done; if [ "$w" -eq 0 ]; then if command -v amd-smi >/dev/null 2>&1; then amd-smi set --perf-level auto >/dev/null 2>&1 || true; elif command -v rocm-smi >/dev/null 2>&1; then rocm-smi --setperflevel auto >/dev/null 2>&1 || true; fi; fi; true'
 
 [Install]
 WantedBy=multi-user.target
@@ -2722,7 +3513,306 @@ EOF
 }
 revert_amd_gpu_perf() {
   remove_service strata-amd-gpu-perf.service
-  run_root sh -c 'for f in /sys/class/drm/card*/device/power_dpm_force_performance_level; do [ -w "$f" ] && echo auto > "$f"; done' 2>/dev/null || true
+  run_root sh -c 'w=0; for f in /sys/class/drm/card*/device/power_dpm_force_performance_level; do [ -w "$f" ] && echo auto > "$f" 2>/dev/null && w=1; done; if [ "$w" -eq 0 ]; then if command -v amd-smi >/dev/null 2>&1; then amd-smi set --perf-level auto >/dev/null 2>&1 || true; elif command -v rocm-smi >/dev/null 2>&1; then rocm-smi --setperflevel auto >/dev/null 2>&1 || true; fi; fi; true' 2>/dev/null || true
+}
+
+# 11d. NVIDIA Volta (V100 / sm_70) Strata Decode Table
+applicable_nvidia_sm70_table() {
+  [[ "$HAS_NVIDIA" == true && "$HAS_NVIDIA_VOLTA_SM70" == true ]] || [[ -f "$NVIDIA_SM70_MARKER" ]]
+}
+title_nvidia_sm70_table() { echo "NVIDIA Volta (V100 / sm_70) Strata Decode Table (STRATA_SM70_TABLE=1)"; }
+status_nvidia_sm70_table() { [[ -f "$NVIDIA_SM70_MARKER" ]]; }
+explain_nvidia_sm70_table() {
+  cat <<'EOF'
+Impact:
+  Enables Strata's opt-in Volta (sm_70 / Tesla V100) decode table via
+  STRATA_SM70_TABLE=1 across wizard CLI calls, /etc/profile.d/strata-sm70.sh,
+  and a strata.service systemd drop-in. Improves token decode speed on V100
+  with zero idle power impact (remember to run Strata CUDA 12 builds on sm_70).
+EOF
+}
+apply_nvidia_sm70_table() {
+  echo "1" | run_root tee "$NVIDIA_SM70_MARKER" >/dev/null
+  run_root tee /etc/profile.d/strata-sm70.sh >/dev/null <<'EOF'
+export STRATA_SM70_TABLE=1
+EOF
+  run_root chmod 0644 /etc/profile.d/strata-sm70.sh 2>/dev/null || true
+  if [[ "$HAS_SYSTEMD" == true && -f /etc/systemd/system/strata.service ]]; then
+    run_root mkdir -p /etc/systemd/system/strata.service.d
+    run_root tee /etc/systemd/system/strata.service.d/20-sm70-table.conf >/dev/null <<'EOF'
+[Service]
+Environment=STRATA_SM70_TABLE=1
+EOF
+    run_root systemctl daemon-reload
+    unit_active strata.service && echo -e "${C_YELLOW}Restart strata.service for STRATA_SM70_TABLE=1 to take effect.${C_RESET}" || true
+  fi
+}
+revert_nvidia_sm70_table() {
+  run_root rm -f "$NVIDIA_SM70_MARKER" /etc/profile.d/strata-sm70.sh
+  if [[ -f /etc/systemd/system/strata.service.d/20-sm70-table.conf ]]; then
+    run_root rm -f /etc/systemd/system/strata.service.d/20-sm70-table.conf
+    run_root rmdir /etc/systemd/system/strata.service.d 2>/dev/null || true
+    [[ "$HAS_SYSTEMD" == true ]] && run_root systemctl daemon-reload 2>/dev/null || true
+  fi
+}
+
+# 11e. NVIDIA Tesla Idle P-State Daemon (nvidia-pstated / nvidia-pstate)
+nvidia_pstate_target_indices() {
+  local idxs=() i cc g_name
+  for (( i = 0; i < ${#NVIDIA_GPU_INDICES[@]}; i++ )); do
+    [[ "${NVIDIA_GPU_IS_DATACENTER[$i]}" == true ]] || continue
+    cc="${NVIDIA_GPU_COMPUTE_CAP[$i]}"
+    g_name="${NVIDIA_GPU_NAMES[$i]}"
+    if [[ "$cc" =~ ^(5\.|6\.|7\.0$) ]] || grep -qiE "\b(M40|M60|M10|P4|P40|P100|V100)\b|CMP [0-9]+HX|P10[246]-100" <<<"$g_name"; then
+      idxs+=("${NVIDIA_GPU_INDICES[$i]}")
+    fi
+  done
+  local IFS=,
+  echo "${idxs[*]}"
+}
+_find_nvml_include_dir() {
+  local d
+  for d in /usr/include /usr/local/cuda/include /opt/cuda/include /usr/include/x86_64-linux-gnu; do
+    [[ -f "${d}/nvml.h" ]] && { echo "$d"; return 0; }
+  done
+  return 1
+}
+applicable_nvidia_pstate() {
+  [[ "$HAS_NVIDIA" == true && "$HAS_NVIDIA_LEGACY_PSTATE_CARD" == true ]] ||
+    service_installed nvidia-pstated.service || service_installed strata-nvidia-pstate.service
+}
+title_nvidia_pstate() { echo "NVIDIA Tesla Idle P-State Daemon (P0 -> P8 idle power fix, nvidia-pstated)"; }
+note_nvidia_pstate() { echo -e "${C_MAGENTA}[EXP]${C_RESET}"; }
+status_nvidia_pstate() {
+  { service_installed nvidia-pstated.service && unit_enabled nvidia-pstated.service && unit_active nvidia-pstated.service; } ||
+    { service_installed strata-nvidia-pstate.service && unit_enabled strata-nvidia-pstate.service && unit_active strata-nvidia-pstate.service; }
+}
+explain_nvidia_pstate() {
+  cat <<'EOF'
+Impact:
+  Installs and runs sasha0552/nvidia-pstated (or Python nvidia-pstate polling
+  fallback if CUDA/NVML headers are absent) to drop legacy Tesla/CMP GPUs
+  (P40, P100, P4, M40, M60, V100) from stuck P0 (~30-50W idle) into P8 (~9-10W)
+  when no inference workload is running, cutting heat and fan noise.
+EOF
+  echo -e "\n${C_MAGENTA}[EXPERIMENTAL] Relies on undocumented NvAPI calls (requires libnvidia-api.so.1${C_RESET}"
+  echo -e "${C_MAGENTA}               from nvidia-utils / libnvidia-api1) and third-party code.${C_RESET}"
+}
+apply_nvidia_pstate() {
+  if ! ldconfig -p 2>/dev/null | grep -q "libnvidia-api\.so\.1" && ! compgen -G "/usr/lib*/libnvidia-api.so*" >/dev/null 2>&1 && ! compgen -G "/usr/lib/*/libnvidia-api.so*" >/dev/null 2>&1; then
+    echo -e "${C_YELLOW}libnvidia-api.so.1 was not found on this host.${C_RESET}"
+    echo -e "Install it first (Arch: nvidia-utils, Debian/Ubuntu: libnvidia-api1 or libnvidia-tesla-api1, Fedora: nvidia-driver-libs)."
+    return 1
+  fi
+  local target_idxs="" idx_args=""
+  target_idxs="$(nvidia_pstate_target_indices)"
+
+  local daemon_bin=""
+  command -v nvidia-pstated >/dev/null 2>&1 && daemon_bin="$(command -v nvidia-pstated)"
+  [[ -z "$daemon_bin" && -x /usr/local/bin/nvidia-pstated ]] && daemon_bin="/usr/local/bin/nvidia-pstated"
+
+  if [[ -z "$daemon_bin" ]] && _find_nvml_include_dir >/dev/null 2>&1; then
+    local -a bdeps=()
+    command -v git >/dev/null 2>&1 || bdeps+=(git)
+    command -v cmake >/dev/null 2>&1 || bdeps+=(cmake)
+    command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1 || bdeps+=(gcc)
+    if (( ${#bdeps[@]} == 0 )) || prompt_install_deps repo "${bdeps[@]}"; then
+      local bdir nvml_inc
+      nvml_inc="$(_find_nvml_include_dir)"
+      bdir="$(mktemp -d /tmp/nvidia-pstated.XXXXXX)"
+      [[ $EUID -eq 0 && "$TARGET_USER" != "root" ]] && chown "$TARGET_USER" "$bdir" 2>/dev/null || true
+      echo -e "${C_CYAN}Building sasha0552/nvidia-pstated from source...${C_RESET}"
+      if run_as_user_exec git clone --depth 1 https://github.com/sasha0552/nvidia-pstated.git "$bdir/src" &&
+         run_as_user_exec cmake -S "$bdir/src" -B "$bdir/build" "-DCMAKE_C_FLAGS=-I${nvml_inc}" &&
+         run_as_user_exec cmake --build "$bdir/build" &&
+         [[ -x "$bdir/build/nvidia-pstated" ]]; then
+        run_root install -m 0755 "$bdir/build/nvidia-pstated" /usr/local/bin/nvidia-pstated
+        daemon_bin="/usr/local/bin/nvidia-pstated"
+      else
+        echo -e "${C_YELLOW}C build of nvidia-pstated failed; falling back to Python nvidia-pstate daemon.${C_RESET}"
+      fi
+      rm -rf "$bdir"
+    fi
+  fi
+
+  if [[ -n "$daemon_bin" ]]; then
+    if [[ -n "$target_idxs" ]] && "$daemon_bin" --help 2>&1 | grep -q -- "-i"; then
+      idx_args=" -i ${target_idxs}"
+    fi
+    service_installed strata-nvidia-pstate.service && remove_service strata-nvidia-pstate.service
+    echo "daemon" | run_root tee "$NVIDIA_PSTATE_MARKER" >/dev/null
+    if [[ "$HAS_SYSTEMD" == true ]]; then
+      install_service nvidia-pstated.service <<EOF
+[Unit]
+Description=NVIDIA GPU Idle P-State Daemon (nvidia-pstated)
+After=nvidia-persistenced.service strata-nvidia-persistenced.service
+StartLimitIntervalSec=0
+
+[Service]
+DynamicUser=yes
+ExecStart=${daemon_bin}${idx_args}
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    else
+      install_service nvidia-pstated.service <<EOF
+[Unit]
+Description=NVIDIA GPU Idle P-State Daemon (nvidia-pstated)
+
+[Service]
+ExecStart=/bin/sh -c 'nohup ${daemon_bin}${idx_args} >/dev/null 2>&1 &'
+ExecStop=/bin/sh -c 'pkill -x nvidia-pstated >/dev/null 2>&1 || true'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    fi
+    return $?
+  fi
+
+  # Fallback: Python nvidia-pstate polling daemon in isolated venv
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo -e "${C_RED}python3 is required for the nvidia-pstate fallback.${C_RESET}"
+    return 1
+  fi
+  echo -e "${C_CYAN}Setting up Python nvidia-pstate idle daemon in /opt/strata-nvidia-pstate...${C_RESET}"
+  run_root mkdir -p /opt/strata-nvidia-pstate /usr/local/libexec
+  if [[ ! -x /opt/strata-nvidia-pstate/venv/bin/python ]]; then
+    if ! run_root python3 -m venv /opt/strata-nvidia-pstate/venv; then
+      echo -e "${C_RED}Could not create Python venv (install python3-venv / python-virtualenv).${C_RESET}"
+      return 1
+    fi
+  fi
+  if ! run_root /opt/strata-nvidia-pstate/venv/bin/pip install --upgrade nvidia-pstate; then
+    echo -e "${C_RED}Failed to install nvidia-pstate from PyPI.${C_RESET}"
+    return 1
+  fi
+  run_root tee /usr/local/libexec/strata-nvidia-pstated.py >/dev/null <<'PY'
+#!/usr/bin/env python3
+import inspect, signal, subprocess, sys, time
+from nvidia_pstate import set_pstate_high, set_pstate_low
+
+IDLE_DELAY_S = 30.0
+POLL_S = 2.0
+
+def call_pstate(fn, idxs):
+    try:
+        sig = inspect.signature(fn)
+        if not sig.parameters:
+            fn()
+            return
+        pname = next(iter(sig.parameters))
+        if idxs is None:
+            fn()
+        else:
+            for idx in idxs:
+                fn(**{pname: idx})
+    except Exception:
+        fn()
+
+def is_busy(idxs):
+    cmd = ["nvidia-smi", "--query-gpu=index,utilization.gpu", "--format=csv,noheader,nounits"]
+    if idxs:
+        cmd.extend(["-i", ",".join(str(i) for i in idxs)])
+    try:
+        out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+        for line in out.splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 2 and parts[1].isdigit() and int(parts[1]) > 3:
+                return True
+        apps_cmd = ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"]
+        if idxs:
+            apps_cmd.extend(["-i", ",".join(str(i) for i in idxs)])
+        apps = subprocess.check_output(apps_cmd, text=True, stderr=subprocess.DEVNULL).strip()
+        if apps:
+            return True
+    except Exception:
+        return True
+    return False
+
+def main():
+    idxs = None
+    if len(sys.argv) > 1 and sys.argv[1]:
+        idxs = [int(x) for x in sys.argv[1].split(",") if x.strip().isdigit()]
+    def handle_stop(_signum, _frame):
+        try:
+            call_pstate(set_pstate_high, idxs)
+        except Exception:
+            pass
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, handle_stop)
+    signal.signal(signal.SIGINT, handle_stop)
+    state = "high"
+    last_active = time.monotonic()
+    while True:
+        now = time.monotonic()
+        if is_busy(idxs):
+            last_active = now
+            if state != "high":
+                call_pstate(set_pstate_high, idxs)
+                state = "high"
+        elif now - last_active >= IDLE_DELAY_S and state != "low":
+            call_pstate(set_pstate_low, idxs)
+            state = "low"
+        time.sleep(POLL_S)
+
+if __name__ == "__main__":
+    main()
+PY
+  run_root chmod 0755 /usr/local/libexec/strata-nvidia-pstated.py
+  echo "python" | run_root tee "$NVIDIA_PSTATE_MARKER" >/dev/null
+  if [[ "$HAS_SYSTEMD" == true ]]; then
+    install_service strata-nvidia-pstate.service <<EOF
+[Unit]
+Description=NVIDIA GPU Idle P-State Polling Service (Strata)
+After=nvidia-persistenced.service strata-nvidia-persistenced.service
+
+[Service]
+Type=simple
+ExecStart=/opt/strata-nvidia-pstate/venv/bin/python /usr/local/libexec/strata-nvidia-pstated.py ${target_idxs}
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  else
+    install_service strata-nvidia-pstate.service <<EOF
+[Unit]
+Description=NVIDIA GPU Idle P-State Polling Service (Strata)
+
+[Service]
+ExecStart=/bin/sh -c 'nohup /opt/strata-nvidia-pstate/venv/bin/python /usr/local/libexec/strata-nvidia-pstated.py ${target_idxs} >/dev/null 2>&1 &'
+ExecStop=/bin/sh -c 'pkill -f strata-nvidia-pstated.py >/dev/null 2>&1 || true'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  fi
+}
+revert_nvidia_pstate() {
+  service_installed nvidia-pstated.service && remove_service nvidia-pstated.service
+  service_installed strata-nvidia-pstate.service && remove_service strata-nvidia-pstate.service
+  if [[ -x /opt/strata-nvidia-pstate/venv/bin/python ]]; then
+    local _tidxs=""
+    _tidxs="$(nvidia_pstate_target_indices)"
+    run_root /opt/strata-nvidia-pstate/venv/bin/python - "$_tidxs" <<'PY' >/dev/null 2>&1 || true
+import inspect, sys
+from nvidia_pstate import set_pstate_high
+idxs = [int(x) for x in sys.argv[1].split(",") if x.strip().isdigit()] if len(sys.argv) > 1 and sys.argv[1] else None
+sig = inspect.signature(set_pstate_high)
+if not sig.parameters or idxs is None:
+    set_pstate_high()
+else:
+    p = next(iter(sig.parameters))
+    for i in idxs:
+        set_pstate_high(**{p: i})
+PY
+  fi
+  run_root rm -f /usr/local/libexec/strata-nvidia-pstated.py "$NVIDIA_PSTATE_MARKER"
 }
 
 # 11c. Intel Arc / iGPU
@@ -3127,22 +4217,36 @@ explain_nvidia_clock_lock() {
   cat <<EOF
 Impact:
   Locks GPU core clocks at ${NVIDIA_MAX_GFX_CLK} MHz (and VRAM clocks at ${NVIDIA_MAX_MEM_CLK:-max} MHz when
-  supported) via 'nvidia-smi -lgc/-lmc' (or '-ac' application clocks on older Tesla
-  Kepler/Maxwell GPUs) and a persistent systemd service. Removes clock ramp-up delay
-  for stable, lowest-latency token decode.
+  supported) via 'nvidia-smi -lgc/-lmc' (or '-ac' application clocks with
+  Auto Boost disabled on older Kepler/Maxwell/Pascal Tesla GPUs) and a persistent
+  service. Removes clock ramp-up delay for stable, lowest-latency token decode.
 EOF
   echo -e "\n${C_YELLOW}[WARNING] Locked clocks keep the GPU at high power even when idle${C_RESET}"
   echo -e "${C_YELLOW}          and hardly provide gains for sustained, GPU-bound generation.${C_RESET}"
 }
+nvidia_best_ac_pair() {
+  local idx="$1" max_mem="${2:-}" max_gfx="${3:-}" raw best=""
+  raw="$(nvidia-smi -i "$idx" --query-supported-clocks=mem,gr --format=csv,noheader,nounits 2>/dev/null || true)"
+  best="$(awk -F', *' '$1~/^[0-9]+$/ && $2~/^[0-9]+$/ {m=$1+0; g=$2+0; if (m > bm || (m == bm && g > bg)) {bm=m; bg=g}} END {if (bm > 0 && bg > 0) printf "%d,%d", bm, bg}' <<<"$raw")"
+  if [[ -n "$best" ]]; then
+    echo "$best"
+  elif [[ -n "$max_mem" && -n "$max_gfx" ]]; then
+    echo "${max_mem},${max_gfx}"
+  fi
+}
 apply_nvidia_clock_lock() {
-  local smi_bin out i idx max_gfx max_mem exec_start="" exec_stop="" applied=0
+  local smi_bin out i idx max_gfx max_mem cc g_name ac_pair exec_start="" exec_stop="" applied=0 lgc_ok ac_ok
   smi_bin="$(command -v nvidia-smi)"
   for (( i = 0; i < ${#NVIDIA_GPU_INDICES[@]}; i++ )); do
     idx="${NVIDIA_GPU_INDICES[$i]}"
     max_gfx="${NVIDIA_GPU_MAX_GFX_CLK[$i]}"
     max_mem="${NVIDIA_GPU_MAX_MEM_CLK[$i]}"
+    cc="${NVIDIA_GPU_COMPUTE_CAP[$i]:-}"
+    g_name="${NVIDIA_GPU_NAMES[$i]}"
     [[ -n "$max_gfx" ]] || continue
-    if out="$(run_root "$smi_bin" -i "$idx" -lgc "${max_gfx},${max_gfx}" 2>&1)"; then
+    lgc_ok=false
+    if out="$(run_root "$smi_bin" -i "$idx" -lgc "${max_gfx},${max_gfx}" 2>&1)" && ! grep -qiE "not supported|not a valid|failed|error" <<<"$out"; then
+      lgc_ok=true
       exec_start+="ExecStart=${smi_bin} -i ${idx} -lgc ${max_gfx},${max_gfx}"$'\n'
       exec_stop+="ExecStop=-${smi_bin} -i ${idx} -rgc"$'\n'
       if [[ -n "$max_mem" ]]; then
@@ -3151,12 +4255,23 @@ apply_nvidia_clock_lock() {
         exec_stop+="ExecStop=-${smi_bin} -i ${idx} -rmc"$'\n'
       fi
       applied=$((applied + 1))
-    elif [[ -n "$max_mem" ]] && out="$(run_root "$smi_bin" -i "$idx" -ac "${max_mem},${max_gfx}" 2>&1)"; then
-      exec_start+="ExecStart=${smi_bin} -i ${idx} -ac ${max_mem},${max_gfx}"$'\n'
-      exec_stop+="ExecStop=-${smi_bin} -i ${idx} -rac"$'\n'
-      applied=$((applied + 1))
-    else
-      echo -e "${C_YELLOW}nvidia-smi clock lock (-lgc/-ac) is not supported on GPU ${idx} (${NVIDIA_GPU_NAMES[$i]}): ${out}${C_RESET}"
+    fi
+    if [[ "$lgc_ok" == false ]]; then
+      ac_pair="$(nvidia_best_ac_pair "$idx" "$max_mem" "$max_gfx")"
+      if [[ "$cc" =~ ^(3\.|5\.) ]] || grep -qiE "\b(K80|K40|K20|K10|M40|M60|M10)\b" <<<"$g_name"; then
+        run_root "$smi_bin" -i "$idx" --auto-boost-default=0 >/dev/null 2>&1 || true
+        exec_start+="ExecStart=-${smi_bin} -i ${idx} --auto-boost-default=0"$'\n'
+        exec_stop+="ExecStop=-${smi_bin} -i ${idx} --auto-boost-default=1"$'\n'
+      fi
+      ac_ok=false
+      if [[ -n "$ac_pair" ]] && out="$(run_root "$smi_bin" -i "$idx" -ac "$ac_pair" 2>&1)" && ! grep -qiE "not supported|not a valid|failed|error" <<<"$out"; then
+        ac_ok=true
+        exec_start+="ExecStart=${smi_bin} -i ${idx} -ac ${ac_pair}"$'\n'
+        exec_stop+="ExecStop=-${smi_bin} -i ${idx} -rac"$'\n'
+        applied=$((applied + 1))
+      else
+        echo -e "${C_YELLOW}nvidia-smi clock lock (-lgc/-ac) is not supported on GPU ${idx} (${g_name}): ${out}${C_RESET}"
+      fi
     fi
   done
   if (( applied == 0 )); then
@@ -3165,7 +4280,7 @@ apply_nvidia_clock_lock() {
   install_service nvidia-clock-lock.service <<EOF
 [Unit]
 Description=Lock NVIDIA GPU Clocks at Maximum for Strata
-After=nvidia-persistenced.service nvidia-powerd.service
+After=nvidia-persistenced.service strata-nvidia-persistenced.service nvidia-powerd.service
 Wants=nvidia-persistenced.service
 
 [Service]
@@ -3185,6 +4300,7 @@ revert_nvidia_clock_lock() {
     run_root nvidia-smi -i "$idx" -rgc >/dev/null 2>&1 || true
     run_root nvidia-smi -i "$idx" -rmc >/dev/null 2>&1 || true
     run_root nvidia-smi -i "$idx" -rac >/dev/null 2>&1 || true
+    run_root nvidia-smi -i "$idx" --auto-boost-default=1 >/dev/null 2>&1 || true
   done
 }
 
@@ -3278,6 +4394,74 @@ revert_nvidia_compute_mode() {
     refresh_nvidia_compute_mode
   else
     echo -e "${C_YELLOW}Previous compute modes were not recorded by this script; leaving as Default.${C_RESET}"
+  fi
+}
+
+# 12i3. NVIDIA Disable MIG Mode
+applicable_nvidia_mig_disable() {
+  [[ "$HAS_NVIDIA" == true ]] || { [[ -f "$NVIDIA_MIG_PREV_MARKER" ]]; return $?; }
+  { (( ${#NVIDIA_MIG_INDICES[@]} > 0 )) && [[ "$NVIDIA_MIG_ANY_ENABLED" == true || "$NVIDIA_MIG_ANY_PEND_ENABLED" == true ]]; } || [[ -f "$NVIDIA_MIG_PREV_MARKER" ]]
+}
+title_nvidia_mig_disable() { echo "NVIDIA Disable MIG Mode (Full VRAM & Multi-GPU Tensor Parallelism)"; }
+status_nvidia_mig_disable() {
+  [[ "$NVIDIA_MIG_ANY_ENABLED" == false && "$NVIDIA_MIG_ANY_PEND_ENABLED" == false ]]
+}
+explain_nvidia_mig_disable() {
+  cat <<'EOF'
+Impact:
+  Disables NVIDIA Multi-Instance GPU partitioning ('nvidia-smi -mig 0') on
+  A100/A30/H100/H200/B200 GPUs that have MIG enabled (often left on by cloud or
+  used-server images). Reclaims full unpartitioned VRAM and enables multi-GPU
+  NVLink / tensor parallelism. May require GPU reset or reboot to apply.
+EOF
+}
+apply_nvidia_mig_disable() {
+  local i idx cur pend out prev_lines="" any_ok=false
+  for (( i = 0; i < ${#NVIDIA_MIG_INDICES[@]}; i++ )); do
+    idx="${NVIDIA_MIG_INDICES[$i]}"
+    cur="${NVIDIA_GPU_MIG_CUR[$i]}"
+    pend="${NVIDIA_GPU_MIG_PEND[$i]}"
+    [[ "$cur" == "Enabled" || "$pend" == "Enabled" ]] || continue
+    prev_lines+="${idx}"$'\n'
+    if out="$(run_root nvidia-smi -i "$idx" -mig 0 2>&1)" && ! grep -qiE "not supported|failed|error|unable" <<<"$out"; then
+      any_ok=true
+      if [[ "$cur" == "Enabled" ]]; then
+        if [[ -z "$(nvidia-smi -i "$idx" --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -d '[:space:]')" ]]; then
+          run_root nvidia-smi --gpu-reset -i "$idx" >/dev/null 2>&1 || true
+        fi
+      fi
+    else
+      echo -e "${C_YELLOW}Could not disable MIG mode on GPU ${idx}: ${out}${C_RESET}"
+    fi
+  done
+  if [[ -n "$prev_lines" && "$any_ok" == true ]]; then
+    printf "%s" "$prev_lines" | run_root tee "$NVIDIA_MIG_PREV_MARKER" >/dev/null
+  fi
+  refresh_nvidia_mig
+  if [[ "$NVIDIA_MIG_ANY_ENABLED" == true ]]; then
+    REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
+  fi
+  [[ "$any_ok" == true ]]
+}
+revert_nvidia_mig_disable() {
+  if [[ -f "$NVIDIA_MIG_PREV_MARKER" ]]; then
+    local idx any_ok=false
+    while IFS= read -r idx; do
+      [[ "$idx" =~ ^[0-9]+$ ]] || continue
+      if run_root nvidia-smi -i "$idx" -mig 1; then
+        any_ok=true
+        if [[ -z "$(nvidia-smi -i "$idx" --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -d '[:space:]')" ]]; then
+          run_root nvidia-smi --gpu-reset -i "$idx" >/dev/null 2>&1 || true
+        fi
+      fi
+    done < "$NVIDIA_MIG_PREV_MARKER"
+    run_root rm -f "$NVIDIA_MIG_PREV_MARKER"
+    refresh_nvidia_mig
+    if [[ "$any_ok" == true && "$NVIDIA_MIG_ANY_ENABLED" == false ]]; then
+      REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
+    fi
+  else
+    echo -e "${C_YELLOW}Previous MIG state was not recorded by this script; leaving MIG disabled.${C_RESET}"
   fi
 }
 
@@ -3612,7 +4796,7 @@ revert_tuned_profile() {
 gpu_pci_count() { echo "${DISCRETE_GPU_COUNT:-0}"; }
 applicable_iommu_pt() {
   has_kernel_param "iommu=pt" && return 0
-  [[ -n "$(ls -A /sys/kernel/iommu_groups 2>/dev/null)" ]] && (( $(gpu_pci_count) >= 2 ))
+  [[ -n "$(ls -A "${STRATA_IOMMU_GROUPS_DIR:-/sys/kernel/iommu_groups}" 2>/dev/null)" ]] && (( $(gpu_pci_count) >= 2 ))
 }
 title_iommu_pt() { echo "IOMMU Passthrough Mode (iommu=pt, lower multi-GPU DMA overhead)"; }
 status_iommu_pt() { has_kernel_param "iommu=pt" || has_kernel_param "iommu.passthrough=1"; }
@@ -3620,12 +4804,171 @@ explain_iommu_pt() { echo -e "Impact:\n  Adds 'iommu=pt' to the kernel command l
 apply_iommu_pt() { add_kernel_param "iommu=pt"; }
 revert_iommu_pt() { remove_kernel_param "iommu=pt"; remove_kernel_param "iommu.passthrough=1"; }
 
+# 12q2. Multi-GPU PCIe ACS Disable
+applicable_pcie_acs_disable() {
+  (( $(gpu_pci_count) >= 2 )) && [[ "$HAS_FULL_GPU_INTERCONNECT" == false ]] && command -v setpci >/dev/null 2>&1 &&
+    { service_installed strata-pcie-acs-disable.service || [[ "$PCIE_ACS_CHECKED" == false || "$PCIE_ACS_ENABLED" == true ]]; }
+}
+title_pcie_acs_disable() { echo "Multi-GPU PCIe ACS Disable (setpci, direct GPU-to-GPU P2P)"; }
+note_pcie_acs_disable() { echo -e "${C_MAGENTA}[EXP]${C_RESET}"; }
+status_pcie_acs_disable() { service_installed strata-pcie-acs-disable.service && unit_enabled strata-pcie-acs-disable.service; }
+explain_pcie_acs_disable() {
+  cat <<'EOF'
+Impact:
+  Clears PCIe Access Control Services (ECAP_ACS+0x6.w=0000) via setpci at boot
+  on PCIe bridges/switches when GPUs lack NVLink or XGMI. Allows direct
+  peer-to-peer GPU transfers across PCIe switches instead of detouring through
+  the CPU root complex (boosts multi-GPU tensor parallelism bandwidth).
+EOF
+  echo -e "\n${C_MAGENTA}[EXPERIMENTAL] Disabling ACS removes PCIe isolation between devices.${C_RESET}"
+  echo -e "${C_YELLOW}[WARNING] Bare-metal single-tenant hosts only — DO NOT enable if you use${C_RESET}"
+  echo -e "${C_YELLOW}          VFIO VM passthrough or untrusted multi-tenant VMs.${C_RESET}"
+}
+apply_pcie_acs_disable() {
+  local setpci_bin lspci_bin
+  setpci_bin="$(command -v setpci)" || return 1
+  lspci_bin="$(command -v lspci)" || return 1
+  run_root mkdir -p /usr/local/sbin
+  run_root tee /usr/local/sbin/strata-disable-acs.sh >/dev/null <<EOF
+#!/bin/sh
+bdfs="\$("${lspci_bin}" -d "*:*:0604" 2>/dev/null | awk '{print \$1}')"
+[ -n "\$bdfs" ] || bdfs="\$("${lspci_bin}" -d "*:*:*" 2>/dev/null | awk '{print \$1}')"
+for bdf in \$bdfs; do
+  "${setpci_bin}" -s "\$bdf" ECAP_ACS+0x6.w >/dev/null 2>&1 || continue
+  "${setpci_bin}" -s "\$bdf" ECAP_ACS+0x6.w=0000 >/dev/null 2>&1 || true
+done
+EOF
+  run_root chmod 0755 /usr/local/sbin/strata-disable-acs.sh
+  install_service strata-pcie-acs-disable.service <<'EOF'
+[Unit]
+Description=Disable PCIe ACS for Multi-GPU P2P (Strata)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/strata-disable-acs.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  detect_gpu_topology
+}
+revert_pcie_acs_disable() {
+  remove_service strata-pcie-acs-disable.service
+  run_root rm -f /usr/local/sbin/strata-disable-acs.sh
+  REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
+  echo -e "${C_YELLOW}Removed PCIe ACS disable service; reboot to restore BIOS default ACS settings.${C_RESET}"
+}
+
+# 12q3. AMD Instinct Compute/Memory Partition Mode
+amd_instinct_partition_supported() {
+  [[ "$HAS_AMD" == true && "$HAS_AMD_INSTINCT" == true ]] || return 1
+  local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}"
+  compgen -G "${drm_dir}/card*/device/current_compute_partition" >/dev/null 2>&1 && return 0
+  command -v amd-smi >/dev/null 2>&1 && amd-smi partition --current >/dev/null 2>&1 && return 0
+  return 1
+}
+applicable_amd_instinct_partition() {
+  amd_instinct_partition_supported || [[ -f "$AMD_INSTINCT_PART_MARKER" ]]
+}
+title_amd_instinct_partition() { echo "AMD Instinct Compute/Memory Partition Mode (SPX/CPX, NPS1/NPS4)"; }
+note_amd_instinct_partition() { echo -e "${C_BLUE}[OPT]${C_RESET}"; }
+status_amd_instinct_partition() { [[ -f "$AMD_INSTINCT_PART_MARKER" ]]; }
+explain_amd_instinct_partition() {
+  cat <<'EOF'
+Impact:
+  Switches AMD Instinct MI250X/MI300X/MI325X compute and memory partitioning:
+    - SPX + NPS1: Single unified GPU per package (best for massive single LLMs)
+    - CPX + NPS4: Splits XCDs & memory domains (best for concurrent small models)
+  Saves your original modes and restores them on revert. May require a reboot.
+EOF
+}
+apply_amd_instinct_partition() {
+  local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}" cur_cp="" cur_mp="" f
+  for f in "${drm_dir}"/card*/device/current_compute_partition; do
+    [[ -r "$f" ]] && { cur_cp="$(cat "$f" 2>/dev/null | tr -d '[:space:]')"; break; }
+  done
+  for f in "${drm_dir}"/card*/device/current_memory_partition; do
+    [[ -r "$f" ]] && { cur_mp="$(cat "$f" 2>/dev/null | tr -d '[:space:]')"; break; }
+  done
+  if [[ -z "$cur_cp" ]] && command -v amd-smi >/dev/null 2>&1; then
+    local part_out
+    part_out="$(amd-smi partition --current 2>/dev/null || true)"
+    cur_cp="$(awk -F: '/COMPUTE_PARTITION/ {gsub(/ /,"",$2); print $2; exit}' <<<"$part_out")"
+    cur_mp="$(awk -F: '/MEMORY_PARTITION/ {gsub(/ /,"",$2); print $2; exit}' <<<"$part_out")"
+  fi
+  echo -e "\n${C_BOLD}Select AMD Instinct Partition Preset (current: compute=${cur_cp:-unknown}, memory=${cur_mp:-unknown}):${C_RESET}"
+  echo "  1) SPX + NPS1 (Unified GPU — recommended for large single LLMs)"
+  echo "  2) CPX + NPS4 (Split XCDs — concurrent smaller models)"
+  local pchoice="" tgt_cp="SPX" tgt_mp="NPS1"
+  read -r -p "Choose [1-2, default 1]: " pchoice
+  case "$pchoice" in
+    2) tgt_cp="CPX"; tgt_mp="NPS4" ;;
+    1|"") ;;
+    *) echo -e "${C_RED}Invalid choice '${pchoice}'. Cancelled.${C_RESET}"; return 1 ;;
+  esac
+  if [[ ! -f "$AMD_INSTINCT_PART_MARKER" ]]; then
+    echo "${cur_cp:-SPX}:${cur_mp:-NPS1}" | run_root tee "$AMD_INSTINCT_PART_MARKER" >/dev/null
+  fi
+  local ok=false
+  if command -v amd-smi >/dev/null 2>&1; then
+    run_root amd-smi set --compute-partition "$tgt_cp" >/dev/null 2>&1 && ok=true
+    run_root amd-smi set --memory-partition "$tgt_mp" >/dev/null 2>&1 && ok=true
+  fi
+  if [[ "$ok" == false ]]; then
+    for f in "${drm_dir}"/card*/device/current_compute_partition; do
+      [[ -f "$f" ]] && echo "$tgt_cp" | run_root tee "$f" >/dev/null 2>&1 && ok=true
+    done
+    for f in "${drm_dir}"/card*/device/current_memory_partition; do
+      [[ -f "$f" ]] && echo "$tgt_mp" | run_root tee "$f" >/dev/null 2>&1 && ok=true
+    done
+  fi
+  if [[ "$ok" == false ]]; then
+    run_root rm -f "$AMD_INSTINCT_PART_MARKER"
+    echo -e "${C_YELLOW}Could not change Instinct partition mode (may require idle GPU or root amd-smi).${C_RESET}"
+    return 1
+  fi
+  if [[ -n "$cur_mp" && "$cur_mp" != "$tgt_mp" ]]; then
+    REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
+  fi
+}
+revert_amd_instinct_partition() {
+  if [[ -f "$AMD_INSTINCT_PART_MARKER" ]]; then
+    local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}" orig_cp orig_mp f
+    IFS=: read -r orig_cp orig_mp < "$AMD_INSTINCT_PART_MARKER"
+    if command -v amd-smi >/dev/null 2>&1; then
+      [[ -n "$orig_cp" ]] && run_root amd-smi set --compute-partition "$orig_cp" >/dev/null 2>&1 || true
+      [[ -n "$orig_mp" ]] && run_root amd-smi set --memory-partition "$orig_mp" >/dev/null 2>&1 || true
+    fi
+    for f in "${drm_dir}"/card*/device/current_compute_partition; do
+      [[ -n "$orig_cp" && -f "$f" ]] && echo "$orig_cp" | run_root tee "$f" >/dev/null 2>&1 || true
+    done
+    for f in "${drm_dir}"/card*/device/current_memory_partition; do
+      [[ -n "$orig_mp" && -f "$f" ]] && echo "$orig_mp" | run_root tee "$f" >/dev/null 2>&1 || true
+    done
+    run_root rm -f "$AMD_INSTINCT_PART_MARKER"
+    REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
+  fi
+}
+
 # 12r. Intel compute stack
 intel_compute_pkgs() {
   case "$DISTRO_FAMILY" in
     arch)   echo "intel-compute-runtime level-zero-loader" ;;
     fedora) echo "intel-compute-runtime oneapi-level-zero" ;;
     debian) echo "intel-opencl-icd libze-intel-gpu1 libze1" ;;
+    suse)
+      local pkgs=()
+      if pkg_available repo intel-opencl; then pkgs+=(intel-opencl)
+      elif pkg_available repo intel-compute-runtime; then pkgs+=(intel-compute-runtime)
+      else return 0; fi
+      pkg_available repo libze_intel_gpu1 && pkgs+=(libze_intel_gpu1)
+      if pkg_available repo level-zero; then pkgs+=(level-zero)
+      elif pkg_available repo libze1; then pkgs+=(libze1)
+      else return 0; fi
+      echo "${pkgs[*]}"
+      ;;
     *)      echo "" ;;
   esac
 }
@@ -3696,7 +5039,7 @@ jetson_fan_pwm_path() {
   local hm
   for hm in /sys/class/hwmon/hwmon*; do
     [[ -r "$hm/name" ]] || continue
-    if grep -qiE "pwm-?fan" "$hm/name" 2>/dev/null && [[ -e "$hm/pwm1" ]]; then
+    if grep -qiE "pwm-?fan|tegra_pwmfan" "$hm/name" 2>/dev/null && [[ -e "$hm/pwm1" ]]; then
       echo "$hm/pwm1"
       return 0
     fi
@@ -3772,7 +5115,7 @@ applicable_hugepages_1g() {
   (( ${RAM_GB:-0} >= 64 )) && (( $(numa_node_count) > 1 ))
 }
 title_hugepages_1g() { echo "Reserve 1 GiB Hugepages ($(( RAM_GB / 4 )) GiB, multi-socket CPU inference)"; }
-note_hugepages_1g() { echo -e "${C_YELLOW}[!] Reserves RAM, minimal gain${C_RESET}"; }
+note_hugepages_1g() { echo -e "${C_BLUE}[OPT]${C_RESET}"; }
 status_hugepages_1g() { [[ -n "$(kernel_param_value hugepages || true)" ]]; }
 explain_hugepages_1g() {
   cat <<EOF
@@ -4336,7 +5679,7 @@ format_strata_hw_warnings() {
     return 0
   elif [[ "$HAS_NVIDIA" == false && "$HAS_AMD" == false && "$HAS_INTEL_ARC" == false ]]; then
     echo -e "${C_YELLOW}[WARNING] No dedicated NVIDIA, AMD Radeon, or Intel Arc GPU detected (${GPU_SUMMARY}). Strata models may not run.${C_RESET}"
-  elif [[ "$HAS_NVIDIA" == true && "$NVIDIA_VRAM_MB" -gt 0 && "$NVIDIA_VRAM_MB" -lt 6144 ]]; then
+  elif [[ "$HAS_NVIDIA" == true && "$HAS_NVIDIA_UNIFIED_MEM" == false && "$NVIDIA_VRAM_MB" -gt 0 && "$NVIDIA_VRAM_MB" -lt 6144 ]]; then
     echo -e "${C_YELLOW}[WARNING] NVIDIA GPU VRAM is $((NVIDIA_VRAM_MB / 1024)) GiB (< 6 GiB). Larger Strata models may not fit in VRAM.${C_RESET}"
   fi
   if (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )) && [[ "$HAS_NVIDIA" == false && "$HAS_AMD_PREBUILT_GFX" == false && "$HAS_INTEL_ARC" == false ]]; then
@@ -4344,8 +5687,14 @@ format_strata_hw_warnings() {
       echo -e "${C_YELLOW}[NOTE] AMD GPU (${AMD_MISSING_GFX_SUMMARY}) has no official prebuilt Strata Linux engine. Open [STRATA] -> Build Local HIP Engine to compile & register support from source.${C_RESET}"
     fi
   fi
-  if [[ "$HAS_NVIDIA_TESLA" == true && ${#NVIDIA_GPU_INDICES[@]} -eq 0 ]]; then
-    echo -e "${C_YELLOW}[WARNING] NVIDIA Tesla GPU detected without active nvidia-smi. Ensure Above 4G Decoding is enabled in BIOS and use the proprietary nvidia driver (not nvidia-open) for pre-Turing Tesla (V100/P100/P40/P4/M40/M60), or R470 legacy for Kepler (K80/K40).${C_RESET}"
+  if [[ "$HAS_NVIDIA_DATACENTER" == true && ${#NVIDIA_GPU_INDICES[@]} -eq 0 ]]; then
+    echo -e "${C_YELLOW}[WARNING] NVIDIA Tesla / datacenter GPU detected without active nvidia-smi. Ensure Above 4G Decoding is enabled in BIOS, use the proprietary nvidia driver (not nvidia-open) for pre-Turing GPUs, use the R580 legacy branch for Maxwell/Pascal/Volta (R590+ dropped M40/M60/P4/P40/P100/V100), or R470 legacy for Kepler (K80/K40).${C_RESET}"
+  elif [[ "$HAS_NVIDIA_PASCAL" == true || "$HAS_NVIDIA_VOLTA_SM70" == true ]]; then
+    local _arch_note="Pascal/Volta (sm_60/sm_61/sm_70) GPU detected: CUDA 13 dropped sm_60-sm_70, so use Strata CUDA 12 builds and R580-branch drivers"
+    if [[ "$HAS_NVIDIA_VOLTA_SM70" == true ]] && [[ ! -f "$NVIDIA_SM70_MARKER" ]]; then
+      _arch_note+=" (enable the V100 STRATA_SM70_TABLE step for faster decode)"
+    fi
+    echo -e "${C_YELLOW}[NOTE] ${_arch_note}.${C_RESET}"
   fi
 }
 
@@ -4396,7 +5745,7 @@ install_strata_service_fn() {
   [[ -f "$NUMACTL_MARKER" ]] && command -v numactl >/dev/null 2>&1 && numa_prefix="$(command -v numactl) --interleave=all "
   while IFS= read -r kv; do
     [[ -n "$kv" ]] && env_lines+="Environment=${kv}"$'\n'
-  done < <(strata_amd_opt_in_env_list)
+  done < <(strata_runtime_env_list)
 
   install_service strata.service <<EOF
 [Unit]
@@ -4462,7 +5811,7 @@ find_latest_results_json() {
 }
 
 read_jetson_ina3221_watts() {
-  local d ch rname pval sw="" gw="" cw=""
+  local d ch rname pval mv ma sw="" gw="" cw=""
   for d in /sys/bus/i2c/drivers/ina3221x/*/iio:device*; do
     [[ -d "$d" ]] || continue
     for ch in 0 1 2; do
@@ -4471,12 +5820,32 @@ read_jetson_ina3221_watts() {
       pval="$(cat "$d/in_power${ch}_input" 2>/dev/null || true)"
       [[ "$pval" =~ ^[0-9]+$ ]] || continue
       case "$rname" in
-        VDD_IN|POM_5V_IN)   [[ -z "$sw" ]] && sw="$(awk -v m="$pval" 'BEGIN{printf "%.2f", m/1000.0}')" ;;
-        VDD_GPU|POM_5V_GPU) [[ -z "$gw" ]] && gw="$(awk -v m="$pval" 'BEGIN{printf "%.2f", m/1000.0}')" ;;
-        VDD_CPU|POM_5V_CPU|VDD_SYS_CPU) [[ -z "$cw" ]] && cw="$(awk -v m="$pval" 'BEGIN{printf "%.2f", m/1000.0}')" ;;
+        VDD_IN|POM_5V_IN|VIN_SYS_5V0) [[ -z "$sw" ]] && sw="$(awk -v m="$pval" 'BEGIN{printf "%.2f", m/1000.0}')" ;;
+        VDD_GPU|POM_5V_GPU|VDD_GPU_SOC|VDD_CPU_GPU_CV) [[ -z "$gw" ]] && gw="$(awk -v m="$pval" 'BEGIN{printf "%.2f", m/1000.0}')" ;;
+        VDD_CPU|POM_5V_CPU|VDD_SYS_CPU|VDD_CPU_CV) [[ -z "$cw" ]] && cw="$(awk -v m="$pval" 'BEGIN{printf "%.2f", m/1000.0}')" ;;
       esac
     done
   done
+  if [[ -z "$sw" && -z "$gw" && -z "$cw" ]]; then
+    local hm_base="${STRATA_HWMON_DIR:-/sys/class/hwmon}" hm
+    for hm in "$hm_base"/hwmon*; do
+      [[ -r "$hm/name" ]] || continue
+      [[ "$(cat "$hm/name" 2>/dev/null || true)" == "ina3221" ]] || continue
+      for ch in 0 1 2 3; do
+        [[ -r "$hm/in${ch}_label" && -r "$hm/in${ch}_input" && -r "$hm/curr${ch}_input" ]] || continue
+        rname="$(cat "$hm/in${ch}_label" 2>/dev/null || true)"
+        mv="$(cat "$hm/in${ch}_input" 2>/dev/null || true)"
+        ma="$(cat "$hm/curr${ch}_input" 2>/dev/null || true)"
+        [[ "$mv" =~ ^[0-9]+$ && "$ma" =~ ^[0-9]+$ ]] || continue
+        pval="$(awk -v v="$mv" -v c="$ma" 'BEGIN{printf "%.2f", (v*c)/1000000.0}')"
+        case "$rname" in
+          VDD_IN|POM_5V_IN|VIN_SYS_5V0) [[ -z "$sw" ]] && sw="$pval" ;;
+          VDD_GPU|POM_5V_GPU|VDD_GPU_SOC|VDD_CPU_GPU_CV) [[ -z "$gw" ]] && gw="$pval" ;;
+          VDD_CPU|POM_5V_CPU|VDD_SYS_CPU|VDD_CPU_CV) [[ -z "$cw" ]] && cw="$pval" ;;
+        esac
+      done
+    done
+  fi
   printf "%s|%s|%s" "$sw" "$gw" "$cw"
 }
 
@@ -4485,6 +5854,7 @@ start_bench_power_sampler() {
   (
     local n=0 gpu_sum="0" cpu_sum="0" sys_sum="0" gpu_n=0 cpu_n=0 sys_n=0
     local prev_uj="" prev_us="" rapl_f="/sys/class/powercap/intel-rapl:0/energy_uj" rapl_mode="none"
+    local -A prev_intel_uj=() prev_intel_us=()
     if [[ -r "$rapl_f" ]]; then
       rapl_mode="direct"
     elif [[ -e "$rapl_f" ]] && sudo -n true >/dev/null 2>&1; then
@@ -4500,14 +5870,50 @@ start_bench_power_sampler() {
         if [[ -n "$nv_p" ]]; then gw="$nv_p"; has_g=true; fi
       fi
       if [[ "$HAS_AMD" == true ]]; then
-        local card_dir hwmon_dir pa
-        for card_dir in /sys/class/drm/card*/device; do
+        local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}" card_dir hwmon_dir pa
+        for card_dir in "${drm_dir}"/card[0-9]*/device; do
           for hwmon_dir in "$card_dir"/hwmon/hwmon*; do
             if [[ -r "$hwmon_dir/power1_average" ]]; then
               pa="$(cat "$hwmon_dir/power1_average" 2>/dev/null || echo 0)"
               if [[ "$pa" =~ ^[0-9]+$ ]] && (( pa > 0 )); then
                 gw="$(awk -v a="$gw" -v b="$pa" 'BEGIN{printf "%.2f", a + b/1000000.0}')"
                 has_g=true
+                break
+              fi
+            fi
+          done
+        done
+      fi
+      if [[ "$HAS_INTEL_ARC" == true ]]; then
+        local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}" card_dir hwmon_dir ven did pa e_uj e_us de dt_us
+        for card_dir in "${drm_dir}"/card[0-9]*/device; do
+          [[ -r "$card_dir/vendor" && -r "$card_dir/device" ]] || continue
+          ven="$(tr '[:upper:]' '[:lower:]' < "$card_dir/vendor" 2>/dev/null || true)"
+          [[ "$ven" == "0x8086" ]] || continue
+          did="$(tr '[:upper:]' '[:lower:]' < "$card_dir/device" 2>/dev/null || true)"
+          _is_intel_discrete_pci_id "$did" || continue
+          for hwmon_dir in "$card_dir"/hwmon/hwmon*; do
+            if [[ -r "$hwmon_dir/power1_average" ]]; then
+              pa="$(cat "$hwmon_dir/power1_average" 2>/dev/null || echo 0)"
+              if [[ "$pa" =~ ^[0-9]+$ ]] && (( pa > 0 )); then
+                gw="$(awk -v a="$gw" -v b="$pa" 'BEGIN{printf "%.2f", a + b/1000000.0}')"
+                has_g=true
+                break
+              fi
+            elif [[ -r "$hwmon_dir/energy1_input" ]]; then
+              e_uj="$(cat "$hwmon_dir/energy1_input" 2>/dev/null || true)"
+              e_us="$(date +%s%6N 2>/dev/null || true)"
+              if [[ "$e_uj" =~ ^[0-9]+$ && "$e_us" =~ ^[0-9]+$ ]]; then
+                if [[ -n "${prev_intel_uj[$hwmon_dir]:-}" && -n "${prev_intel_us[$hwmon_dir]:-}" ]]; then
+                  de=$(( e_uj - prev_intel_uj[$hwmon_dir] ))
+                  dt_us=$(( e_us - prev_intel_us[$hwmon_dir] ))
+                  if (( de >= 0 && dt_us > 0 )); then
+                    gw="$(awk -v a="$gw" -v de="$de" -v dt="$dt_us" 'BEGIN{printf "%.2f", a + (de/dt)}')"
+                    has_g=true
+                  fi
+                fi
+                prev_intel_uj[$hwmon_dir]="$e_uj"
+                prev_intel_us[$hwmon_dir]="$e_us"
                 break
               fi
             fi
@@ -6107,7 +7513,8 @@ Impact:
   Builds and registers a self-contained local Strata HIP engine package for AMD
   architectures that lack an official prebuilt Linux release (such as gfx1150
   Strix Point / Radeon 890M, gfx1103 Radeon 780M, gfx1152 Krackan, gfx1153,
-  RDNA1 gfx1010/1011/1012, gfx1034, or wave64 gfx906).
+  RDNA1 gfx1010/1011/1012, gfx1034, or wave64 Instinct MI50/MI60/MI100/MI210/
+  MI250X/MI300X/MI350X).
 
   Workflow:
     1. Acquires AMD's TheRock ROCm SDK (or uses a compatible system /opt/rocm)
@@ -6206,24 +7613,45 @@ strata_action_build_hip() {
     (( ${#targets[@]} > 0 )) || { echo -e "${C_YELLOW}No target architecture specified. Cancelled.${C_RESET}"; return 0; }
   fi
 
-  if _array_contains_val "gfx906" "${targets[@]}" && (( ${#targets[@]} > 1 )); then
-    echo -e "${C_YELLOW}gfx906 (wave64) cannot be combined with wave32 architectures in one Strata binary.${C_RESET}"
-    echo "  1) Build for wave32 targets only"
-    echo "  2) Build for gfx906 (wave64) only"
-    local wchoice="" filtered=() t
+  local -a wave64_tgts=() wave32_tgts=()
+  local _wt=""
+  for _wt in "${targets[@]}"; do
+    if amd_gfx_is_wave64 "$_wt"; then
+      wave64_tgts+=("$_wt")
+    else
+      wave32_tgts+=("$_wt")
+    fi
+  done
+  if (( ${#wave64_tgts[@]} > 0 && ${#wave32_tgts[@]} > 0 )); then
+    echo -e "${C_YELLOW}Wave64 targets (${wave64_tgts[*]}) cannot be combined with wave32 targets (${wave32_tgts[*]}) in one Strata binary.${C_RESET}"
+    echo "  1) Build for wave32 targets only (${wave32_tgts[*]})"
+    echo "  2) Build for wave64 targets only (${wave64_tgts[*]})"
+    local wchoice=""
     read -r -p "Choose [1-2]: " wchoice
     case "$wchoice" in
-      1)
-        for t in "${targets[@]}"; do [[ "$t" != "gfx906" ]] && filtered+=("$t"); done
-        targets=("${filtered[@]}")
-        ;;
-      2) targets=("gfx906") ;;
+      1) targets=("${wave32_tgts[@]}") ;;
+      2) targets=("${wave64_tgts[@]}") ;;
+      *) echo -e "${C_YELLOW}Cancelled.${C_RESET}"; return 0 ;;
+    esac
+  fi
+  if _array_contains_val "gfx906" "${targets[@]}" && (( ${#targets[@]} > 1 )); then
+    echo -e "${C_YELLOW}gfx906 uses dedicated -DSTRATA_HIP_GFX906=ON flags and cannot combine with other wave64 targets.${C_RESET}"
+    local -a non906=()
+    for _wt in "${targets[@]}"; do [[ "$_wt" != "gfx906" ]] && non906+=("$_wt"); done
+    echo "  1) Build for gfx906 only"
+    echo "  2) Build for ${non906[*]} only"
+    local g9choice=""
+    read -r -p "Choose [1-2]: " g9choice
+    case "$g9choice" in
+      1) targets=("gfx906") ;;
+      2) targets=("${non906[@]}") ;;
       *) echo -e "${C_YELLOW}Cancelled.${C_RESET}"; return 0 ;;
     esac
   fi
 
-  local is_wave32=true
-  [[ "${targets[0]}" == "gfx906" ]] && is_wave32=false
+  local is_gfx906=false is_wave32=true
+  [[ "${targets[0]}" == "gfx906" ]] && is_gfx906=true
+  amd_gfx_is_wave64 "${targets[0]}" && is_wave32=false
 
   if [[ -z "$existing" ]]; then
     local tgt_desc="" t=""
@@ -6253,7 +7681,7 @@ strata_action_build_hip() {
   cache_base="$(_user_cache_dir)/strata-performance-setup"
   run_as_user_exec mkdir -p "$cache_base" || return 1
 
-  if [[ "$is_wave32" == false ]]; then
+  if [[ "$is_gfx906" == true ]]; then
     if _is_usable_rocm_root "$sys_rocm"; then
       echo -e "${C_GREEN}Using ROCm toolchain at ${sys_rocm} for gfx906.${C_RESET}"
       sdk="$sys_rocm"
@@ -6275,9 +7703,11 @@ strata_action_build_hip() {
 
     if (( ${#therock_families[@]} == 0 )); then
       if _is_usable_rocm_root "$sys_rocm"; then
+        echo -e "${C_GREEN}Using system ROCm toolchain at ${sys_rocm} for ${targets[*]}.${C_RESET}"
         sdk="$sys_rocm"
       else
         echo -e "${C_RED}No AMD TheRock tarball family known for '${targets[0]}' and no usable ROCm at ${sys_rocm}.${C_RESET}"
+        echo -e "Install ROCm (or set ${C_BOLD}ROCM_PATH${C_RESET} to your ROCm root) and re-run."
         return 1
       fi
     elif _is_usable_rocm_root "$sys_rocm"; then
@@ -6317,7 +7747,9 @@ strata_action_build_hip() {
   fi
 
   local src_dir="${cache_base}/Strata-src"
-  _prepare_strata_source "$src_dir" "$is_wave32" "${targets[@]}" || return 1
+  local patch_hip_cmake=true
+  [[ "$is_gfx906" == true ]] && patch_hip_cmake=false
+  _prepare_strata_source "$src_dir" "$patch_hip_cmake" "${targets[@]}" || return 1
   local commit="$_PREPARED_STRATA_COMMIT"
 
   local jobs=4 ram_cap=4
@@ -6360,7 +7792,7 @@ strata_action_build_hip() {
   [[ -n "$bitcode" ]] && hip_flag_str+=" --rocm-device-lib-path=${bitcode}"
 
   echo -e "\n${C_CYAN}Configuring Strata engine for ${cmake_archs} (jobs=${jobs})...${C_RESET}"
-  if [[ "$is_wave32" == true ]]; then
+  if [[ "$is_gfx906" == false ]]; then
     run_as_user_exec env "${build_env[@]}" cmake -G Ninja -S "${src_dir}/engine" -B "${bdir}/engine" \
       -DCMAKE_BUILD_TYPE=Release \
       -DSTRATA_ENABLE_HIP=ON \
@@ -6852,14 +8284,48 @@ print_live_stats() {
     fi
   fi
 
-  local gpu_pcts=() vram_pcts=() vram_useds=() vram_tots=() pwr_ws=() pwr_lim_ws=() pwr_pcts=() gpu_temps=()
+  local gpu_pcts=() vram_pcts=() vram_useds=() vram_tots=() vram_labels=() pwr_ws=() pwr_lim_ws=() pwr_pcts=() gpu_temps=() gpu_notes=() gpu_thr_tags=()
   local total_gpu_pwr_w="" cpu_temp=""
 
-  # GPU, VRAM, Power, and Temp (supports multiple NVIDIA and/or AMD GPUs)
+  # GPU, VRAM, Power, and Temp (supports NVIDIA, AMD, Intel Arc, and Jetson)
   if [[ "$HAS_NVIDIA" == true ]] && command -v nvidia-smi >/dev/null 2>&1; then
     local nv_lines nv_parsed nv_line
     nv_lines="$(nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,power.draw,power.limit,temperature.gpu --format=csv,noheader,nounits 2>/dev/null || true)"
     if [[ -n "$nv_lines" ]]; then
+      local -a nv_pstates=() nv_thr_active=()
+      local nv_extra="" eline ei_pstate ei_hw ei_sw
+      if [[ -z "$NVIDIA_LIVE_EXTRA_FIELDS" ]]; then
+        nv_extra="$(nvidia-smi --query-gpu=pstate,clocks_event_reasons.hw_thermal_slowdown,clocks_event_reasons.sw_thermal_slowdown --format=csv,noheader 2>/dev/null || true)"
+        if [[ -n "$nv_extra" ]] && ! grep -qiE "not a valid|field.*not" <<<"$nv_extra"; then
+          NVIDIA_LIVE_EXTRA_FIELDS="pstate,clocks_event_reasons.hw_thermal_slowdown,clocks_event_reasons.sw_thermal_slowdown"
+        else
+          nv_extra="$(nvidia-smi --query-gpu=pstate,clocks_throttle_reasons.hw_thermal_slowdown,clocks_throttle_reasons.sw_thermal_slowdown --format=csv,noheader 2>/dev/null || true)"
+          if [[ -n "$nv_extra" ]] && ! grep -qiE "not a valid|field.*not" <<<"$nv_extra"; then
+            NVIDIA_LIVE_EXTRA_FIELDS="pstate,clocks_throttle_reasons.hw_thermal_slowdown,clocks_throttle_reasons.sw_thermal_slowdown"
+          else
+            NVIDIA_LIVE_EXTRA_FIELDS="pstate"
+            nv_extra="$(nvidia-smi --query-gpu=pstate --format=csv,noheader 2>/dev/null || true)"
+          fi
+        fi
+      else
+        nv_extra="$(nvidia-smi --query-gpu="$NVIDIA_LIVE_EXTRA_FIELDS" --format=csv,noheader 2>/dev/null || true)"
+      fi
+      while IFS= read -r eline; do
+        [[ -n "$eline" ]] || continue
+        ei_pstate="" ei_hw="" ei_sw=""
+        IFS=',' read -r ei_pstate ei_hw ei_sw <<< "$eline"
+        ei_pstate="${ei_pstate//[[:space:]]/}"
+        ei_hw="${ei_hw//[[:space:]]/}"
+        ei_sw="${ei_sw//[[:space:]]/}"
+        [[ "$ei_pstate" =~ ^P[0-9]+$ ]] || ei_pstate=""
+        nv_pstates+=("$ei_pstate")
+        if [[ "$ei_hw" == "Active" || "$ei_sw" == "Active" ]]; then
+          nv_thr_active+=("true")
+        else
+          nv_thr_active+=("false")
+        fi
+      done <<< "$nv_extra"
+
       nv_parsed="$(awk -F', *' '
         function isnum(s) { return s ~ /^[0-9]+(\.[0-9]+)?$/ }
         {
@@ -6883,19 +8349,36 @@ print_live_stats() {
           printf "%s|%s|%s|%s|%s|%s|%s|%s\n", gp, vp, vu, vt, pw, plw, pp, gt
         }
       ' <<< "$nv_lines")"
+      local nv_ri=0
       while IFS= read -r nv_line; do
         [[ -n "$nv_line" ]] || continue
-        local g_pct="" v_pct="" v_used="" v_tot="" pw="" plw="" ppct="" gtmp=""
+        local g_pct="" v_pct="" v_used="" v_tot="" pw="" plw="" ppct="" gtmp="" v_lbl_tag="" g_note="" g_thr=""
         IFS='|' read -r g_pct v_pct v_used v_tot pw plw ppct gtmp <<< "$nv_line"
+        if [[ "$IS_DGX_SPARK" == true && -z "$v_pct" && -n "$ram_pct" ]]; then
+          v_pct="$ram_pct"
+          v_used="$ram_used_gib"
+          v_tot="$ram_tot_gib"
+          v_lbl_tag="Unified"
+        fi
+        if [[ "$HAS_NVIDIA_DATACENTER" == true && -n "${nv_pstates[$nv_ri]:-}" ]]; then
+          g_note="${nv_pstates[$nv_ri]}"
+        fi
+        if [[ "${nv_thr_active[$nv_ri]:-false}" == true ]]; then
+          g_thr=" ${C_RED}[THROTTLE]${C_RESET}"
+        fi
         [[ -n "$pw" ]] && total_gpu_pwr_w=$(( ${total_gpu_pwr_w:-0} + pw ))
         gpu_pcts+=("$g_pct")
         vram_pcts+=("$v_pct")
         vram_useds+=("$v_used")
         vram_tots+=("$v_tot")
+        vram_labels+=("$v_lbl_tag")
         pwr_ws+=("$pw")
         pwr_lim_ws+=("$plw")
         pwr_pcts+=("$ppct")
         gpu_temps+=("$gtmp")
+        gpu_notes+=("$g_note")
+        gpu_thr_tags+=("$g_thr")
+        ((nv_ri++))
       done <<< "$nv_parsed"
     fi
   fi
@@ -6953,16 +8436,80 @@ print_live_stats() {
       vram_pcts+=("$v_pct")
       vram_useds+=("$v_used")
       vram_tots+=("$v_tot")
+      vram_labels+=("")
       pwr_ws+=("$pw")
       pwr_lim_ws+=("$plw")
       pwr_pcts+=("$ppct")
       gpu_temps+=("$gtmp")
+      gpu_notes+=("")
+      gpu_thr_tags+=("")
+    done
+  fi
+  if [[ "$HAS_INTEL_ARC" == true ]]; then
+    local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}" card_node card_dir ven did hwmon_dir
+    for card_node in "$drm_dir"/card[0-9]*; do
+      [[ -e "$card_node" ]] || continue
+      [[ "$(basename "$card_node")" == *-* ]] && continue
+      card_dir="$card_node/device"
+      [[ -r "$card_dir/vendor" && -r "$card_dir/device" ]] || continue
+      ven="$(tr '[:upper:]' '[:lower:]' < "$card_dir/vendor" 2>/dev/null || true)"
+      [[ "$ven" == "0x8086" ]] || continue
+      did="$(tr '[:upper:]' '[:lower:]' < "$card_dir/device" 2>/dev/null || true)"
+      _is_intel_discrete_pci_id "$did" || continue
+      local pw="" gtmp="" mc="" pa="" e_uj="" e_us="" de="" dt_us=""
+      for hwmon_dir in "$card_dir"/hwmon/hwmon*; do
+        [[ -d "$hwmon_dir" ]] || continue
+        if [[ -z "$gtmp" ]]; then
+          local tf
+          for tf in "$hwmon_dir/temp2_input" "$hwmon_dir/temp1_input"; do
+            if [[ -r "$tf" ]]; then
+              mc="$(cat "$tf" 2>/dev/null || echo 0)"
+              [[ "$mc" =~ ^[0-9]+$ ]] && (( mc > 0 )) && { gtmp=$((mc / 1000)); break; }
+            fi
+          done
+        fi
+        if [[ -z "$pw" && -r "$hwmon_dir/power1_average" ]]; then
+          pa="$(cat "$hwmon_dir/power1_average" 2>/dev/null || echo 0)"
+          if [[ "$pa" =~ ^[0-9]+$ ]] && (( pa > 0 )); then
+            pw=$((pa / 1000000))
+            total_gpu_pwr_w=$(( ${total_gpu_pwr_w:-0} + pw ))
+          fi
+        elif [[ -z "$pw" && -r "$hwmon_dir/energy1_input" ]]; then
+          e_uj="$(cat "$hwmon_dir/energy1_input" 2>/dev/null || true)"
+          e_us="$(date +%s%6N 2>/dev/null || true)"
+          if [[ "$e_uj" =~ ^[0-9]+$ && "$e_us" =~ ^[0-9]+$ ]]; then
+            if [[ -n "${PREV_INTEL_GPU_UJ_MAP[$card_dir]:-}" && -n "${PREV_INTEL_GPU_US_MAP[$card_dir]:-}" ]]; then
+              de=$(( e_uj - PREV_INTEL_GPU_UJ_MAP[$card_dir] ))
+              dt_us=$(( e_us - PREV_INTEL_GPU_US_MAP[$card_dir] ))
+              if (( de >= 0 && dt_us > 0 )); then
+                pw=$(( de / dt_us ))
+                total_gpu_pwr_w=$(( ${total_gpu_pwr_w:-0} + pw ))
+              fi
+            fi
+            PREV_INTEL_GPU_UJ_MAP[$card_dir]="$e_uj"
+            PREV_INTEL_GPU_US_MAP[$card_dir]="$e_us"
+          fi
+        fi
+      done
+      if [[ -n "$gtmp" || -n "$pw" ]]; then
+        gpu_pcts+=("")
+        vram_pcts+=("")
+        vram_useds+=("")
+        vram_tots+=("")
+        vram_labels+=("")
+        pwr_ws+=("$pw")
+        pwr_lim_ws+=("")
+        pwr_pcts+=("")
+        gpu_temps+=("$gtmp")
+        gpu_notes+=("")
+        gpu_thr_tags+=("")
+      fi
     done
   fi
 
   if [[ "$IS_JETSON" == true && ${#gpu_pcts[@]} -eq 0 ]]; then
     local j_load_f="" j_load="" j_gp="" j_gt="" tz_d tz_t j_mc
-    for j_load_f in /sys/devices/gpu.0/load /sys/devices/*.gp10b/load /sys/devices/platform/host1x/*.gp10b/load; do
+    for j_load_f in /sys/devices/platform/17000000.ga10b/load /sys/devices/platform/*.ga10b/load /sys/devices/platform/*.gv11b/load /sys/devices/platform/gpu.0/load /sys/devices/gpu.0/load /sys/devices/*.gp10b/load /sys/devices/platform/host1x/*.gp10b/load; do
       if [[ -r "$j_load_f" ]]; then
         j_load="$(cat "$j_load_f" 2>/dev/null || true)"
         [[ "$j_load" =~ ^[0-9]+$ ]] && { j_gp=$(( j_load / 10 )); break; }
@@ -6971,7 +8518,7 @@ print_live_stats() {
     for tz_d in /sys/class/thermal/thermal_zone*; do
       [[ -r "$tz_d/type" && -r "$tz_d/temp" ]] || continue
       tz_t="$(cat "$tz_d/type" 2>/dev/null || true)"
-      if [[ "$tz_t" == "GPU-therm" ]]; then
+      if [[ "$tz_t" == "GPU-therm" || "$tz_t" == "gpu-thermal" || "$tz_t" == "tj-thermal" ]]; then
         j_mc="$(cat "$tz_d/temp" 2>/dev/null || echo 0)"
         [[ "$j_mc" =~ ^[0-9]+$ ]] && (( j_mc > 0 )) && { j_gt=$(( j_mc / 1000 )); break; }
       fi
@@ -6981,10 +8528,13 @@ print_live_stats() {
       vram_pcts+=("")
       vram_useds+=("")
       vram_tots+=("")
+      vram_labels+=("")
       pwr_ws+=("")
       pwr_lim_ws+=("")
       pwr_pcts+=("")
       gpu_temps+=("$j_gt")
+      gpu_notes+=("")
+      gpu_thr_tags+=("")
     fi
   fi
 
@@ -7091,10 +8641,21 @@ print_live_stats() {
     if (( gpu_count > 1 )); then
       g_lbl="GPU${gi}:" v_lbl="VRAM${gi}:" p_lbl="GPU${gi}"
     fi
+    if [[ "${vram_labels[$gi]:-}" == "Unified" ]]; then
+      v_lbl="Unified:"
+      (( gpu_count > 1 )) && v_lbl="Unif${gi}:"
+    fi
     if [[ -n "${gpu_pcts[$gi]}" ]]; then
       local gpu_t_str=""
-      [[ -n "${gpu_temps[$gi]}" ]] && gpu_t_str=" ($(format_temp "${gpu_temps[$gi]}"))"
+      if [[ -n "${gpu_temps[$gi]}" ]]; then
+        gpu_t_str=" ($(format_temp "${gpu_temps[$gi]}")${gpu_notes[$gi]:+, ${gpu_notes[$gi]}})"
+      elif [[ -n "${gpu_notes[$gi]:-}" ]]; then
+        gpu_t_str=" (${gpu_notes[$gi]})"
+      fi
+      [[ -n "${gpu_thr_tags[$gi]:-}" ]] && gpu_t_str+="${gpu_thr_tags[$gi]}"
       LIVE_STAT_LINES+=("$(printf "  %-8s [%s] %3d%%%s" "$g_lbl" "$(render_bar "${gpu_pcts[$gi]}")" "${gpu_pcts[$gi]}" "$gpu_t_str")")
+    elif [[ -n "${gpu_temps[$gi]}" ]]; then
+      LIVE_STAT_LINES+=("$(printf "  %-8s %s" "$g_lbl" "$(format_temp "${gpu_temps[$gi]}")${gpu_thr_tags[$gi]:-}")")
     fi
     if [[ -n "${vram_pcts[$gi]}" ]]; then
       LIVE_STAT_LINES+=("$(printf "  %-8s [%s] %3d%% (%s / %s GiB)" "$v_lbl" "$(render_bar "${vram_pcts[$gi]}")" "${vram_pcts[$gi]}" "${vram_useds[$gi]}" "${vram_tots[$gi]}")")
@@ -7131,7 +8692,11 @@ print_live_stats() {
   [[ -n "$ram_pct" ]] && _cparts+=("RAM ${ram_pct}%")
   for ((gi=0; gi<gpu_count; gi++)); do
     local _gl="GPU"; (( gpu_count > 1 )) && _gl="GPU${gi}"
-    [[ -n "${gpu_pcts[$gi]}" ]] && _cparts+=("${_gl} ${gpu_pcts[$gi]}%${gpu_temps[$gi]:+ (${gpu_temps[$gi]}°C)}")
+    if [[ -n "${gpu_pcts[$gi]}" ]]; then
+      _cparts+=("${_gl} ${gpu_pcts[$gi]}%${gpu_temps[$gi]:+ (${gpu_temps[$gi]}°C)}")
+    elif [[ -n "${gpu_temps[$gi]}" ]]; then
+      _cparts+=("${_gl} ${gpu_temps[$gi]}°C")
+    fi
   done
   local _cpwr=()
   [[ -n "$total_gpu_pwr_w" ]] && _cpwr+=("GPU ${total_gpu_pwr_w}W")
@@ -7163,7 +8728,9 @@ build_sys_info_lines() {
   SYS_INFO_LINES+=("$(printf "CPU:    %b%s%b" "${C_DIM}" "$CPU_SUMMARY" "${C_RESET}")")
   SYS_INFO_LINES+=("$(printf "RAM:    %b%s GiB%s%b" "${C_DIM}" "$RAM_GB" "$RAM_DETAILS" "${C_RESET}")")
   SYS_INFO_LINES+=("$(printf "GPU(s): %b%s%b" "${C_DIM}" "$GPU_SUMMARY" "${C_RESET}")")
-  if (( TOTAL_VRAM_MB > 0 )) || [[ "$HAS_AMD_APU" == true && "$AMD_GTT_TOTAL_MB" -gt 0 ]]; then
+  if [[ "$IS_DGX_SPARK" == true || ( "$HAS_NVIDIA_UNIFIED_MEM" == true && "$TOTAL_VRAM_MB" -eq 0 ) ]]; then
+    SYS_INFO_LINES+=("$(printf "VRAM:   %b%s GiB unified (GB10)%b" "${C_DIM}" "$RAM_GB" "${C_RESET}")")
+  elif (( TOTAL_VRAM_MB > 0 )) || [[ "$HAS_AMD_APU" == true && "$AMD_GTT_TOTAL_MB" -gt 0 ]]; then
     local total_vram_gb="" gtt_gb=""
     if (( TOTAL_VRAM_MB > 0 )); then
       total_vram_gb="$(awk "BEGIN {g=$TOTAL_VRAM_MB/1024; if (g == int(g)) printf \"%d\", g; else printf \"%.1f\", g}")"
@@ -8362,14 +9929,21 @@ INDEX_SELECTED=0
 
 # Relative performance/utility rating per step on a 5-point scale (0 = no rating/stars, 1 = 1 star, 5 = 5 stars).
 declare -A STEP_GAIN_PTS=(
+  [nvidia_fabricmanager]=5
   [gpu_unlock]=5
   [amd_apu_memory]=5
   [amd_cwsr_disable]=4
+  [nvidia_mig_disable]=4
+  [nvidia_sm70_table]=4
+  [nvidia_pstate]=4
   [gpu_groups]=4
   [intel_compute_stack]=4
   [lact_overclock]=4
   [jetson_perf]=4
   [nvidia_power_limit]=2
+  [nvidia_power_cap]=3
+  [pcie_acs_disable]=3
+  [amd_instinct_partition]=3
   [amd_gpu_perf]=4
   [intel_gpu_perf]=4
   [ryzenadj_tdp]=4
@@ -8488,8 +10062,8 @@ index_row_up_offset() {
     echo $(( toggle_up - 2 ))
   else
     local o_idx=$(( idx - 2 ))
-    # Below opt table: blank + legend (2 lines) + footer_menu_lines
-    echo $(( (n_opt - o_idx) + 2 + footer_menu_lines ))
+    local leg_lines=$(( INDEX_LEGEND_LINES > 0 ? INDEX_LEGEND_LINES + 1 : 0 ))
+    echo $(( (n_opt - o_idx) + leg_lines + footer_menu_lines ))
   fi
 }
 
@@ -8817,14 +10391,40 @@ show_index() {
         body+="$(format_index_row "$idx" false)"$'\n'
       fi
     done
-    local legend_line="  ${C_YELLOW}[!]${C_RESET} ${C_DIM}Higher idle power, minimal gain${C_RESET}"
-    if [[ "$DISTRO_FAMILY" != "arch" ]]; then
-      legend_line+="   ${C_MAGENTA}[EXP]${C_RESET} ${C_DIM}Experimental for this distribution, might not work properly${C_RESET}"
+    local step has_warn_flag=false has_opt_flag=false has_exp_flag=false
+    for step in "${ACTIVE_STEPS[@]}"; do
+      is_high_idle_step "$step" && has_warn_flag=true
+      is_opt_in_step "$step" && has_opt_flag=true
+      is_experimental_step "$step" && has_exp_flag=true
+    done
+
+    local -a legend_items=()
+    [[ "$has_warn_flag" == true ]] && legend_items+=("$(echo -e "${C_YELLOW}[!]${C_RESET} ${C_DIM}Higher idle power, minimal gain${C_RESET}")")
+    [[ "$has_opt_flag" == true ]] && legend_items+=("$(echo -e "${C_BLUE}[OPT]${C_RESET} ${C_DIM}Opt-in trade-off (power cap / partitioning / RAM reserve)${C_RESET}")")
+    [[ "$has_exp_flag" == true ]] && legend_items+=("$(echo -e "${C_MAGENTA}[EXP]${C_RESET} ${C_DIM}Experimental / third-party or hardware-dependent${C_RESET}")")
+    [[ "$IS_LAPTOP" == true ]] && legend_items+=("$(echo -e "${C_CYAN}[L]${C_RESET} ${C_DIM}Laptop-recommended (low idle battery impact)${C_RESET}")")
+
+    INDEX_LEGEND_LINES=0
+    if (( ${#legend_items[@]} > 0 )); then
+      local leg_single="  " li_idx leg_vis
+      for (( li_idx = 0; li_idx < ${#legend_items[@]}; li_idx++ )); do
+        (( li_idx > 0 )) && leg_single+="   "
+        leg_single+="${legend_items[$li_idx]}"
+      done
+      leg_vis="${leg_single//$'\033'\[*([0-9;])m/}"
+      if (( ${#leg_vis} <= 108 )) || (( ${#legend_items[@]} <= 1 )); then
+        INDEX_LEGEND_LINES=1
+        body+=$'\n'"${leg_single}"$'\n'
+      else
+        local leg_line1="  ${legend_items[0]}   ${legend_items[1]}"
+        local leg_line2="  ${legend_items[2]}"
+        for (( li_idx = 3; li_idx < ${#legend_items[@]}; li_idx++ )); do
+          leg_line2+="   ${legend_items[$li_idx]}"
+        done
+        INDEX_LEGEND_LINES=2
+        body+=$'\n'"${leg_line1}"$'\n'"${leg_line2}"$'\n'
+      fi
     fi
-    if [[ "$IS_LAPTOP" == true ]]; then
-      legend_line+="   ${C_CYAN}[L]${C_RESET} ${C_DIM}Laptop-recommended (low idle battery impact)${C_RESET}"
-    fi
-    body+=$'\n'"$(echo -e "$legend_line")"$'\n'
 
     local footer_lines=9 hist_count
     hist_count="$(count_bench_history)"
@@ -8838,9 +10438,16 @@ show_index() {
       body+="$(echo -e "  ${C_CYAN}[h]${C_RESET} Benchmark history & restore coupled options (${hist_count})")"$'\n'
       ((footer_lines++))
     fi
-    local rec_excl="excludes high-idle-power options"
-    [[ "$DISTRO_FAMILY" != "arch" ]] && rec_excl="excludes high-idle-power and experimental options"
-    body+="$(echo -e "  ${C_GREEN}[a]${C_RESET} Apply all recommended optimizations (${rec_excl})")"$'\n'
+    local -a excl_parts=("high-idle-power options")
+    [[ "$has_opt_flag" == true ]] && excl_parts+=("opt-in trade-offs")
+    [[ "$has_exp_flag" == true ]] && excl_parts+=("experimental options")
+    local rec_excl="${excl_parts[0]}"
+    if (( ${#excl_parts[@]} == 2 )); then
+      rec_excl="${excl_parts[0]} and ${excl_parts[1]}"
+    elif (( ${#excl_parts[@]} == 3 )); then
+      rec_excl="${excl_parts[0]}, ${excl_parts[1]}, and ${excl_parts[2]}"
+    fi
+    body+="$(echo -e "  ${C_GREEN}[a]${C_RESET} Apply all recommended optimizations (excludes ${rec_excl})")"$'\n'
     if [[ "$IS_LAPTOP" == true ]]; then
       body+="$(echo -e "  ${C_CYAN}[l]${C_RESET} Apply laptop-recommended optimizations (minimal idle battery impact)")"$'\n'
       ((footer_lines++))
@@ -8946,14 +10553,15 @@ EOF
 
 is_step_managed_by_wizard() {
   case "$1" in
-    cpu_performance)   service_installed strata-cpu-perf.service ;;
-    memlock_realtime)  [[ -n "$STRATA_DOCKER_CONTAINER" || -f /etc/security/limits.d/99-strata-memlock.conf || -f /etc/security/limits.d/99-realtime-privileges.conf ]] ;;
-    numa_balancing)    [[ -f /etc/sysctl.d/99-strata-numa.conf ]] ;;
-    amd_gpu_perf)      service_installed strata-amd-gpu-perf.service ;;
-    intel_gpu_perf)    service_installed strata-intel-gpu-perf.service ;;
-    cstate_limit)      service_installed strata-cstate-limit.service ;;
-    pcie_aspm)         [[ -f /etc/udev/rules.d/99-strata-pcie-aspm.rules ]] || grep -q "pcie_aspm=off" /proc/cmdline 2>/dev/null ;;
-    *)                 return 0 ;;
+    cpu_performance)     service_installed strata-cpu-perf.service ;;
+    memlock_realtime)    [[ -n "$STRATA_DOCKER_CONTAINER" || -f /etc/security/limits.d/99-strata-memlock.conf || -f /etc/security/limits.d/99-realtime-privileges.conf ]] ;;
+    numa_balancing)      [[ -f /etc/sysctl.d/99-strata-numa.conf ]] ;;
+    amd_gpu_perf)        service_installed strata-amd-gpu-perf.service ;;
+    intel_gpu_perf)      service_installed strata-intel-gpu-perf.service ;;
+    nvidia_persistenced) unit_exists nvidia-persistenced.service || service_installed strata-nvidia-persistenced.service ;;
+    cstate_limit)        service_installed strata-cstate-limit.service ;;
+    pcie_aspm)           [[ -f /etc/udev/rules.d/99-strata-pcie-aspm.rules ]] || grep -q "pcie_aspm=off" /proc/cmdline 2>/dev/null ;;
+    *)                   return 0 ;;
   esac
 }
 
@@ -8989,14 +10597,31 @@ print_check_summary() {
   echo "  RAM:      ${RAM_GB} GiB${RAM_DETAILS}"
   echo "  GPU(s):   ${GPU_SUMMARY:-Unknown}"
   if [[ "$HAS_NVIDIA" == true && ${#NVIDIA_GPU_INDICES[@]} -gt 0 ]]; then
-    local i
+    local i mi mig_info cc_info vram_info
     for (( i = 0; i < ${#NVIDIA_GPU_INDICES[@]}; i++ )); do
       local pl_info="PL n/a"
-      if [[ "${NVIDIA_GPU_PL_SUPPORTED[$i]}" == true ]]; then
-        pl_info="PL ${NVIDIA_GPU_CUR_PL[$i]}W (default ${NVIDIA_GPU_DEF_PL[$i]}W, max ${NVIDIA_GPU_MAX_PL[$i]}W)"
+      if [[ "${NVIDIA_GPU_PL_SUPPORTED[$i]}" == true || -n "${NVIDIA_GPU_CUR_PL[$i]}" ]]; then
+        pl_info="PL ${NVIDIA_GPU_CUR_PL[$i]:-?}W (default ${NVIDIA_GPU_DEF_PL[$i]:-?}W, max ${NVIDIA_GPU_MAX_PL[$i]:-?}W)"
       fi
-      echo "    NVIDIA[${NVIDIA_GPU_INDICES[$i]}]: ${NVIDIA_GPU_NAMES[$i]} (${NVIDIA_GPU_VRAM[$i]} MiB, ${pl_info}, compute=${NVIDIA_GPU_COMPUTE_MODE[$i]})"
+      vram_info="unified memory (GB10)"
+      if [[ "${NVIDIA_GPU_VRAM[$i]}" =~ ^[0-9]+$ ]] && (( NVIDIA_GPU_VRAM[$i] > 0 )); then
+        vram_info="${NVIDIA_GPU_VRAM[$i]} MiB"
+      elif [[ "$IS_DGX_SPARK" == false ]]; then
+        vram_info="${NVIDIA_GPU_VRAM[$i]:-n/a}"
+      fi
+      cc_info=""
+      [[ -n "${NVIDIA_GPU_COMPUTE_CAP[$i]:-}" ]] && cc_info=", cc=${NVIDIA_GPU_COMPUTE_CAP[$i]}"
+      mig_info=""
+      for (( mi = 0; mi < ${#NVIDIA_MIG_INDICES[@]}; mi++ )); do
+        if [[ "${NVIDIA_MIG_INDICES[$mi]}" == "${NVIDIA_GPU_INDICES[$i]}" && "${NVIDIA_GPU_MIG_CUR[$mi]}" == "Enabled" ]]; then
+          mig_info=", MIG=Enabled"
+        fi
+      done
+      echo "    NVIDIA[${NVIDIA_GPU_INDICES[$i]}]: ${NVIDIA_GPU_NAMES[$i]} (${vram_info}, ${pl_info}, compute=${NVIDIA_GPU_COMPUTE_MODE[$i]}${cc_info}${mig_info})"
     done
+  fi
+  if [[ "$IS_DGX_SPARK" == true ]]; then
+    echo "    Platform: NVIDIA DGX Spark (GB10 unified memory)"
   fi
   if [[ "$HAS_AMD" == true && ${#AMD_GFX_ARCHS[@]} -gt 0 ]]; then
     local _ag _ast _agtt=""
@@ -9035,8 +10660,10 @@ print_check_summary() {
     note_lbl=""
     if is_experimental_step "$step"; then
       note_lbl=" [EXP]"
-    elif ! is_recommended_step "$step"; then
-      note_lbl=" [opt-in]"
+    elif is_opt_in_step "$step"; then
+      note_lbl=" [OPT]"
+    elif is_high_idle_step "$step"; then
+      note_lbl=" [!]"
     elif [[ "$IS_LAPTOP" == true ]] && is_laptop_recommended_step "$step"; then
       note_lbl=" [L]"
     fi
