@@ -8,6 +8,7 @@ This wizard relies on and integrates with the following open-source projects for
 | **ROCm TheRock** | Multi-arch ROCm/HIP SDK tarballs for local Strata HIP engine builds | [ROCm/TheRock](https://github.com/ROCm/TheRock) |
 | **LACT (`lactd`)** | GPU core & VRAM clock offset tuning (NVIDIA / AMD / Intel) | [ilya-zlobintsev/LACT](https://github.com/ilya-zlobintsev/LACT) |
 | **gpu-unlock** | NVIDIA consumer GPU SM/tensor unlock kernel module (`gpu-unlock-dkms`) | [Zagitta/gpu-unlock](https://github.com/Zagitta/gpu-unlock) |
+| **nvidia-pstated / nvidia-pstate** | Idle P-state power management (P0 → P8) for legacy Tesla/CMP GPUs | [sasha0552/nvidia-pstated](https://github.com/sasha0552/nvidia-pstated) |
 | **msi-ec** | MSI laptop Embedded Controller driver for shift/fan/Cooler Boost | [MControlSuite/msi-ec](https://github.com/MControlSuite/msi-ec) |
 | **MControlCenter** | MSI laptop cooling and performance profile companion app | [dmitry-s93/MControlCenter](https://github.com/dmitry-s93/MControlCenter) |
 | **asusctl** | ASUS laptop performance and fan profile control (`asusd`) | [asus-linux/asusctl](https://gitlab.com/asus-linux/asusctl) |
