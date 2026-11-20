@@ -5,6 +5,7 @@ This wizard relies on and integrates with the following open-source projects for
 | Project | Role in Wizard | Repository |
 | --- | --- | --- |
 | **Strata** | LLM inference engine, CLI, updates, and `strata.service` | [Niko1221/Strata](https://github.com/Niko1221/Strata) |
+| **ROCm TheRock** | Multi-arch ROCm/HIP SDK tarballs for local Strata HIP engine builds | [ROCm/TheRock](https://github.com/ROCm/TheRock) |
 | **LACT (`lactd`)** | GPU core & VRAM clock offset tuning (NVIDIA / AMD / Intel) | [ilya-zlobintsev/LACT](https://github.com/ilya-zlobintsev/LACT) |
 | **gpu-unlock** | NVIDIA consumer GPU SM/tensor unlock kernel module (`gpu-unlock-dkms`) | [Zagitta/gpu-unlock](https://github.com/Zagitta/gpu-unlock) |
 | **msi-ec** | MSI laptop Embedded Controller driver for shift/fan/Cooler Boost | [MControlSuite/msi-ec](https://github.com/MControlSuite/msi-ec) |
