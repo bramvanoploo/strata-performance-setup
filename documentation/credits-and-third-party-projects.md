@@ -4,7 +4,8 @@ This wizard relies on and integrates with the following open-source projects for
 
 | Project | Role in Wizard | Repository |
 | --- | --- | --- |
-| **Strata** | LLM inference engine, CLI, updates, and `strata.service` | [Niko1221/Strata](https://github.com/Niko1221/Strata) |
+| **Strata** | LLM inference engine, CLI, updates, and `strata.service` / `launchd` service | [Niko1221/Strata](https://github.com/Niko1221/Strata) |
+| **mbpfan** | Fan control daemon (`mbpfan`) for Intel Apple Macs running Linux (`applesmc`) | [linux-on-mac/mbpfan](https://github.com/linux-on-mac/mbpfan) |
 | **ROCm TheRock** | Multi-arch ROCm/HIP SDK tarballs for local Strata HIP engine builds | [ROCm/TheRock](https://github.com/ROCm/TheRock) |
 | **LACT (`lactd`)** | GPU core & VRAM clock offset tuning (NVIDIA / AMD / Intel) | [ilya-zlobintsev/LACT](https://github.com/ilya-zlobintsev/LACT) |
 | **gpu-unlock** | NVIDIA consumer GPU SM/tensor unlock kernel module (`gpu-unlock-dkms`) | [Zagitta/gpu-unlock](https://github.com/Zagitta/gpu-unlock) |

@@ -5,14 +5,73 @@
 # Interactive TUI wizard to apply, inspect, and revert host-level performance
 # optimizations for running Strata LLM inference (and install/manage Strata).
 #
-# Supported distributions:
-#   - Arch-based (CachyOS, Arch Linux, EndeavourOS, Manjaro)
-#   - Fedora-based (Fedora, Nobara)
-#   - Debian-based (Debian, Ubuntu, Pop!_OS, Linux Mint)
-#   - openSUSE-based (Tumbleweed, Leap, SLE)
+# Supported platforms:
+#   - Linux: Arch, Fedora/RHEL, Debian/Ubuntu (incl. Jetson L4T), openSUSE,
+#            Slackware, Unraid, TrueNAS SCALE, Synology DSM
+#   - macOS: Apple Silicon (M1 or newer, macOS 15+ / Metal / launchd)
 # ==============================================================================
 
+# Ensure Bash 4.3+ (associative arrays, namerefs, fractional read timeouts).
+# macOS ships Bash 3.2 at /bin/bash; re-exec under Homebrew/MacPorts/Nix Bash.
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ] || { [ "${BASH_VERSINFO[0]:-0}" -eq 4 ] && [ "${BASH_VERSINFO[1]:-0}" -lt 3 ]; }; then
+  _strata_bash=""
+  for _strata_cand in /opt/homebrew/bin/bash /usr/local/bin/bash /opt/local/bin/bash /nix/var/nix/profiles/default/bin/bash; do
+    if [ -x "$_strata_cand" ]; then
+      if "$_strata_cand" -c '[ "${BASH_VERSINFO[0]:-0}" -gt 4 ] || { [ "${BASH_VERSINFO[0]:-0}" -eq 4 ] && [ "${BASH_VERSINFO[1]:-0}" -ge 3 ]; }' 2>/dev/null; then
+        _strata_bash="$_strata_cand"
+        break
+      fi
+    fi
+  done
+  if [ -n "$_strata_bash" ]; then
+    exec "$_strata_bash" "$0" "$@"
+  fi
+  printf 'strata-performance-setup.sh requires Bash 4.3+ (running %s).\n' "${BASH_VERSION:-unknown}" >&2
+  if [ "$(uname -s 2>/dev/null || true)" = "Darwin" ]; then
+    _strata_brew=""
+    for _strata_cand in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+      [ -x "$_strata_cand" ] && { _strata_brew="$_strata_cand"; break; }
+    done
+    if [ -n "$_strata_brew" ] && [ "${EUID:-$(id -u)}" -ne 0 ] && [ -t 0 ]; then
+      printf 'Install modern Bash via Homebrew now (%s install bash)? [Y/n]: ' "$_strata_brew" >&2
+      read -r _strata_ans || _strata_ans="n"
+      case "${_strata_ans:-Y}" in
+        y|Y|yes|YES|Yes)
+          if "$_strata_brew" install bash; then
+            for _strata_cand in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+              [ -x "$_strata_cand" ] && exec "$_strata_cand" "$0" "$@"
+            done
+          fi
+          ;;
+      esac
+    fi
+    printf 'Install Bash 4.3+ on macOS with Homebrew: brew install bash\n' >&2
+  fi
+  exit 1
+fi
+
 set -uo pipefail
+
+if [[ "${STRATA_OS_UNAME:-$(uname -s 2>/dev/null || echo Linux)}" == "Darwin" ]]; then
+  IS_MACOS=true
+  [[ -d /opt/homebrew/bin && ":${PATH}:" != *":/opt/homebrew/bin:"* ]] && PATH="/opt/homebrew/bin:${PATH}"
+  [[ -d /opt/homebrew/sbin && ":${PATH}:" != *":/opt/homebrew/sbin:"* ]] && PATH="/opt/homebrew/sbin:${PATH}"
+  [[ -d /usr/local/bin && ":${PATH}:" != *":/usr/local/bin:"* ]] && PATH="/usr/local/bin:${PATH}"
+  [[ -d /usr/local/sbin && ":${PATH}:" != *":/usr/local/sbin:"* ]] && PATH="/usr/local/sbin:${PATH}"
+  export PATH
+else
+  IS_MACOS=false
+fi
+
+has_working_python3() {
+  local py_bin
+  py_bin="$(command -v python3 2>/dev/null || true)"
+  [[ -n "$py_bin" ]] || return 1
+  if [[ "$IS_MACOS" == true && "$py_bin" == "/usr/bin/python3" ]] && command -v xcode-select >/dev/null 2>&1; then
+    xcode-select -p >/dev/null 2>&1 || return 1
+  fi
+  return 0
+}
 
 # ------------------------------------------------------------------------------
 # Colors & Globals
@@ -26,13 +85,31 @@ else
 fi
 
 TARGET_USER="${SUDO_USER:-${USER:-$(id -un)}}"
-TARGET_HOME="$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6 || true)"
+TARGET_HOME=""
+if [[ "$IS_MACOS" == true ]] && command -v dscl >/dev/null 2>&1; then
+  TARGET_HOME="$(dscl . -read "/Users/$TARGET_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2; exit}' || true)"
+elif command -v getent >/dev/null 2>&1; then
+  TARGET_HOME="$(getent passwd "$TARGET_USER" 2>/dev/null | cut -d: -f6 || true)"
+fi
+if [[ -z "$TARGET_HOME" ]] && has_working_python3; then
+  TARGET_HOME="$(python3 -c 'import pwd, sys; print(pwd.getpwnam(sys.argv[1]).pw_dir)' "$TARGET_USER" 2>/dev/null || true)"
+fi
 [[ -n "$TARGET_HOME" ]] || TARGET_HOME="$HOME"
 STRATA_BIN="" STRATA_VERSION="" STRATA_RUNNING_PRESET="" STRATA_RUNNING_URL="" STRATA_DOCKER_CONTAINER="" STRATA_DOCKER_IMAGE=""
 STRATA_API_KEY="${STRATA_API_KEY:-}"
 [[ -n "$STRATA_API_KEY" ]] && export STRATA_API_KEY
 CHECK_ONLY=false
-DISTRO_FAMILY="unknown" DISTRO_ID="unknown" OS_PRETTY="" KERNEL_VER="" AUR_HELPER="" HAS_SYSTEMD=true IS_UNRAID=false IS_TRUENAS=false IS_SYNOLOGY=false
+DISTRO_FAMILY="unknown" DISTRO_ID="unknown" OS_PRETTY="" KERNEL_VER="" AUR_HELPER="" HAS_SYSTEMD=true HAS_LAUNCHD=false IS_UNRAID=false IS_TRUENAS=false IS_SYNOLOGY=false
+IS_APPLE_SILICON=false IS_APPLE_LINUX=false IS_ASAHI_LINUX=false HAS_APPLESMC=false
+MACOS_VER="" MACOS_MAJOR=0 MACOS_CHIP="" MACOS_GPU_CORES="" MACOS_METAL_VER="" MACOS_MODEL_ID="" MACOS_WIRED_LIMIT_MB="" MACOS_POWER_MODE_SUPPORTED=false
+MACOS_CPU_THREADS="" MACOS_RAM_BYTES=0
+MACOS_SUPPORT_DIR="${STRATA_MACOS_SUPPORT_DIR:-/Library/Application Support/strata-performance-setup}"
+MACOS_POWER_MODE_MARKER="${MACOS_SUPPORT_DIR}/macos-power-mode.prev"
+MACOS_NOSLEEP_MARKER="${MACOS_SUPPORT_DIR}/macos-nosleep.prev"
+MACOS_METAL_ENV_FILE="$TARGET_HOME/.config/strata/macos-metal-env.conf"
+MACOS_METAL_ENV_SH="$TARGET_HOME/.config/strata/macos-metal-env.sh"
+MACOS_SPOTLIGHT_LIST="$TARGET_HOME/.local/share/strata-performance-setup/spotlight-excluded.list"
+APPLESMC_MBPFAN_MARKER="/etc/strata-applesmc-mbpfan.conf"
 HAS_NVIDIA=false HAS_NVIDIA_POWERD=false HAS_AMD=false HAS_INTEL_GPU=false HAS_INTEL_ARC=false
 HAS_AMD_APU=false HAS_AMD_PREBUILT_GFX=false AMD_GTT_TOTAL_MB=0
 HAS_AMD_INSTINCT=false HAS_AMD_NON_INSTINCT=false
@@ -81,6 +158,27 @@ declare -A PKG_AVAIL_CACHE PKG_INST_CACHE
 # ------------------------------------------------------------------------------
 # Core Helpers (Privileges, Packages, Services, Bootloader)
 # ------------------------------------------------------------------------------
+file_mtime() {
+  local path="$1"
+  if [[ "$IS_MACOS" == true ]]; then
+    stat -f '%m' "$path" 2>/dev/null || echo 0
+  else
+    stat -c '%Y' "$path" 2>/dev/null || echo 0
+  fi
+}
+
+_xml_escape() {
+  local s="$1" _had_pr=0
+  shopt -q patsub_replacement 2>/dev/null && { _had_pr=1; shopt -u patsub_replacement; }
+  s="${s//&/&amp;}"
+  s="${s//</&lt;}"
+  s="${s//>/&gt;}"
+  s="${s//\"/&quot;}"
+  s="${s//\'/&apos;}"
+  (( _had_pr )) && shopt -s patsub_replacement
+  printf '%s' "$s"
+}
+
 run_root() {
   [[ "${CHECK_ONLY:-false}" == true ]] && return 1
   if [[ $EUID -eq 0 ]]; then "$@"
@@ -96,7 +194,9 @@ run_as_user() {
     env_prefix+="export ${_kv}; "
   done
   if [[ $EUID -eq 0 && "$TARGET_USER" != "root" ]]; then
-    if command -v runuser >/dev/null 2>&1; then
+    if [[ "$IS_MACOS" == true ]]; then
+      sudo -u "$TARGET_USER" -H -- env "PATH=${TARGET_HOME}/.local/bin:${PATH}" bash -c "${env_prefix}$*"
+    elif command -v runuser >/dev/null 2>&1; then
       runuser -u "$TARGET_USER" -- bash -c "${env_prefix}$*"
     else
       su - "$TARGET_USER" -c "${env_prefix}$*"
@@ -114,7 +214,9 @@ run_as_user_exec() {
   (( ${#_rt_env[@]} > 0 )) && env_args+=("${_rt_env[@]}")
   (( ${#env_args[@]} > 0 )) && env_cmd=(env "${env_args[@]}")
   if [[ $EUID -eq 0 && "$TARGET_USER" != "root" ]]; then
-    if command -v runuser >/dev/null 2>&1; then
+    if [[ "$IS_MACOS" == true ]]; then
+      sudo -u "$TARGET_USER" -H -- env "PATH=${TARGET_HOME}/.local/bin:${PATH}" ${env_args[@]+"${env_args[@]}"} "$@"
+    elif command -v runuser >/dev/null 2>&1; then
       runuser -u "$TARGET_USER" -- ${env_cmd[@]+"${env_cmd[@]}"} "$@"
     else
       local cmd=""
@@ -139,6 +241,26 @@ unit_exists() {
   awk -v u="$1" '$1 == u {found=1; exit} END {exit !found}' <<< "$UNIT_FILES_CACHE"
 }
 
+_launchd_meta() {
+  local unit="$1" name="${1%.service}" scope="system" label="" plist="" runner="" short=""
+  if [[ "$unit" == "strata.service" ]]; then
+    scope="user"
+    label="com.strata.server"
+    plist="${STRATA_LAUNCHD_USER_DIR:-$TARGET_HOME/Library/LaunchAgents}/${label}.plist"
+    runner="${STRATA_LAUNCHD_USER_BIN_DIR:-$TARGET_HOME/.local/share/strata-performance-setup}/strata-server-ctl.sh"
+  else
+    short="${name#strata-}"
+    label="com.strata.${short}"
+    plist="${STRATA_LAUNCHD_SYS_DIR:-/Library/LaunchDaemons}/${label}.plist"
+    runner="${STRATA_LAUNCHD_SYS_BIN_DIR:-$MACOS_SUPPORT_DIR}/${name}.sh"
+  fi
+  printf '%s|%s|%s|%s\n' "$scope" "$label" "$plist" "$runner"
+}
+
+_launchd_user_uid() {
+  id -u "$TARGET_USER" 2>/dev/null || id -u
+}
+
 resolve_rc_script() {
   local name="${1%.service}"
   if [[ -x "/etc/rc.d/rc.strata.${name}" ]]; then
@@ -156,6 +278,10 @@ service_installed() {
   local unit="$1"
   if [[ "$HAS_SYSTEMD" == true ]]; then
     [[ -f "/etc/systemd/system/${unit}" ]]
+  elif [[ "$HAS_LAUNCHD" == true ]]; then
+    local _sc _lb _pl _rn
+    IFS='|' read -r _sc _lb _pl _rn <<< "$(_launchd_meta "$unit")"
+    [[ -f "$_pl" ]]
   else
     resolve_rc_script "$unit" >/dev/null
   fi
@@ -172,6 +298,26 @@ unit_enabled() {
 unit_active() {
   if [[ "$HAS_SYSTEMD" == true ]]; then
     systemctl is-active "$1" >/dev/null 2>&1
+  elif [[ "$HAS_LAUNCHD" == true ]]; then
+    local _sc _lb _pl _rn
+    IFS='|' read -r _sc _lb _pl _rn <<< "$(_launchd_meta "$1")"
+    [[ -f "$_pl" ]] || return 1
+    if [[ "$_sc" == "user" ]]; then
+      local uid
+      uid="$(_launchd_user_uid)"
+      if run_as_user_exec launchctl print "gui/${uid}/${_lb}" >/dev/null 2>&1 || run_as_user_exec launchctl list "$_lb" >/dev/null 2>&1; then
+        return 0
+      fi
+      [[ "$1" == "strata.service" && -f "$_pl" && -n "$STRATA_RUNNING_PRESET" ]]
+    else
+      if [[ $EUID -eq 0 ]]; then
+        launchctl print "system/${_lb}" >/dev/null 2>&1 || launchctl list "$_lb" >/dev/null 2>&1
+      elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+        sudo -n launchctl print "system/${_lb}" >/dev/null 2>&1 || [[ -f "$_pl" ]]
+      else
+        [[ -f "$_pl" ]]
+      fi
+    fi
   else
     service_installed "$1"
   fi
@@ -179,8 +325,56 @@ unit_active() {
 
 service_ctl() {
   local action="$1" unit="$2"
+  [[ "${CHECK_ONLY:-false}" == true ]] && return 1
   if [[ "$HAS_SYSTEMD" == true ]]; then
     run_root systemctl "$action" "$unit"
+  elif [[ "$HAS_LAUNCHD" == true ]]; then
+    local _sc _lb _pl _rn
+    IFS='|' read -r _sc _lb _pl _rn <<< "$(_launchd_meta "$unit")"
+    [[ -f "$_pl" ]] || return 1
+    if [[ "$_sc" == "user" ]]; then
+      local uid
+      uid="$(_launchd_user_uid)"
+      case "$action" in
+        start)
+          run_as_user_exec launchctl bootout "gui/${uid}/${_lb}" >/dev/null 2>&1 || true
+          if ! run_as_user_exec launchctl bootstrap "gui/${uid}" "$_pl" >/dev/null 2>&1; then
+            if ! run_as_user_exec launchctl load -w "$_pl" >/dev/null 2>&1; then
+              [[ -x "$_rn" ]] && run_as_user_exec sh "$_rn" start || return 1
+            fi
+          fi
+          ;;
+        stop)
+          run_as_user_exec launchctl bootout "gui/${uid}/${_lb}" >/dev/null 2>&1 || run_as_user_exec launchctl unload -w "$_pl" >/dev/null 2>&1 || true
+          [[ -x "$_rn" ]] && run_as_user_exec sh "$_rn" stop || true
+          ;;
+        restart)
+          service_ctl stop "$unit" || true
+          service_ctl start "$unit"
+          ;;
+        *) return 1 ;;
+      esac
+    else
+      case "$action" in
+        start)
+          run_root launchctl bootout "system/${_lb}" >/dev/null 2>&1 || true
+          if ! run_root launchctl bootstrap system "$_pl" >/dev/null 2>&1; then
+            if ! run_root launchctl load -w "$_pl" >/dev/null 2>&1; then
+              [[ -x "$_rn" ]] && run_root sh "$_rn" start || return 1
+            fi
+          fi
+          ;;
+        stop)
+          run_root launchctl bootout "system/${_lb}" >/dev/null 2>&1 || run_root launchctl unload -w "$_pl" >/dev/null 2>&1 || true
+          [[ -x "$_rn" ]] && run_root sh "$_rn" stop || true
+          ;;
+        restart)
+          service_ctl stop "$unit" || true
+          service_ctl start "$unit"
+          ;;
+        *) return 1 ;;
+      esac
+    fi
   else
     local rc_script
     rc_script="$(resolve_rc_script "$unit")" || return 1
@@ -216,6 +410,7 @@ remove_boot_hook() {
 
 install_service() {
   local unit="$1"
+  [[ "${CHECK_ONLY:-false}" == true ]] && return 1
   if [[ "$HAS_SYSTEMD" == true ]]; then
     run_root tee "/etc/systemd/system/${unit}" >/dev/null
     run_root systemctl daemon-reload
@@ -224,8 +419,8 @@ install_service() {
     return $?
   fi
 
-  local name="${unit%.service}" rc_script="/etc/rc.d/rc.strata.${unit%.service}"
-  local content env_cmds="" start_cmds="" stop_cmds="" line cmd ignore_err ev ek evv
+  local name="${unit%.service}"
+  local content env_cmds="" start_cmds="" stop_cmds="" work_dir="" line cmd ignore_err ev ek evv
   content="$(cat)"
   while IFS= read -r line; do
     if [[ "$line" =~ ^Environment=(.*)$ ]]; then
@@ -241,6 +436,8 @@ install_service() {
           env_cmds+="export ${ek}='${evv}'"$'\n'
         fi
       fi
+    elif [[ "$line" =~ ^WorkingDirectory=(.*)$ ]]; then
+      work_dir="${BASH_REMATCH[1]}"
     elif [[ "$line" =~ ^ExecStart=(.*)$ ]]; then
       cmd="${BASH_REMATCH[1]}"
       ignore_err=""
@@ -254,6 +451,104 @@ install_service() {
     fi
   done <<< "$content"
 
+  if [[ "$HAS_LAUNCHD" == true ]]; then
+    local scope label plist runner work_dir_line="" dyn_env_line="" runner_content plist_content
+    IFS='|' read -r scope label plist runner <<< "$(_launchd_meta "$unit")"
+    if [[ "$scope" == "user" && -n "${MACOS_METAL_ENV_SH:-}" ]]; then
+      local me_sq
+      me_sq="$(printf "%s" "$MACOS_METAL_ENV_SH" | sed "s/'/'\\\\''/g")"
+      dyn_env_line="[ -r '${me_sq}' ] && . '${me_sq}'"$'\n'
+    fi
+    if [[ -n "$work_dir" ]]; then
+      local wd_sq
+      wd_sq="$(printf "%s" "$work_dir" | sed "s/'/'\\\\''/g")"
+      work_dir_line="cd '${wd_sq}' || true"$'\n'
+    fi
+    runner_content="#!/bin/sh
+# Managed by strata-performance-setup (${unit})
+export PATH=\"${TARGET_HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:\${PATH:-}\"
+${env_cmds}${dyn_env_line}${work_dir_line}case \"\$1\" in
+  start)
+${start_cmds:-    :}
+    ;;
+  stop)
+${stop_cmds:-    :}
+    ;;
+  restart)
+    \"\$0\" stop
+    \"\$0\" start
+    ;;
+  *)
+    echo \"Usage: \$0 {start|stop|restart}\"
+    exit 1
+    ;;
+esac
+"
+    local extra_plist=""
+    if [[ "$scope" == "user" ]]; then
+      local log_dir="$TARGET_HOME/Library/Logs"
+      extra_plist="  <key>AbandonProcessGroup</key>
+  <true/>
+"
+      [[ -n "$work_dir" ]] && extra_plist+="  <key>WorkingDirectory</key>
+  <string>$(_xml_escape "$work_dir")</string>
+"
+      extra_plist+="  <key>StandardOutPath</key>
+  <string>$(_xml_escape "${log_dir}/strata.log")</string>
+  <key>StandardErrorPath</key>
+  <string>$(_xml_escape "${log_dir}/strata.err.log")</string>
+"
+    fi
+    plist_content="<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<plist version=\"1.0\">
+<dict>
+  <key>Label</key>
+  <string>$(_xml_escape "$label")</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>$(_xml_escape "$runner")</string>
+    <string>start</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <false/>
+${extra_plist}</dict>
+</plist>
+"
+    if [[ "$scope" == "user" ]]; then
+      local uid
+      uid="$(_launchd_user_uid)"
+      run_as_user_exec mkdir -p "$(dirname "$plist")" "$(dirname "$runner")" "$TARGET_HOME/Library/Logs"
+      printf '%s' "$runner_content" | run_as_user_exec tee "$runner" >/dev/null
+      run_as_user_exec chmod 755 "$runner"
+      printf '%s' "$plist_content" | run_as_user_exec tee "$plist" >/dev/null
+      run_as_user_exec chmod 644 "$plist"
+      run_as_user_exec launchctl bootout "gui/${uid}/${label}" >/dev/null 2>&1 || true
+      if ! run_as_user_exec launchctl bootstrap "gui/${uid}" "$plist" >/dev/null 2>&1; then
+        if ! run_as_user_exec launchctl load -w "$plist" >/dev/null 2>&1; then
+          run_as_user_exec sh "$runner" start
+          echo -e "${C_YELLOW}Note: launchd GUI domain unavailable in this session; auto-start will activate on next login.${C_RESET}"
+        fi
+      fi
+    else
+      run_root mkdir -p "$(dirname "$plist")" "$(dirname "$runner")"
+      printf '%s' "$runner_content" | run_root tee "$runner" >/dev/null
+      run_root chmod 755 "$runner"
+      printf '%s' "$plist_content" | run_root tee "$plist" >/dev/null
+      run_root chown root:wheel "$plist" 2>/dev/null || true
+      run_root chmod 644 "$plist"
+      run_root launchctl bootout "system/${label}" >/dev/null 2>&1 || true
+      if ! run_root launchctl bootstrap system "$plist" >/dev/null 2>&1; then
+        run_root launchctl load -w "$plist" >/dev/null 2>&1 || run_root sh "$runner" start
+      fi
+    fi
+    return 0
+  fi
+
+  local rc_script="/etc/rc.d/rc.strata.${name}"
   run_root tee "$rc_script" >/dev/null <<EOF
 #!/bin/sh
 # Managed by strata-performance-setup (${unit})
@@ -295,11 +590,22 @@ EOF
 
 remove_service() {
   local unit="$1"
+  [[ "${CHECK_ONLY:-false}" == true ]] && return 1
   if [[ "$HAS_SYSTEMD" == true ]]; then
     run_root systemctl disable --now "$unit" 2>/dev/null || true
     run_root rm -f "/etc/systemd/system/${unit}"
     run_root systemctl daemon-reload
     refresh_unit_files_cache
+    return 0
+  elif [[ "$HAS_LAUNCHD" == true ]]; then
+    local scope label plist runner
+    IFS='|' read -r scope label plist runner <<< "$(_launchd_meta "$unit")"
+    service_ctl stop "$unit" >/dev/null 2>&1 || true
+    if [[ "$scope" == "user" ]]; then
+      run_as_user_exec rm -f "$plist" "$runner"
+    else
+      run_root rm -f "$plist" "$runner"
+    fi
     return 0
   fi
 
@@ -331,6 +637,7 @@ pkg_installed() {
         rc=0
       fi
       ;;
+    macos)     command -v brew >/dev/null 2>&1 && run_as_user_exec brew list --formula "$pkg" >/dev/null 2>&1 && rc=0 ;;
     *)         return 1 ;;
   esac
   PKG_INST_CACHE[$pkg]=$rc
@@ -363,6 +670,9 @@ pkg_available() {
           fi
         fi
         ;;
+      macos)
+        [[ "$mode" == "repo" ]] && command -v brew >/dev/null 2>&1 && run_as_user_exec brew info "$pkg" >/dev/null 2>&1 && rc=0
+        ;;
     esac
   fi
   PKG_AVAIL_CACHE[$key]=$rc
@@ -386,6 +696,13 @@ pkg_install() {
         run_root slackpkg -batch=on -default_answer=y install "$@" || rc=$?
       else
         echo -e "${C_RED}slackpkg not found; please install manually: $*${C_RESET}"; return 1
+      fi
+      ;;
+    macos)
+      if command -v brew >/dev/null 2>&1; then
+        run_as_user_exec brew install "$@" || rc=$?
+      else
+        echo -e "${C_RED}Homebrew (brew) not found; please install manually: $*${C_RESET}"; return 1
       fi
       ;;
     *)         echo -e "${C_RED}Unsupported package manager.${C_RESET}"; return 1 ;;
@@ -724,10 +1041,16 @@ for p in glob.glob("/sys/bus/i2c/drivers/ee1004/*/eeprom") + glob.glob("/sys/bus
 
 _docker_ro() {
   [[ -S /var/run/docker.sock ]] && command -v docker >/dev/null 2>&1 || return 1
+  local _to=()
+  if command -v timeout >/dev/null 2>&1; then
+    _to=(timeout 3)
+  elif command -v gtimeout >/dev/null 2>&1; then
+    _to=(gtimeout 3)
+  fi
   if [[ $EUID -eq 0 || ( -r /var/run/docker.sock && -w /var/run/docker.sock ) ]]; then
-    timeout 3 docker "$@" 2>/dev/null
+    "${_to[@]}" docker "$@" 2>/dev/null
   elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
-    sudo -n timeout 3 docker "$@" 2>/dev/null
+    sudo -n "${_to[@]}" docker "$@" 2>/dev/null
   else
     return 1
   fi
@@ -736,6 +1059,8 @@ _docker_ro() {
 refresh_strata_bin() {
   if command -v strata >/dev/null 2>&1; then STRATA_BIN="$(command -v strata)"
   elif [[ -x "$TARGET_HOME/.local/bin/strata" ]]; then STRATA_BIN="$TARGET_HOME/.local/bin/strata"
+  elif [[ -x "/opt/homebrew/bin/strata" ]]; then STRATA_BIN="/opt/homebrew/bin/strata"
+  elif [[ -x "/opt/homebrew/sbin/strata" ]]; then STRATA_BIN="/opt/homebrew/sbin/strata"
   elif [[ -x "/usr/local/bin/strata" ]]; then STRATA_BIN="/usr/local/bin/strata"
   else STRATA_BIN=""; fi
 
@@ -767,7 +1092,7 @@ refresh_strata_running() {
   [[ -n "$STRATA_BIN" ]] || return 0
   local st_json parsed=""
   st_json="$(run_as_user_exec "$STRATA_BIN" launch --status --output json 2>/dev/null || true)"
-  if [[ -n "$st_json" ]] && command -v python3 >/dev/null 2>&1; then
+  if [[ -n "$st_json" ]] && has_working_python3; then
     parsed="$(python3 -c '
 import json, sys
 for line in sys.stdin:
@@ -912,6 +1237,12 @@ _fill_strata_runtime_env_array() {
     done
   fi
   [[ -f "$NVIDIA_SM70_MARKER" ]] && _out_env+=("STRATA_SM70_TABLE=1")
+  if [[ "$IS_MACOS" == true && -r "$MACOS_METAL_ENV_FILE" ]]; then
+    local _mline=""
+    while IFS= read -r _mline; do
+      [[ "$_mline" =~ ^STRATA_[A-Z0-9_]+=[^\;[:space:]]+$ ]] && _out_env+=("$_mline")
+    done < "$MACOS_METAL_ENV_FILE"
+  fi
 }
 
 strata_runtime_env_list() {
@@ -1274,6 +1605,34 @@ PLATFORM_BASICS_DONE=false
 detect_platform_basics() {
   [[ "$PLATFORM_BASICS_DONE" == true ]] && return 0
   PLATFORM_BASICS_DONE=true
+  local host_os="${STRATA_OS_UNAME:-$(uname -s 2>/dev/null || echo Linux)}"
+  local host_arch="${STRATA_ARCH_UNAME:-$(uname -m 2>/dev/null || echo unknown)}"
+  if [[ "$host_os" == "Darwin" ]]; then
+    IS_MACOS=true
+    HAS_SYSTEMD=false
+    HAS_LAUNCHD=true
+    DISTRO_FAMILY="macos"
+    DISTRO_ID="macos"
+    MACOS_VER="${STRATA_MACOS_VER:-$(sw_vers -productVersion 2>/dev/null || true)}"
+    MACOS_MAJOR="${MACOS_VER%%.*}"
+    [[ "$MACOS_MAJOR" =~ ^[0-9]+$ ]] || MACOS_MAJOR=0
+    OS_PRETTY="macOS ${MACOS_VER:-unknown}"
+    KERNEL_VER="Darwin ${STRATA_KERNEL_VER:-$(uname -r 2>/dev/null || echo unknown)}"
+    if [[ "$host_arch" == "arm64" || "$host_arch" == "aarch64" ]]; then
+      IS_APPLE_SILICON=true
+    else
+      IS_APPLE_SILICON=false
+    fi
+    IS_VIRT=""
+    local hv_vmm=""
+    hv_vmm="${STRATA_MACOS_VM:-$(sysctl -n kern.hv_vmm_present 2>/dev/null || echo 0)}"
+    [[ "$hv_vmm" == "1" ]] && IS_VIRT="apple-vm"
+    refresh_unit_files_cache
+    return 0
+  fi
+
+  IS_MACOS=false
+  HAS_LAUNCHD=false
   if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
     HAS_SYSTEMD=true
   else
@@ -1349,9 +1708,26 @@ detect_platform_basics() {
 }
 
 ensure_script_tools() {
+  [[ -t 0 ]] || return 0
+  if [[ "$IS_MACOS" == true ]]; then
+    if ! command -v curl >/dev/null 2>&1; then
+      echo -e "${C_YELLOW}Missing curl; install Xcode Command Line Tools ('xcode-select --install') or Homebrew curl.${C_RESET}"
+    fi
+    if ! has_working_python3; then
+      if command -v brew >/dev/null 2>&1; then
+        echo -e "${C_YELLOW}Working python3 not detected (used for JSON metrics & benchmark history).${C_RESET}"
+        if confirm_yn "Install python3 via Homebrew now? [Y/n]: " "Y"; then
+          pkg_install python3 || echo -e "${C_YELLOW}Warning: Failed to install python3; JSON telemetry may be incomplete.${C_RESET}"
+        fi
+      else
+        echo -e "${C_YELLOW}Working python3 not detected (install Homebrew 'python3' or 'xcode-select --install' for benchmark history & live Strata metrics).${C_RESET}"
+      fi
+    fi
+    return 0
+  fi
+
   [[ "$DISTRO_FAMILY" != "unknown" && "$DISTRO_FAMILY" != "synology" ]] || return 0
   [[ "$IS_UNRAID" == true || "$IS_TRUENAS" == true ]] && return 0
-  [[ -t 0 ]] || return 0
   local missing_cmds=() missing_pkgs=()
   if ! command -v lspci >/dev/null 2>&1; then
     missing_cmds+=("lspci"); missing_pkgs+=("pciutils")
@@ -1359,7 +1735,7 @@ ensure_script_tools() {
   if ! command -v curl >/dev/null 2>&1; then
     missing_cmds+=("curl"); missing_pkgs+=("curl")
   fi
-  if ! command -v python3 >/dev/null 2>&1; then
+  if ! has_working_python3; then
     missing_cmds+=("python3")
     case "$DISTRO_FAMILY" in
       arch) missing_pkgs+=("python") ;;
@@ -1377,6 +1753,26 @@ ensure_script_tools() {
   else
     echo -e "${C_DIM}Skipped installing missing script tools.${C_RESET}"
   fi
+}
+
+_applesmc_dir() {
+  local d
+  if [[ -n "${STRATA_APPLESMC_DIR:-}" && -d "$STRATA_APPLESMC_DIR" ]]; then
+    echo "$STRATA_APPLESMC_DIR"
+    return 0
+  fi
+  for d in /sys/devices/platform/applesmc* /sys/devices/platform/applesmc*/hwmon/hwmon*; do
+    [[ -d "$d" ]] && compgen -G "$d/fan*_input" >/dev/null 2>&1 && { echo "$d"; return 0; }
+  done
+  local hm_base="${STRATA_HWMON_DIR:-/sys/class/hwmon}"
+  for d in "$hm_base"/hwmon*; do
+    [[ -r "$d/name" && "$(cat "$d/name" 2>/dev/null || true)" == "applesmc" ]] || continue
+    compgen -G "$d/fan*_input" >/dev/null 2>&1 && { echo "$d"; return 0; }
+  done
+  for d in /sys/devices/platform/applesmc*; do
+    [[ -d "$d" ]] && { echo "$d"; return 0; }
+  done
+  return 1
 }
 
 _is_nvidia_datacenter_name() {
@@ -1417,17 +1813,82 @@ detect_environment() {
   TOTAL_VRAM_MB=0
   NVIDIA_VRAM_MB=0
   HAS_NVIDIA=false HAS_NVIDIA_POWERD=false HAS_AMD=false HAS_INTEL_GPU=false HAS_INTEL_ARC=false
+  HAS_AMD_APU=false HAS_AMD_PREBUILT_GFX=false AMD_GTT_TOTAL_MB=0
+  HAS_AMD_INSTINCT=false HAS_AMD_NON_INSTINCT=false
+  AMD_GFX_SUMMARY="" AMD_MISSING_GFX_SUMMARY="" AMD_GFX_ARCHS=() AMD_MISSING_GFX_ARCHS=()
   HAS_NVIDIA_TESLA=false HAS_NVIDIA_NON_TESLA=false NVIDIA_COMPUTE_MODE_NON_DEFAULT=false
   HAS_NVIDIA_DATACENTER=false HAS_NVIDIA_PASSIVE=false HAS_NVIDIA_LEGACY_PSTATE_CARD=false
   HAS_NVIDIA_KEPLER=false HAS_NVIDIA_MAXWELL=false HAS_NVIDIA_PASCAL=false HAS_NVIDIA_VOLTA_SM70=false
   HAS_NVIDIA_NVSWITCH=false IS_DGX_SPARK=false HAS_NVIDIA_UNIFIED_MEM=false
   NVIDIA_DRIVER_VER="" NVIDIA_DRIVER_MAJOR=0 NVIDIA_LIVE_EXTRA_FIELDS=""
-  SYS_VENDOR="$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || true)"
-  PRODUCT_NAME="$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)"
+  IS_LAPTOP=false HAS_MSI_EC=false HAS_ASPM=false
+  IS_APPLE_LINUX=false IS_ASAHI_LINUX=false HAS_APPLESMC=false
+  RAM_HEALTH_LINES=() GPU_TOPO_LINES=()
+  GPU_SUMMARY="" GPU_RAW="" RAM_DETAILS=""
+  NUMA_NODES=1 CPU_SOCKETS=1 DISCRETE_GPU_COUNT=0
+
+  if [[ "$IS_MACOS" == true ]]; then
+    SYS_VENDOR="Apple Inc."
+    MACOS_MODEL_ID="${STRATA_MACOS_MODEL:-$(sysctl -n hw.model 2>/dev/null || true)}"
+    PRODUCT_NAME="$MACOS_MODEL_ID"
+    MACOS_CHIP="${STRATA_MACOS_CHIP:-$(sysctl -n machdep.cpu.brand_string 2>/dev/null || true)}"
+    local cpu_threads p_cores e_cores ram_bytes sp_disp="" sp_chip="" sp_cores="" sp_metal=""
+    cpu_threads="${STRATA_MACOS_THREADS:-$(sysctl -n hw.logicalcpu 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo '?')}"
+    MACOS_CPU_THREADS="$cpu_threads"
+    p_cores="${STRATA_MACOS_PCORES:-$(sysctl -n hw.perflevel0.logicalcpu 2>/dev/null || true)}"
+    e_cores="${STRATA_MACOS_ECORES:-$(sysctl -n hw.perflevel1.logicalcpu 2>/dev/null || true)}"
+    if [[ "$p_cores" =~ ^[0-9]+$ && "$e_cores" =~ ^[0-9]+$ ]]; then
+      CPU_SUMMARY="${MACOS_CHIP:-Apple Silicon} (${cpu_threads} threads: ${p_cores}P+${e_cores}E)"
+    else
+      CPU_SUMMARY="${MACOS_CHIP:-Unknown CPU} (${cpu_threads} threads)"
+    fi
+    ram_bytes="${STRATA_MACOS_RAM_BYTES:-$(sysctl -n hw.memsize 2>/dev/null || echo 0)}"
+    [[ "$ram_bytes" =~ ^[0-9]+$ ]] && { MACOS_RAM_BYTES="$ram_bytes"; RAM_GB=$(( ram_bytes / 1073741824 )); } || { MACOS_RAM_BYTES=0; RAM_GB=0; }
+    [[ "$IS_APPLE_SILICON" == true ]] && RAM_DETAILS=" (Unified)" || RAM_DETAILS=""
+
+    if command -v system_profiler >/dev/null 2>&1; then
+      sp_disp="$(system_profiler SPDisplaysDataType 2>/dev/null || true)"
+      sp_chip="$(sed -n 's/^[[:space:]]*Chipset Model:[[:space:]]*//p' <<< "$sp_disp" | head -n1)"
+      sp_cores="$(sed -n 's/^[[:space:]]*Total Number of Cores:[[:space:]]*//p' <<< "$sp_disp" | head -n1)"
+      sp_metal="$(sed -n 's/^[[:space:]]*Metal Support:[[:space:]]*//p' <<< "$sp_disp" | head -n1)"
+    fi
+    MACOS_GPU_CORES="${STRATA_MACOS_GPU_CORES:-$sp_cores}"
+    MACOS_METAL_VER="${STRATA_MACOS_METAL_VER:-$sp_metal}"
+    local gpu_base="${STRATA_MACOS_GPU_NAME:-${sp_chip:-$MACOS_CHIP}}"
+    if [[ "$IS_APPLE_SILICON" == true ]]; then
+      GPU_SUMMARY="${gpu_base:-Apple Silicon GPU}${MACOS_GPU_CORES:+ (${MACOS_GPU_CORES}-core GPU)}${MACOS_METAL_VER:+, ${MACOS_METAL_VER}}, Unified"
+    else
+      GPU_SUMMARY="${gpu_base:-Intel/Discrete GPU}${MACOS_METAL_VER:+, ${MACOS_METAL_VER}}"
+    fi
+    MACOS_WIRED_LIMIT_MB="${STRATA_MACOS_WIRED_LIMIT_MB:-$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)}"
+    [[ "$MACOS_WIRED_LIMIT_MB" =~ ^[0-9]+$ ]] || MACOS_WIRED_LIMIT_MB=0
+    if [[ "$MACOS_MODEL_ID" == MacBook* ]] || { command -v pmset >/dev/null 2>&1 && pmset -g batt 2>/dev/null | grep -qi "InternalBattery"; }; then
+      IS_LAPTOP=true
+    fi
+    MACOS_POWER_MODE_SUPPORTED=false
+    if command -v pmset >/dev/null 2>&1 && pmset -g 2>/dev/null | grep -qiE '(^|[[:space:]])powermode[[:space:]]'; then
+      MACOS_POWER_MODE_SUPPORTED=true
+    fi
+    refresh_strata_bin
+    return 0
+  fi
+
+  SYS_VENDOR="${STRATA_SYS_VENDOR:-$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || true)}"
+  PRODUCT_NAME="${STRATA_PRODUCT_NAME:-$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)}"
   local dt_dir="${STRATA_DT_DIR:-/proc/device-tree}"
   if grep -qiE "GB10|DGX Spark|Grace Blackwell" "$dt_dir/model" /sys/class/dmi/id/product_name 2>/dev/null; then
     IS_DGX_SPARK=true
     HAS_NVIDIA_UNIFIED_MEM=true
+  fi
+  if grep -qi "Apple" <<< "${SYS_VENDOR} ${PRODUCT_NAME}" || _applesmc_dir >/dev/null 2>&1; then
+    IS_APPLE_LINUX=true
+  fi
+  if _applesmc_dir >/dev/null 2>&1; then
+    HAS_APPLESMC=true
+  fi
+  if [[ "${STRATA_ARCH_UNAME:-$(uname -m 2>/dev/null || echo unknown)}" == "aarch64" ]] && grep -qi "apple," "$dt_dir/compatible" 2>/dev/null; then
+    IS_APPLE_LINUX=true
+    IS_ASAHI_LINUX=true
   fi
 
   if command -v nvidia-smi >/dev/null 2>&1; then
@@ -2130,6 +2591,7 @@ detect_gpu_topology() {
 }
 
 power_daemon_conflict_line() {
+  [[ "$IS_MACOS" == true ]] && return 0
   local active=()
   unit_active tlp.service && active+=("TLP")
   unit_active auto-cpufreq.service && active+=("auto-cpufreq")
@@ -2140,6 +2602,7 @@ power_daemon_conflict_line() {
 
 # Appends one "PCIe:" diagnostic line per discrete/integrated GPU (link width/gen + Resizable BAR).
 append_gpu_pcie_lines() {
+  [[ "$IS_MACOS" == true ]] && return 0
   local pci_dir="${STRATA_PCI_DIR:-/sys/bus/pci/devices}"
   local dev cls ven did cs ms cw mw cg mg addr line rebar max_bar s e f size vt cap_out dev_desc
   for dev in "$pci_dir"/*; do
@@ -2218,13 +2681,14 @@ append_gpu_pcie_lines() {
 # Step Registry
 # ------------------------------------------------------------------------------
 ALL_STEPS=(
-  nvidia_fabricmanager gpu_unlock amd_apu_memory amd_cwsr_disable
+  nvidia_fabricmanager gpu_unlock amd_apu_memory amd_cwsr_disable macos_wired_limit
   nvidia_mig_disable nvidia_sm70_table nvidia_pstate
   gpu_groups intel_compute_stack lact_overclock jetson_perf jetson_fan
   nvidia_power_limit amd_gpu_perf intel_gpu_perf ryzenadj_tdp nvidia_ecc nvidia_compute_mode
   nvidia_power_cap pcie_acs_disable amd_instinct_partition
+  macos_power_mode macos_spotlight_exclude macos_metal_tuning
   headless_target numactl_interleave amd_x3d_mode intel_rapl msi_cooling lenovo_legion
-  asus_perf dell_thermal system76_perf tuxedo_perf acpi_platform_profile intel_pcore_pinning zram_swap numa_balancing
+  asus_perf dell_thermal system76_perf tuxedo_perf apple_smc_cooling acpi_platform_profile intel_pcore_pinning zram_swap numa_balancing
   sysctl_tuning memlock_realtime nvme_tuning
   nvidia_persistenced nvidia_powerd intel_thermald iommu_pt scx_scheduler
   net_tuning irq_balance
@@ -2233,10 +2697,12 @@ ALL_STEPS=(
 )
 ACTIVE_STEPS=()
 
-VM_HIDDEN_STEPS=" nvidia_fabricmanager pcie_acs_disable amd_instinct_partition msi_cooling acpi_platform_profile asus_perf dell_thermal lenovo_legion system76_perf tuxedo_perf cpu_performance cstate_limit pcie_aspm ryzenadj_tdp intel_rapl intel_thermald amd_x3d_mode intel_pcore_pinning tuned_profile jetson_perf jetson_fan "
+VM_HIDDEN_STEPS=" nvidia_fabricmanager pcie_acs_disable amd_instinct_partition msi_cooling acpi_platform_profile asus_perf dell_thermal lenovo_legion system76_perf tuxedo_perf apple_smc_cooling cpu_performance cstate_limit pcie_aspm ryzenadj_tdp intel_rapl intel_thermald amd_x3d_mode intel_pcore_pinning tuned_profile jetson_perf jetson_fan macos_wired_limit macos_power_mode "
+MACOS_ALLOWED_STEPS=" macos_wired_limit macos_power_mode macos_spotlight_exclude macos_metal_tuning prevent_sleep "
 build_active_steps() {
   local step candidates=() pts
   for step in "${ALL_STEPS[@]}"; do
+    [[ "$IS_MACOS" == true && "$MACOS_ALLOWED_STEPS" != *" $step "* ]] && continue
     [[ -n "$IS_VIRT" && "$VM_HIDDEN_STEPS" == *" $step "* ]] && continue
     "applicable_${step}" && candidates+=("$step")
   done
@@ -2258,7 +2724,7 @@ is_experimental_step() {
 
 is_opt_in_step() {
   case "$1" in
-    nvidia_power_cap|amd_instinct_partition|hugepages_1g) return 0 ;;
+    nvidia_power_cap|amd_instinct_partition|hugepages_1g|macos_wired_limit|macos_metal_tuning) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -2280,7 +2746,7 @@ is_recommended_step() {
 is_laptop_recommended_step() {
   is_recommended_step "$1" || return 1
   case "$1" in
-    prevent_sleep|acpi_platform_profile|msi_cooling|asus_perf|dell_thermal|lenovo_legion|system76_perf|tuxedo_perf|amd_gpu_perf|intel_gpu_perf|nvidia_persistenced|nvidia_fabricmanager|nvidia_mig_disable)
+    prevent_sleep|acpi_platform_profile|msi_cooling|asus_perf|dell_thermal|lenovo_legion|system76_perf|tuxedo_perf|apple_smc_cooling|macos_power_mode|amd_gpu_perf|intel_gpu_perf|nvidia_persistenced|nvidia_fabricmanager|nvidia_mig_disable)
       return 1 ;;
     *)
       return 0 ;;
@@ -2315,18 +2781,30 @@ run_recommended_batch() {
   else
     echo -e "${C_BOLD}Revert ${scope_title} Performance Optimizations${C_RESET}"
   fi
-  local has_opt_ex=false has_exp_ex=false extra_excl=""
+  local has_warn_ex=false has_opt_ex=false has_exp_ex=false
+  local -a batch_excl=()
   for step in "${ACTIVE_STEPS[@]}"; do
+    is_high_idle_step "$step" && has_warn_ex=true
     is_experimental_step "$step" && has_exp_ex=true
     is_opt_in_step "$step" && has_opt_ex=true
   done
-  [[ "$has_opt_ex" == true ]] && extra_excl+=", opt-in trade-offs ([OPT])"
-  [[ "$has_exp_ex" == true ]] && extra_excl+=", experimental options ([EXP])"
   if [[ "$scope" == "laptop" ]]; then
-    echo -e "${C_DIM}Excluded: high-idle-power options ([!])${extra_excl}, prevent sleep, GPU high-idle-clock/persistence, platform & vendor performance profiles, Strata setup.${C_RESET}\n"
+    [[ "$has_warn_ex" == true ]] && batch_excl+=("high-idle-power options ([!])")
+    [[ "$has_opt_ex" == true ]] && batch_excl+=("opt-in trade-offs ([OPT])")
+    [[ "$has_exp_ex" == true ]] && batch_excl+=("experimental options ([EXP])")
+    batch_excl+=("prevent sleep" "GPU high-idle-clock/persistence" "platform & vendor performance profiles" "Strata setup")
   else
-    echo -e "${C_DIM}Excluded: high-idle-power options ([!]: CPU Performance, PCIe ASPM, CPU C-State Limit, NVIDIA Clock Lock, tuned profile)${extra_excl}, Strata setup.${C_RESET}\n"
+    [[ "$has_warn_ex" == true ]] && batch_excl+=("high-idle-power options ([!]: CPU Performance, PCIe ASPM, CPU C-State Limit, NVIDIA Clock Lock, tuned profile)")
+    [[ "$has_opt_ex" == true ]] && batch_excl+=("opt-in trade-offs ([OPT])")
+    [[ "$has_exp_ex" == true ]] && batch_excl+=("experimental options ([EXP])")
+    batch_excl+=("Strata setup")
   fi
+  local batch_excl_str="" _bi=0
+  for (( _bi = 0; _bi < ${#batch_excl[@]}; _bi++ )); do
+    (( _bi > 0 )) && batch_excl_str+=", "
+    batch_excl_str+="${batch_excl[$_bi]}"
+  done
+  echo -e "${C_DIM}Excluded: ${batch_excl_str}.${C_RESET}\n"
 
   if [[ ${#targets[@]} -eq 0 && ${#out_of_scope[@]} -eq 0 ]]; then
     if [[ "$mode" == "apply" ]]; then
@@ -2402,18 +2880,86 @@ run_recommended_batch() {
   pause_prompt
 }
 
+_pmset_ac_val() {
+  local key="$1" val=""
+  val="$(pmset -g custom 2>/dev/null | awk -v k="$key" '
+    /^AC Power:/ { in_ac=1; next }
+    /^[A-Za-z].*:/ { in_ac=0 }
+    in_ac && $1 == k { print $2; found=1; exit }
+    END { if (!found) exit 1 }
+  ')" || val="$(pmset -g 2>/dev/null | awk -v k="$key" '$1 == k { print $2; exit }')"
+  printf '%s' "$val"
+}
+
 # 1. Prevent Sleep
-applicable_prevent_sleep() { [[ "$HAS_SYSTEMD" == true ]]; }
-title_prevent_sleep() { echo "Disable System Sleep & Lid-Close Suspend (Server Uptime)"; }
-status_prevent_sleep() { [[ "$(systemctl is-enabled sleep.target 2>/dev/null || true)" == "masked" ]]; }
+applicable_prevent_sleep() {
+  [[ "$HAS_SYSTEMD" == true ]] || { [[ "$IS_MACOS" == true ]] && command -v pmset >/dev/null 2>&1; }
+}
+title_prevent_sleep() {
+  if [[ "$IS_MACOS" == true ]]; then
+    echo "Disable System Sleep & Idle Suspend (pmset Server Uptime)"
+  else
+    echo "Disable System Sleep & Lid-Close Suspend (Server Uptime)"
+  fi
+}
+status_prevent_sleep() {
+  if [[ "$IS_MACOS" == true ]]; then
+    [[ -f "$MACOS_NOSLEEP_MARKER" ]] || return 1
+    local _slp _sd
+    _slp="$(_pmset_ac_val sleep || true)"
+    _sd="$(pmset -g 2>/dev/null | awk '$1 == "SleepDisabled" {print $2; exit}')"
+    [[ "$_slp" == "0" || "$_sd" == "1" ]]
+    return $?
+  fi
+  [[ "$(systemctl is-enabled sleep.target 2>/dev/null || true)" == "masked" ]]
+}
 explain_prevent_sleep() {
-  cat <<'EOF'
+  if [[ "$IS_MACOS" == true ]]; then
+    cat <<'EOF'
+Impact:
+  Configures pmset so the Mac does not enter idle sleep, standby, autopoweroff,
+  or Power Nap while serving Strata (on MacBooks, scoped to AC power; optionally
+  disables sleep completely for closed-clamshell server operation).
+  Previous pmset values are saved and restored cleanly on revert.
+EOF
+  else
+    cat <<'EOF'
 Impact:
   Masks systemd sleep/suspend/hibernate targets and ignores lid-close events
   on laptops so long-running Strata inference is never interrupted.
 EOF
+  fi
 }
 apply_prevent_sleep() {
+  if [[ "$IS_MACOS" == true ]]; then
+    local scope="-a" k v prev_lines=""
+    [[ "$IS_LAPTOP" == true ]] && scope="-c"
+    if [[ -r "$MACOS_NOSLEEP_MARKER" ]]; then
+      prev_lines="$(grep -v '^disablesleep_set=' "$MACOS_NOSLEEP_MARKER" 2>/dev/null || true)"
+      [[ -n "$prev_lines" ]] && prev_lines+=$'\n'
+    fi
+    if [[ -z "$prev_lines" ]]; then
+      prev_lines+="scope=${scope}"$'\n'
+      for k in sleep standby autopoweroff powernap; do
+        v="$(_pmset_ac_val "$k" || true)"
+        [[ "$v" =~ ^[0-9]+$ ]] && prev_lines+="${k}=${v}"$'\n'
+      done
+      local sd_prev=""
+      sd_prev="$(pmset -g 2>/dev/null | awk '$1 == "SleepDisabled" {print $2; exit}')"
+      [[ "$sd_prev" =~ ^[0-9]+$ ]] && prev_lines+="SleepDisabled=${sd_prev}"$'\n'
+    fi
+    if ! run_root pmset "$scope" sleep 0 standby 0 autopoweroff 0 powernap 0; then
+      echo -e "${C_RED}Failed to update pmset sleep settings.${C_RESET}"
+      return 1
+    fi
+    run_root mkdir -p "$MACOS_SUPPORT_DIR"
+    printf '%s' "$prev_lines" | run_root tee "$MACOS_NOSLEEP_MARKER" >/dev/null
+    if [[ "$IS_LAPTOP" == true ]] && confirm_yn "Also disable sleep completely when closed/on lid-close (pmset -a disablesleep 1)? [y/N]: " "N"; then
+      run_root pmset -a disablesleep 1
+      echo "disablesleep_set=1" | run_root tee -a "$MACOS_NOSLEEP_MARKER" >/dev/null
+    fi
+    return 0
+  fi
   run_root systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
   if [[ "$IS_LAPTOP" == true ]]; then
     run_root mkdir -p /etc/systemd/logind.conf.d
@@ -2428,6 +2974,30 @@ EOF
   fi
 }
 revert_prevent_sleep() {
+  if [[ "$IS_MACOS" == true ]]; then
+    local scope="-a" line k v had_disablesleep=false
+    [[ "$IS_LAPTOP" == true ]] && scope="-c"
+    if [[ -r "$MACOS_NOSLEEP_MARKER" ]]; then
+      while IFS='=' read -r k v; do
+        case "$k" in
+          scope) [[ -n "$v" ]] && scope="$v" ;;
+          sleep|standby|autopoweroff|powernap)
+            [[ "$v" =~ ^[0-9]+$ ]] && run_root pmset "$scope" "$k" "$v" 2>/dev/null || true
+            ;;
+          SleepDisabled)
+            [[ "$v" =~ ^[0-9]+$ ]] && run_root pmset -a disablesleep "$v" 2>/dev/null || true
+            ;;
+          disablesleep_set) [[ "$v" == "1" ]] && had_disablesleep=true ;;
+        esac
+      done < "$MACOS_NOSLEEP_MARKER"
+      [[ "$had_disablesleep" == true ]] && run_root pmset -a disablesleep 0 2>/dev/null || true
+      run_root rm -f "$MACOS_NOSLEEP_MARKER"
+    else
+      run_root pmset -a disablesleep 0 2>/dev/null || true
+      run_root pmset "$scope" sleep 10 standby 1 autopoweroff 1 powernap 1 2>/dev/null || true
+    fi
+    return 0
+  fi
   run_root systemctl unmask sleep.target suspend.target hibernate.target hybrid-sleep.target
   if [[ -f /etc/systemd/logind.conf.d/99-strata-nosleep.conf ]]; then
     run_root rm -f /etc/systemd/logind.conf.d/99-strata-nosleep.conf
@@ -2613,6 +3183,154 @@ apply_tuxedo_perf() {
 }
 revert_tuxedo_perf() { run_root systemctl disable --now tccd.service 2>/dev/null || true; }
 
+# 3h. Apple Mac SMC Cooling (Linux on Intel Macs)
+applicable_apple_smc_cooling() {
+  [[ "$IS_MACOS" == false && "$IS_APPLE_LINUX" == true && "$IS_ASAHI_LINUX" == false ]] || return 1
+  [[ "$HAS_APPLESMC" == true ]] && return 0
+  service_installed strata-applesmc-cooling.service && return 0
+  [[ -f "$APPLESMC_MBPFAN_MARKER" ]] && return 0
+  command -v mbpfan >/dev/null 2>&1 || pkg_available repo mbpfan || pkg_available aur mbpfan-git || pkg_available aur mbpfan
+}
+title_apple_smc_cooling() { echo "Apple Mac SMC Cooling & Aggressive Fan Control (mbpfan / applesmc)"; }
+status_apple_smc_cooling() {
+  if service_installed strata-applesmc-cooling.service && unit_enabled strata-applesmc-cooling.service; then
+    return 0
+  fi
+  [[ -f "$APPLESMC_MBPFAN_MARKER" ]] && unit_enabled mbpfan.service && unit_active mbpfan.service
+}
+explain_apple_smc_cooling() {
+  cat <<'EOF'
+Impact:
+  Improves thermal headroom on Intel Macs running Linux (Mac Pro, Mac mini,
+  iMac, MacBook Pro) by configuring either an aggressive mbpfan thermal curve
+  (55C ramp -> 82C max) or direct applesmc manual fan floors via systemd.
+  Reverts cleanly to your previous mbpfan configuration / automatic SMC control.
+EOF
+}
+apply_apple_smc_cooling() {
+  run_root modprobe applesmc 2>/dev/null || true
+  local smc_dir="" has_sysfs_fan=false has_mbpfan=false mode=""
+  smc_dir="$(_applesmc_dir || true)"
+  if [[ -n "$smc_dir" ]] && compgen -G "${smc_dir}/fan*_manual" >/dev/null 2>&1; then
+    has_sysfs_fan=true
+  fi
+  if command -v mbpfan >/dev/null 2>&1 || pkg_available repo mbpfan || pkg_available aur mbpfan-git || pkg_available aur mbpfan; then
+    has_mbpfan=true
+  fi
+  if [[ "$has_mbpfan" == true && "$has_sysfs_fan" == true ]]; then
+    echo "Select Apple Mac cooling control method:"
+    echo "  1) mbpfan aggressive thermal curve (recommended, scales dynamically)"
+    echo "  2) Direct applesmc sysfs fan floor / manual speed"
+    local c_ans=""
+    read -r -p "Choose [1-2, default 1]: " c_ans || true
+    case "${c_ans:-1}" in
+      2) mode="sysfs" ;;
+      1|"") mode="mbpfan" ;;
+      *) echo -e "${C_RED}Invalid selection '${c_ans}'. Cancelled.${C_RESET}"; return 1 ;;
+    esac
+  elif [[ "$has_mbpfan" == true ]]; then
+    mode="mbpfan"
+  elif [[ "$has_sysfs_fan" == true ]]; then
+    mode="sysfs"
+  else
+    echo -e "${C_YELLOW}Neither mbpfan nor writable applesmc fan*_manual sysfs nodes were found.${C_RESET}"
+    return 1
+  fi
+
+  if [[ "$mode" == "mbpfan" ]]; then
+    if ! command -v mbpfan >/dev/null 2>&1; then
+      if pkg_available repo mbpfan; then
+        prompt_install_deps repo mbpfan || return 0
+      elif ! prompt_install_repo_or_aur mbpfan-git && ! prompt_install_repo_or_aur mbpfan; then
+        return 0
+      fi
+    fi
+    service_installed strata-applesmc-cooling.service && remove_service strata-applesmc-cooling.service
+    run_root sh -c 'for d in "'"${STRATA_APPLESMC_DIR:-}"'" /sys/devices/platform/applesmc* /sys/devices/platform/applesmc*/hwmon/hwmon*; do [ -n "$d" ] && [ -d "$d" ] || continue; for m in "$d"/fan*_manual; do [ -w "$m" ] && echo 0 > "$m"; done; done; true' 2>/dev/null || true
+    local was_active=false
+    unit_active mbpfan.service && was_active=true
+    if [[ -f /etc/mbpfan.conf && ! -f /etc/mbpfan.conf.bak.strata-setup ]]; then
+      run_root cp /etc/mbpfan.conf /etc/mbpfan.conf.bak.strata-setup
+    fi
+    echo "was_active=${was_active}" | run_root tee "$APPLESMC_MBPFAN_MARKER" >/dev/null
+    run_root tee /etc/mbpfan.conf >/dev/null <<'EOF'
+# Managed by strata-performance-setup
+[general]
+low_temp = 55
+high_temp = 72
+max_temp = 82
+polling_interval = 1
+EOF
+    if [[ "$HAS_SYSTEMD" == true ]]; then
+      run_root systemctl enable --now mbpfan.service
+      run_root systemctl restart mbpfan.service
+    else
+      local mbp_bin
+      mbp_bin="$(command -v mbpfan || true)"
+      if [[ -n "$mbp_bin" ]]; then
+        install_service strata-applesmc-cooling.service <<EOF
+[Unit]
+Description=Apple Mac mbpfan Cooling Service for Strata
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=${mbp_bin} -f
+
+[Install]
+WantedBy=multi-user.target
+EOF
+      fi
+    fi
+    echo -e "${C_GREEN}Configured aggressive mbpfan cooling profile.${C_RESET}"
+    return 0
+  fi
+
+  local pct=""
+  read -r -p "Target minimum manual fan speed percentage [50-100, default 85]: " pct || true
+  pct="${pct:-85}"
+  if ! [[ "$pct" =~ ^[0-9]+$ ]] || (( pct < 50 || pct > 100 )); then
+    echo -e "${C_RED}Invalid percentage '${pct}' (must be 50-100). Cancelled.${C_RESET}"
+    return 1
+  fi
+  unit_active mbpfan.service && run_root systemctl disable --now mbpfan.service 2>/dev/null || true
+  install_service strata-applesmc-cooling.service <<EOF
+[Unit]
+Description=Apple Mac applesmc Fan Speed Control for Strata (${pct}%)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'modprobe applesmc 2>/dev/null || true; for d in "${STRATA_APPLESMC_DIR:-}" /sys/devices/platform/applesmc* /sys/devices/platform/applesmc*/hwmon/hwmon*; do [ -n "\$d" ] && [ -d "\$d" ] || continue; for m in "\$d"/fan*_manual; do [ -w "\$m" ] || continue; b="\${m%_manual}"; [ -r "\${b}_min" ] && [ -r "\${b}_max" ] && [ -w "\${b}_output" ] || continue; mn=\$(tr -d "[:space:]" < "\${b}_min" 2>/dev/null || echo 0); mx=\$(tr -d "[:space:]" < "\${b}_max" 2>/dev/null || echo 0); case "\$mn:\$mx" in *[!0-9:]*|:|*:|:* ) continue ;; esac; [ "\$mx" -gt "\$mn" ] 2>/dev/null || continue; tgt=\$(( mn + (mx - mn) * ${pct} / 100 )); echo 1 > "\$m"; echo "\$tgt" > "\${b}_output"; done; done; true'
+ExecStop=/bin/sh -c 'for d in "${STRATA_APPLESMC_DIR:-}" /sys/devices/platform/applesmc* /sys/devices/platform/applesmc*/hwmon/hwmon*; do [ -n "\$d" ] && [ -d "\$d" ] || continue; for m in "\$d"/fan*_manual; do [ -w "\$m" ] && echo 0 > "\$m"; done; done; true'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+revert_apple_smc_cooling() {
+  service_installed strata-applesmc-cooling.service && remove_service strata-applesmc-cooling.service
+  run_root sh -c 'for d in "'"${STRATA_APPLESMC_DIR:-}"'" /sys/devices/platform/applesmc* /sys/devices/platform/applesmc*/hwmon/hwmon*; do [ -n "$d" ] && [ -d "$d" ] || continue; for m in "$d"/fan*_manual; do [ -w "$m" ] && echo 0 > "$m"; done; done; true' 2>/dev/null || true
+  if [[ -f "$APPLESMC_MBPFAN_MARKER" ]]; then
+    local was_active="false"
+    was_active="$(sed -n 's/^was_active=//p' "$APPLESMC_MBPFAN_MARKER" 2>/dev/null | head -n1)"
+    if [[ -f /etc/mbpfan.conf.bak.strata-setup ]]; then
+      run_root mv -f /etc/mbpfan.conf.bak.strata-setup /etc/mbpfan.conf
+    else
+      run_root rm -f /etc/mbpfan.conf
+    fi
+    if [[ "$HAS_SYSTEMD" == true ]]; then
+      if [[ "$was_active" == "true" ]]; then
+        run_root systemctl restart mbpfan.service 2>/dev/null || true
+      else
+        run_root systemctl disable --now mbpfan.service 2>/dev/null || true
+      fi
+    fi
+    run_root rm -f "$APPLESMC_MBPFAN_MARKER"
+  fi
+}
+
 # 4. CPU Performance
 applicable_cpu_performance() { [[ -d /sys/devices/system/cpu/cpu0/cpufreq ]] || command -v powerprofilesctl >/dev/null 2>&1; }
 title_cpu_performance() { echo "CPU Performance Profile & Governor (performance)"; }
@@ -2682,7 +3400,7 @@ revert_cpu_performance() {
 }
 
 # 5. Memlock & Realtime
-applicable_memlock_realtime() { return 0; }
+applicable_memlock_realtime() { [[ "$IS_MACOS" == false ]]; }
 title_memlock_realtime() { echo "Unlimited Memory Lock & Realtime Privileges (memlock=unlimited)"; }
 status_memlock_realtime() {
   if [[ -n "$STRATA_DOCKER_CONTAINER" ]]; then
@@ -3845,7 +4563,7 @@ revert_intel_gpu_perf() {
 }
 
 # 12. Sysctl & Scheduler
-applicable_sysctl_tuning() { return 0; }
+applicable_sysctl_tuning() { [[ "$IS_MACOS" == false ]]; }
 title_sysctl_tuning() { echo "Kernel VM, Sysctl, THP & Auto-Nice Tuning (ananicy-cpp / bpftune / sysctl)"; }
 strata_swappiness_value() { if status_zram_swap; then echo 100; else echo 10; fi; }
 write_swappiness_conf() {
@@ -4018,7 +4736,7 @@ revert_zram_swap() {
 }
 
 # 12c. IRQ Balance
-applicable_irq_balance() { [[ "$(nproc 2>/dev/null || echo 1)" -gt 1 ]] && { command -v irqbalance >/dev/null 2>&1 || pkg_available repo irqbalance; }; }
+applicable_irq_balance() { [[ "$IS_MACOS" == false ]] && [[ "$(nproc 2>/dev/null || echo 1)" -gt 1 ]] && { command -v irqbalance >/dev/null 2>&1 || pkg_available repo irqbalance; }; }
 title_irq_balance() { echo "Hardware IRQ Load Balancing (irqbalance)"; }
 status_irq_balance() { unit_enabled irqbalance.service && unit_active irqbalance.service; }
 explain_irq_balance() { echo -e "Impact:\n  Distributes NVMe, NIC, and PCIe/GPU interrupts across CPU cores."; }
@@ -4166,7 +4884,7 @@ gpu_missing_groups() {
   done
 }
 applicable_gpu_groups() {
-  [[ "$TARGET_USER" != "root" ]] || return 1
+  [[ "$IS_MACOS" == false && "$TARGET_USER" != "root" ]] || return 1
   compgen -G "/dev/dri/renderD*" >/dev/null 2>&1 || [[ -e /dev/kfd || -e /dev/nvhost-gpu ]] || return 1
   getent group render >/dev/null 2>&1 || getent group video >/dev/null 2>&1
 }
@@ -4558,6 +5276,7 @@ has_physical_nic_up() {
   return 1
 }
 applicable_net_tuning() {
+  [[ "$IS_MACOS" == false ]] || return 1
   [[ -f /etc/sysctl.d/99-strata-net.conf ]] && return 0
   [[ -e /proc/sys/net/core/somaxconn ]] && has_physical_nic_up
 }
@@ -5292,9 +6011,359 @@ revert_intel_pcore_pinning() {
   run_root systemctl daemon-reload
 }
 
+# 12y. macOS Metal GPU Wired Memory Limit (iogpu.wired_limit_mb)
+_macos_wired_limit_cur_mb() {
+  local v="${STRATA_MACOS_WIRED_LIMIT_MB:-$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)}"
+  [[ "$v" =~ ^[0-9]+$ ]] || v=0
+  echo "$v"
+}
+_macos_wired_limit_rec_gb() {
+  local r="${1:-${RAM_GB:-0}}"
+  if (( r >= 128 )); then echo $(( r - 16 ))
+  elif (( r >= 96 )); then echo $(( r - 12 ))
+  elif (( r >= 64 )); then echo $(( r - 10 ))
+  elif (( r >= 48 )); then echo $(( r - 8 ))
+  elif (( r >= 32 )); then echo $(( r - 6 ))
+  else echo $(( r - 5 ))
+  fi
+}
+applicable_macos_wired_limit() {
+  [[ "$IS_MACOS" == true && "$IS_APPLE_SILICON" == true ]] && (( RAM_GB >= 24 ))
+}
+title_macos_wired_limit() { echo "macOS Metal GPU Wired Memory Limit (iogpu.wired_limit_mb)"; }
+note_macos_wired_limit() { echo -e "${C_BLUE}[OPT]${C_RESET}"; }
+status_macos_wired_limit() {
+  service_installed strata-macos-wired-limit.service && return 0
+  (( $(_macos_wired_limit_cur_mb) > 0 ))
+}
+explain_macos_wired_limit() {
+  local rec_gb cur_mb
+  rec_gb="$(_macos_wired_limit_rec_gb "$RAM_GB")"
+  cur_mb="$(_macos_wired_limit_cur_mb)"
+  cat <<EOF
+Impact:
+  Overrides macOS's ~75% Metal GPU memory residency cap by setting
+  'sysctl iogpu.wired_limit_mb' and persisting it via LaunchDaemon.
+  Allows larger resident packs (e.g. UD-Q4_K_XL, IQ3_S, Gyro) on 32-192+ GiB
+  Apple Silicon Macs without spilling experts to SSD streaming.
+  Recommended safe ceiling for ${RAM_GB} GiB RAM: ~${rec_gb} GiB ($(( rec_gb * 1024 )) MiB).
+  Current wired limit: $( (( cur_mb > 0 )) && echo "${cur_mb} MiB ($(( cur_mb / 1024 )) GiB)" || echo "0 (macOS default ~75%)" )
+EOF
+  echo -e "\n${C_YELLOW}[NOTE] Always leave enough RAM for macOS (5-16+ GiB); setting this too${C_RESET}"
+  echo -e "${C_YELLOW}       close to physical RAM can trigger kernel memory-watchdog panics.${C_RESET}"
+}
+apply_macos_wired_limit() {
+  local rec_gb rec_mb max_safe_mb cur_mb target_mb=""
+  rec_gb="$(_macos_wired_limit_rec_gb "$RAM_GB")"
+  rec_mb=$(( rec_gb * 1024 ))
+  max_safe_mb=$(( (RAM_GB - 4) * 1024 ))
+  (( rec_mb > max_safe_mb )) && rec_mb="$max_safe_mb"
+  cur_mb="$(_macos_wired_limit_cur_mb)"
+  echo "Detected unified memory: ${RAM_GB} GiB (current iogpu.wired_limit_mb=${cur_mb})"
+  echo "Recommended safe limit: ${rec_mb} MiB ($(( rec_mb / 1024 )) GiB; hard max ${max_safe_mb} MiB)"
+  read -r -p "Target Metal wired memory limit in MiB [${rec_mb}]: " target_mb || true
+  target_mb="${target_mb:-$rec_mb}"
+  if ! [[ "$target_mb" =~ ^[0-9]+$ ]] || (( target_mb < 4096 || target_mb > max_safe_mb )); then
+    echo -e "${C_RED}Invalid value '${target_mb}' (must be between 4096 and ${max_safe_mb} MiB). Cancelled.${C_RESET}"
+    return 1
+  fi
+  if ! run_root sysctl -w "iogpu.wired_limit_mb=${target_mb}"; then
+    echo -e "${C_RED}Failed to set iogpu.wired_limit_mb=${target_mb}.${C_RESET}"
+    return 1
+  fi
+  MACOS_WIRED_LIMIT_MB="$target_mb"
+  install_service strata-macos-wired-limit.service <<EOF
+[Unit]
+Description=Set macOS Metal Wired Memory Limit for Strata
+
+[Service]
+ExecStart=/usr/sbin/sysctl -w iogpu.wired_limit_mb=${target_mb}
+ExecStop=/usr/sbin/sysctl -w iogpu.wired_limit_mb=0
+EOF
+  echo -e "${C_GREEN}Set iogpu.wired_limit_mb=${target_mb} MiB ($(( target_mb / 1024 )) GiB).${C_RESET}"
+}
+revert_macos_wired_limit() {
+  remove_service strata-macos-wired-limit.service
+  run_root sysctl -w iogpu.wired_limit_mb=0 2>/dev/null || true
+  MACOS_WIRED_LIMIT_MB=0
+  echo -e "${C_GREEN}Restored iogpu.wired_limit_mb=0 (macOS default ~75%).${C_RESET}"
+}
+
+# 12z. macOS Power Mode (High Power Mode / Disable Low Power Mode)
+applicable_macos_power_mode() {
+  [[ "$IS_MACOS" == true && "$IS_APPLE_SILICON" == true ]] && command -v pmset >/dev/null 2>&1
+}
+title_macos_power_mode() {
+  if [[ "$MACOS_POWER_MODE_SUPPORTED" == true ]]; then
+    echo "macOS High Power Mode & Disable Low Power Mode (pmset)"
+  else
+    echo "macOS Disable Low Power Mode (pmset)"
+  fi
+}
+status_macos_power_mode() {
+  [[ -f "$MACOS_POWER_MODE_MARKER" ]] || return 1
+  local applied_mode="" cur_pm="" cur_lp=""
+  applied_mode="$(sed -n 's/^applied_mode=//p' "$MACOS_POWER_MODE_MARKER" 2>/dev/null | head -n1)"
+  cur_pm="$(_pmset_ac_val powermode || true)"
+  cur_lp="$(_pmset_ac_val lowpowermode || true)"
+  if [[ "$applied_mode" == "high" ]]; then
+    [[ "$cur_pm" == "2" ]]
+  else
+    [[ ( -z "$cur_pm" || "$cur_pm" == "0" ) && ( -z "$cur_lp" || "$cur_lp" == "0" ) ]]
+  fi
+}
+explain_macos_power_mode() {
+  cat <<'EOF'
+Impact:
+  Enables macOS High Power Mode (pmset powermode 2, where supported by Max/Ultra
+  Apple Silicon chips) and ensures Low Power Mode is disabled so fans ramp more
+  proactively and sustained prefill/decode avoids early thermal throttling.
+  On MacBooks, scoped to AC power (-c) so battery behavior stays untouched.
+EOF
+}
+apply_macos_power_mode() {
+  local scope="-a" prev_pm="" prev_lp="" applied_mode="auto"
+  [[ "$IS_LAPTOP" == true ]] && scope="-c"
+  if [[ -r "$MACOS_POWER_MODE_MARKER" ]]; then
+    prev_pm="$(sed -n 's/^prev_powermode=//p' "$MACOS_POWER_MODE_MARKER" 2>/dev/null | head -n1)"
+    prev_lp="$(sed -n 's/^prev_lowpowermode=//p' "$MACOS_POWER_MODE_MARKER" 2>/dev/null | head -n1)"
+  fi
+  [[ -n "$prev_pm" ]] || prev_pm="$(_pmset_ac_val powermode || true)"
+  [[ -n "$prev_lp" ]] || prev_lp="$(_pmset_ac_val lowpowermode || true)"
+  run_root mkdir -p "$MACOS_SUPPORT_DIR"
+  if run_root pmset "$scope" powermode 2 2>/dev/null && [[ "$(_pmset_ac_val powermode || true)" == "2" ]]; then
+    applied_mode="high"
+  else
+    [[ -n "$prev_pm" ]] && run_root pmset "$scope" powermode 0 2>/dev/null || true
+    run_root pmset "$scope" lowpowermode 0 2>/dev/null || true
+    applied_mode="auto"
+  fi
+  run_root tee "$MACOS_POWER_MODE_MARKER" >/dev/null <<EOF
+scope=${scope}
+applied_mode=${applied_mode}
+prev_powermode=${prev_pm}
+prev_lowpowermode=${prev_lp}
+EOF
+  if [[ "$applied_mode" == "high" ]]; then
+    echo -e "${C_GREEN}Enabled macOS High Power Mode (${scope}).${C_RESET}"
+  else
+    echo -e "${C_GREEN}Set macOS Power Mode to Automatic / Low Power Mode off (${scope}).${C_RESET}"
+  fi
+}
+revert_macos_power_mode() {
+  local scope="-a" prev_pm="" prev_lp=""
+  [[ "$IS_LAPTOP" == true ]] && scope="-c"
+  if [[ -r "$MACOS_POWER_MODE_MARKER" ]]; then
+    scope="$(sed -n 's/^scope=//p' "$MACOS_POWER_MODE_MARKER" 2>/dev/null | head -n1)"
+    prev_pm="$(sed -n 's/^prev_powermode=//p' "$MACOS_POWER_MODE_MARKER" 2>/dev/null | head -n1)"
+    prev_lp="$(sed -n 's/^prev_lowpowermode=//p' "$MACOS_POWER_MODE_MARKER" 2>/dev/null | head -n1)"
+    [[ -n "$scope" ]] || scope="-a"
+  fi
+  [[ -n "$prev_pm" ]] && run_root pmset "$scope" powermode "$prev_pm" 2>/dev/null || true
+  [[ -n "$prev_lp" ]] && run_root pmset "$scope" lowpowermode "$prev_lp" 2>/dev/null || true
+  run_root rm -f "$MACOS_POWER_MODE_MARKER"
+  echo -e "${C_GREEN}Restored previous macOS power mode settings.${C_RESET}"
+}
+
+# 12aa. macOS Spotlight Exclusion for Strata Models & Data
+_macos_spotlight_dirs() {
+  local -a dirs=("$TARGET_HOME/.local/share/strata" "$TARGET_HOME/.cache/strata")
+  [[ -d "$TARGET_HOME/.strata" ]] && dirs+=("$TARGET_HOME/.strata")
+  [[ -d "$TARGET_HOME/Documents/Strata" ]] && dirs+=("$TARGET_HOME/Documents/Strata")
+  [[ -n "${STRATA_DATA_DIR:-}" ]] && dirs+=("$STRATA_DATA_DIR")
+  printf '%s\n' "${dirs[@]}" | awk '!seen[$0]++'
+}
+applicable_macos_spotlight_exclude() { [[ "$IS_MACOS" == true ]]; }
+title_macos_spotlight_exclude() { echo "Exclude Strata Data & Models from Spotlight Indexing (SSD I/O)"; }
+status_macos_spotlight_exclude() {
+  [[ -f "$TARGET_HOME/.local/share/strata/.metadata_never_index" && -f "$TARGET_HOME/.cache/strata/.metadata_never_index" ]] || return 1
+  if [[ -r "$MACOS_SPOTLIGHT_LIST" ]]; then
+    local d
+    while IFS= read -r d; do
+      [[ -n "$d" && -d "$d" ]] || continue
+      [[ -f "${d}/.metadata_never_index" ]] || return 1
+    done < "$MACOS_SPOTLIGHT_LIST"
+  fi
+  return 0
+}
+explain_macos_spotlight_exclude() {
+  cat <<'EOF'
+Impact:
+  Places '.metadata_never_index' markers inside Strata's data, cache, and model
+  directories (~/.local/share/strata, ~/.cache/strata, ~/.strata, and optional
+  custom model paths) so Spotlight (mds_stores) does not scan multi-GB GGUF/
+  expert files and introduce SSD latency spikes during SSD expert streaming.
+EOF
+}
+apply_macos_spotlight_exclude() {
+  local -a raw_dirs=() dirs=()
+  local d extra_dir=""
+  while IFS= read -r d; do
+    [[ -n "$d" ]] && raw_dirs+=("$d")
+  done < <(_macos_spotlight_dirs)
+  read -r -p "Optional extra Strata model folder to exclude from Spotlight (blank to skip): " extra_dir || true
+  if [[ -n "$extra_dir" ]]; then
+    extra_dir="${extra_dir%\"}"; extra_dir="${extra_dir#\"}"
+    extra_dir="${extra_dir%\'}"; extra_dir="${extra_dir#\'}"
+    if [[ "$extra_dir" == "~" ]]; then
+      extra_dir="$TARGET_HOME"
+    elif [[ "$extra_dir" == "~/"* ]]; then
+      extra_dir="${TARGET_HOME}/${extra_dir#\~/}"
+    fi
+    [[ "$extra_dir" != "/" ]] && extra_dir="${extra_dir%/}"
+    if [[ -d "$extra_dir" ]]; then
+      raw_dirs+=("$extra_dir")
+    else
+      echo -e "${C_YELLOW}Directory not found (${extra_dir}); skipping custom path.${C_RESET}"
+    fi
+  fi
+  while IFS= read -r d; do
+    [[ -n "$d" ]] && dirs+=("$d")
+  done < <(printf '%s\n' "${raw_dirs[@]}" | awk '!seen[$0]++')
+  run_as_user_exec mkdir -p "$(dirname "$MACOS_SPOTLIGHT_LIST")"
+  : | run_as_user_exec tee "$MACOS_SPOTLIGHT_LIST" >/dev/null
+  for d in "${dirs[@]}"; do
+    run_as_user_exec mkdir -p "$d"
+    run_as_user_exec touch "${d}/.metadata_never_index"
+    printf '%s\n' "$d" | run_as_user_exec tee -a "$MACOS_SPOTLIGHT_LIST" >/dev/null
+    echo -e "  ${C_GREEN}Excluded:${C_RESET} ${d}"
+  done
+}
+revert_macos_spotlight_exclude() {
+  local -a dirs=()
+  local d
+  if [[ -r "$MACOS_SPOTLIGHT_LIST" ]]; then
+    while IFS= read -r d; do
+      [[ -n "$d" ]] && dirs+=("$d")
+    done < "$MACOS_SPOTLIGHT_LIST"
+  fi
+  while IFS= read -r d; do
+    [[ -n "$d" ]] && dirs+=("$d")
+  done < <(_macos_spotlight_dirs)
+  while IFS= read -r d; do
+    [[ -n "$d" && -f "${d}/.metadata_never_index" ]] && run_as_user_exec rm -f "${d}/.metadata_never_index"
+  done < <(printf '%s\n' "${dirs[@]}" | awk '!seen[$0]++')
+  run_as_user_exec rm -f "$MACOS_SPOTLIGHT_LIST"
+  echo -e "${C_GREEN}Removed Spotlight exclusion markers from Strata directories.${C_RESET}"
+}
+
+# 12ab. Strata Metal Engine Environment Switches
+_strip_shell_hook_line() {
+  local rc_file="$1" tag="$2" tmp=""
+  [[ -f "$rc_file" ]] && grep -qF "$tag" "$rc_file" 2>/dev/null || return 0
+  if tmp="$(awk -v t="$tag" 'index($0, t) == 0 {print}' "$rc_file")"; then
+    if [[ -n "$tmp" ]]; then
+      printf '%s\n' "$tmp" | run_as_user_exec tee "$rc_file" >/dev/null
+    else
+      : | run_as_user_exec tee "$rc_file" >/dev/null
+    fi
+  fi
+}
+applicable_macos_metal_tuning() { [[ "$IS_MACOS" == true && "$IS_APPLE_SILICON" == true ]]; }
+title_macos_metal_tuning() { echo "Strata Metal Engine Switches (FP16 Decode / Rootless Sensors / Arena)"; }
+note_macos_metal_tuning() { echo -e "${C_BLUE}[OPT]${C_RESET}"; }
+status_macos_metal_tuning() {
+  [[ -s "$MACOS_METAL_ENV_FILE" ]] && grep -qE '^STRATA_[A-Z0-9_]+=' "$MACOS_METAL_ENV_FILE" 2>/dev/null
+}
+explain_macos_metal_tuning() {
+  cat <<'EOF'
+Impact:
+  Configures documented Strata Metal runtime environment switches in
+  ~/.config/strata/macos-metal-env.conf (automatically applied to wizard CLI
+  runs, benchmarks, and the com.strata.server launchd service, plus optional
+  ~/.zprofile shell integration):
+    - STRATA_METAL_F16=1        : FP16 GEMVs on resident Q2_0/IQ3_S (+9-15% decode)
+    - STRATA_MACOS_SENSORS=1    : Rootless SMC/IOReport GPU temp & power in Monitor
+    - STRATA_METAL_PROMPT_CHUNK : Optional SSD streaming prompt chunk override
+    - STRATA_METAL_ARENA_GB     : Optional SSD streaming expert cache arena size
+    - STRATA_METAL_WIRE_ARENA=0 : Leave 64+ GiB streaming arena pageable
+EOF
+}
+apply_macos_metal_tuning() {
+  local -a vars=()
+  local pchunk="" arena_gb=""
+  if confirm_yn "Enable FP16 decode GEMVs for resident IQ3_S / Q2_0 packs (STRATA_METAL_F16=1)? [Y/n]: " "Y"; then
+    vars+=("STRATA_METAL_F16=1")
+  fi
+  if confirm_yn "Enable rootless GPU temp/power sensors in Strata Monitor (STRATA_MACOS_SENSORS=1, uses private SMC/IOReport APIs)? [y/N]: " "N"; then
+    vars+=("STRATA_MACOS_SENSORS=1")
+  fi
+  read -r -p "Override Metal prompt chunk size (STRATA_METAL_PROMPT_CHUNK, blank for auto): " pchunk || true
+  if [[ -n "$pchunk" ]]; then
+    if [[ "$pchunk" =~ ^[0-9]+$ ]] && (( pchunk >= 256 && pchunk <= 32768 )); then
+      vars+=("STRATA_METAL_PROMPT_CHUNK=${pchunk}")
+    else
+      echo -e "${C_RED}Invalid prompt chunk '${pchunk}' (expected 256-32768). Skipping.${C_RESET}"
+    fi
+  fi
+  read -r -p "Override SSD streaming expert arena size in GB (STRATA_METAL_ARENA_GB, blank for auto): " arena_gb || true
+  if [[ -n "$arena_gb" ]]; then
+    if [[ "$arena_gb" =~ ^[0-9]+$ ]] && (( arena_gb >= 1 && arena_gb <= RAM_GB )); then
+      vars+=("STRATA_METAL_ARENA_GB=${arena_gb}")
+    else
+      echo -e "${C_RED}Invalid arena size '${arena_gb}' (expected 1-${RAM_GB}). Skipping.${C_RESET}"
+    fi
+  fi
+  if (( RAM_GB >= 64 )) && confirm_yn "Disable mlock wiring of the SSD streaming arena (STRATA_METAL_WIRE_ARENA=0)? [y/N]: " "N"; then
+    vars+=("STRATA_METAL_WIRE_ARENA=0")
+  fi
+  if (( ${#vars[@]} == 0 )); then
+    echo -e "${C_YELLOW}No Metal switches selected; nothing written.${C_RESET}"
+    return 0
+  fi
+
+  run_as_user_exec mkdir -p "$(dirname "$MACOS_METAL_ENV_FILE")"
+  : | run_as_user_exec tee "$MACOS_METAL_ENV_FILE" >/dev/null
+  : | run_as_user_exec tee "$MACOS_METAL_ENV_SH" >/dev/null
+  local kv
+  for kv in "${vars[@]}"; do
+    printf '%s\n' "$kv" | run_as_user_exec tee -a "$MACOS_METAL_ENV_FILE" >/dev/null
+    printf 'export %s\n' "$kv" | run_as_user_exec tee -a "$MACOS_METAL_ENV_SH" >/dev/null
+  done
+  if [[ -t 0 ]] && confirm_yn "Also source ${MACOS_METAL_ENV_SH} from ~/.zprofile for interactive shells? [y/N]: " "N"; then
+    local zprof="$TARGET_HOME/.zprofile"
+    local hook="[ -r \"${MACOS_METAL_ENV_SH}\" ] && . \"${MACOS_METAL_ENV_SH}\" # strata-metal-env"
+    _strip_shell_hook_line "$zprof" "# strata-metal-env"
+    printf '%s\n' "$hook" | run_as_user_exec tee -a "$zprof" >/dev/null
+  fi
+  echo -e "${C_GREEN}Saved Strata Metal switches to ${MACOS_METAL_ENV_FILE}.${C_RESET}"
+  if strata_service_installed; then
+    echo -e "${C_YELLOW}Note: Restart com.strata.server from [STRATA] -> Service so launchd picks up the updated Metal switches.${C_RESET}"
+  fi
+}
+revert_macos_metal_tuning() {
+  run_as_user_exec rm -f "$MACOS_METAL_ENV_FILE" "$MACOS_METAL_ENV_SH"
+  _strip_shell_hook_line "$TARGET_HOME/.zprofile" "# strata-metal-env"
+  _strip_shell_hook_line "$TARGET_HOME/.bash_profile" "# strata-metal-env"
+  if [[ "$HAS_LAUNCHD" == true ]]; then
+    local _sc _lb _pl _rn _tmp=""
+    IFS='|' read -r _sc _lb _pl _rn <<< "$(_launchd_meta strata.service)"
+    if [[ -f "$_rn" ]] && grep -qE '^export STRATA_(METAL_|MACOS_SENSORS=)' "$_rn" 2>/dev/null; then
+      if _tmp="$(awk '!/^export STRATA_(METAL_|MACOS_SENSORS=)/ {print}' "$_rn")"; then
+        printf '%s\n' "$_tmp" | run_as_user_exec tee "$_rn" >/dev/null
+        run_as_user_exec chmod 755 "$_rn"
+      fi
+    fi
+  fi
+  echo -e "${C_GREEN}Removed Strata Metal engine environment overrides.${C_RESET}"
+}
+
 # 13. Strata Manager
+strata_service_label() {
+  if [[ "$HAS_LAUNCHD" == true ]]; then
+    echo "com.strata.server"
+  else
+    echo "strata.service"
+  fi
+}
 applicable_strata_manager() { return 0; }
-title_strata_manager() { echo "Strata: Install, Update, Launch & Systemd Service"; }
+title_strata_manager() {
+  if [[ "$HAS_LAUNCHD" == true ]]; then
+    echo "Strata: Install, Update, Launch & launchd Service"
+  else
+    echo "Strata: Install, Update, Launch & Systemd Service"
+  fi
+}
 strata_service_installed() { service_installed strata.service; }
 
 strata_components_engine_dir() {
@@ -5326,13 +6395,17 @@ _refresh_local_hip_engine_cache() {
     local IFS=','
     missing_key="${AMD_MISSING_GFX_ARCHS[*]}"
   fi
-  mtime_sig="$(stat -c '%n:%Y:%s' "$eng_dir" "$eng_dir"/*/engine-component.json 2>/dev/null || true)"
+  if [[ "$IS_MACOS" == true ]]; then
+    mtime_sig="$(stat -f '%N:%m:%z' "$eng_dir" "$eng_dir"/*/engine-component.json 2>/dev/null || true)"
+  else
+    mtime_sig="$(stat -c '%n:%Y:%s' "$eng_dir" "$eng_dir"/*/engine-component.json 2>/dev/null || true)"
+  fi
   ckey="${eng_dir}|${missing_key}|${mtime_sig}"
   [[ "$ckey" == "$LOCAL_HIP_INFO_CACHE_KEY" ]] && return 0
 
   LOCAL_HIP_INFO_CACHE_MATCH=""
   LOCAL_HIP_INFO_CACHE_ANY=""
-  if command -v python3 >/dev/null 2>&1; then
+  if has_working_python3; then
     local py_out="" line=""
     py_out="$(python3 - "$eng_dir" "${AMD_MISSING_GFX_ARCHS[@]+"${AMD_MISSING_GFX_ARCHS[@]}"}" <<'PY' 2>/dev/null || true
 import json, os, re, sys
@@ -5431,7 +6504,7 @@ check_strata_update_sync() {
   [[ -n "$STRATA_BIN" ]] || return 1
   local json_out parsed=""
   json_out="$(run_as_user_exec "$STRATA_BIN" update --check --json 2>/dev/null || true)"
-  if [[ -n "$json_out" ]] && command -v python3 >/dev/null 2>&1; then
+  if [[ -n "$json_out" ]] && has_working_python3; then
     parsed="$(python3 -c '
 import json, sys
 try:
@@ -5525,15 +6598,21 @@ strata_update_available() {
 }
 
 wait_for_strata_model_live() {
-  local max_wait="${1:-120}" elapsed=0 json_out ready_profile=""
+  local max_wait="${1:-120}" elapsed=0 json_out ready_profile="" svc_lbl log_hint=""
+  svc_lbl="$(strata_service_label)"
+  if [[ "$HAS_SYSTEMD" == true ]]; then
+    log_hint=" (check 'journalctl -u strata -n 50')"
+  elif [[ "$HAS_LAUNCHD" == true ]]; then
+    log_hint=" (check '${TARGET_HOME}/Library/Logs/strata.err.log')"
+  fi
   echo -e "${C_DIM}Waiting for Strata model to become ready...${C_RESET}"
   while (( elapsed < max_wait )); do
     if ! unit_active strata.service; then
-      echo -e "${C_RED}strata.service is not active (check 'journalctl -u strata -n 50').${C_RESET}"
+      echo -e "${C_RED}${svc_lbl} is not active${log_hint}.${C_RESET}"
       return 1
     fi
     json_out="$(run_as_user_exec "$STRATA_BIN" update --check --json 2>/dev/null || true)"
-    if [[ -n "$json_out" ]] && command -v python3 >/dev/null 2>&1; then
+    if [[ -n "$json_out" ]] && has_working_python3; then
       ready_profile="$(python3 -c '
 import json, sys
 try:
@@ -5554,7 +6633,7 @@ for s in d.get("serving") or []:
     ((elapsed += 2))
   done
   if unit_active strata.service; then
-    echo -e "${C_GREEN}strata.service is active (model readiness not reported via JSON within ${max_wait}s).${C_RESET}"
+    echo -e "${C_GREEN}${svc_lbl} is active (model readiness not reported via JSON within ${max_wait}s).${C_RESET}"
     return 0
   fi
   return 1
@@ -5611,8 +6690,10 @@ perform_strata_update() {
   # to release the component-folder lock before running 'strata update --yes'.
   stop_strata_update_poller
 
+  local svc_lbl
+  svc_lbl="$(strata_service_label)"
   if [[ "$was_active" == true ]]; then
-    echo -e "\n${C_CYAN}Stopping strata.service before updating...${C_RESET}"
+    echo -e "\n${C_CYAN}Stopping ${svc_lbl} before updating...${C_RESET}"
     service_ctl stop strata.service || true
     if ! wait_for_strata_stopped 60; then
       start_strata_update_poller
@@ -5652,19 +6733,22 @@ perform_strata_update() {
   fi
 
   if [[ "$was_active" == true ]]; then
-    echo -e "\n${C_CYAN}Restarting strata.service...${C_RESET}"
+    echo -e "\n${C_CYAN}Restarting ${svc_lbl}...${C_RESET}"
     if service_ctl start strata.service; then
       wait_for_strata_model_live 120
     else
-      echo -e "${C_RED}Failed to start strata.service$([[ "$HAS_SYSTEMD" == true ]] && echo " (check 'journalctl -u strata -n 50')").${C_RESET}"
+      local log_hint=""
+      [[ "$HAS_SYSTEMD" == true ]] && log_hint=" (check 'journalctl -u strata -n 50')"
+      [[ "$HAS_LAUNCHD" == true ]] && log_hint=" (check '${TARGET_HOME}/Library/Logs/strata.err.log')"
+      echo -e "${C_RED}Failed to start ${svc_lbl}${log_hint}.${C_RESET}"
     fi
   elif strata_service_installed; then
     echo ""
-    if confirm_yn "strata.service is installed but was stopped. Start it now? [y/N]: " "N"; then
+    if confirm_yn "${svc_lbl} is installed but was stopped. Start it now? [y/N]: " "N"; then
       if service_ctl start strata.service; then
         wait_for_strata_model_live 120
       else
-        echo -e "${C_RED}Failed to start strata.service.${C_RESET}"
+        echo -e "${C_RED}Failed to start ${svc_lbl}.${C_RESET}"
       fi
     fi
   fi
@@ -5672,10 +6756,29 @@ perform_strata_update() {
   start_strata_update_poller
 }
 format_strata_hw_warnings() {
+  if [[ "$IS_MACOS" == true ]]; then
+    if [[ "$IS_APPLE_SILICON" == false ]]; then
+      echo -e "${C_RED}[WARNING] Intel Macs (x86_64) are not supported by Strata for macOS. Upstream Strata requires Apple Silicon (M1 or newer).${C_RESET}"
+      return 0
+    fi
+    if (( MACOS_MAJOR > 0 && MACOS_MAJOR < 15 )); then
+      echo -e "${C_RED}[WARNING] Detected macOS ${MACOS_VER}. Strata's Metal engine requires macOS 15 or newer (Metal residency sets).${C_RESET}"
+    fi
+    if (( RAM_GB > 0 && RAM_GB < 16 )); then
+      echo -e "${C_YELLOW}[WARNING] Unified memory is ${RAM_GB} GiB (< 16 GiB). Strata models require at least 16 GiB unified memory.${C_RESET}"
+    elif (( RAM_GB >= 16 && RAM_GB < 64 )); then
+      echo -e "${C_YELLOW}[NOTE] Unified memory is ${RAM_GB} GiB (16-48 GiB tier): Strata streams experts from the internal SSD. Keep models on the internal SSD and apply Spotlight exclusion.${C_RESET}"
+    fi
+    return 0
+  fi
+
   if (( RAM_GB > 0 && RAM_GB < 32 )); then
     echo -e "${C_YELLOW}[WARNING] System RAM is ${RAM_GB} GiB (< 32 GiB). Larger Strata models may not fit or may swap.${C_RESET}"
   fi
   if [[ "$IS_JETSON" == true ]]; then
+    return 0
+  elif [[ "$IS_ASAHI_LINUX" == true && "$HAS_NVIDIA" == false && "$HAS_AMD" == false && "$HAS_INTEL_ARC" == false ]]; then
+    echo -e "${C_YELLOW}[NOTE] Apple Silicon on Linux (Asahi) detected. Upstream Strata's Apple Silicon Metal engine currently requires macOS 15+ (Linux ARM64 prebuilt engines target DGX Spark CUDA).${C_RESET}"
     return 0
   elif [[ "$HAS_NVIDIA" == false && "$HAS_AMD" == false && "$HAS_INTEL_ARC" == false ]]; then
     echo -e "${C_YELLOW}[WARNING] No dedicated NVIDIA, AMD Radeon, or Intel Arc GPU detected (${GPU_SUMMARY}). Strata models may not run.${C_RESET}"
@@ -5700,11 +6803,13 @@ format_strata_hw_warnings() {
 
 status_strata_manager() { [[ -n "$STRATA_BIN" ]] && strata_service_installed; }
 explain_strata_manager() {
-  cat <<'EOF'
+  local svc_lbl
+  svc_lbl="$(strata_service_label)"
+  cat <<EOF
 Impact:
   Installs Strata (Niko1221/Strata), checks for updates ('strata update'),
   runs 'strata launch', benchmarks running instances ('strata bench run'),
-  and installs/uninstalls strata.service using a saved preset.
+  and installs/uninstalls ${svc_lbl} using a saved preset.
 EOF
   local hw_warns=""
   hw_warns="$(format_strata_hw_warnings)"
@@ -5733,7 +6838,11 @@ install_strata_service_fn() {
     echo -e "${C_YELLOW}No saved Strata presets found. Run 'strata launch' first to save a preset.${C_RESET}"
     return 1
   fi
-  echo -e "\n${C_BOLD}Select a Strata preset for systemd service:${C_RESET}"
+  local svc_mgr="systemd" svc_lbl
+  svc_lbl="$(strata_service_label)"
+  [[ "$HAS_LAUNCHD" == true ]] && svc_mgr="launchd"
+  [[ "$HAS_SYSTEMD" == false && "$HAS_LAUNCHD" == false ]] && svc_mgr="service"
+  echo -e "\n${C_BOLD}Select a Strata preset for ${svc_mgr} service:${C_RESET}"
   for line in "${presets[@]}"; do echo "  $i) $line"; ((i++)); done
   read -r -p "Preset number [1-${#presets[@]}]: " choice
   if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#presets[@]} )); then
@@ -5769,7 +6878,7 @@ SyslogIdentifier=strata
 [Install]
 WantedBy=multi-user.target
 EOF
-  echo -e "${C_GREEN}strata.service installed and started with preset '${selected_preset}'.${C_RESET}"
+  echo -e "${C_GREEN}${svc_lbl} installed and started with preset '${selected_preset}'.${C_RESET}"
 }
 format_avg_power_str() {
   local sys_w="${1:-}" gpu_w="${2:-}" cpu_w="${3:-}"
@@ -5799,7 +6908,7 @@ find_latest_results_json() {
     for f in "$d"/*/results.json "$d"/results.json; do
       [[ -r "$f" ]] || continue
       if (( min_mtime > 0 )); then
-        fm="$(stat -c '%Y' "$f" 2>/dev/null || echo 0)"
+        fm="$(file_mtime "$f")"
         (( fm >= min_mtime )) || continue
       fi
       if [[ -z "$newest" || "$f" -nt "$newest" ]]; then
@@ -5853,156 +6962,206 @@ start_bench_power_sampler() {
   local out_file="$1"
   (
     local n=0 gpu_sum="0" cpu_sum="0" sys_sum="0" gpu_n=0 cpu_n=0 sys_n=0
-    local prev_uj="" prev_us="" rapl_f="/sys/class/powercap/intel-rapl:0/energy_uj" rapl_mode="none"
-    local -A prev_intel_uj=() prev_intel_us=()
-    if [[ -r "$rapl_f" ]]; then
-      rapl_mode="direct"
-    elif [[ -e "$rapl_f" ]] && sudo -n true >/dev/null 2>&1; then
-      rapl_mode="sudo"
-    fi
     local stop=false
     trap 'stop=true' TERM INT USR1
-    while [[ "$stop" == false ]]; do
-      local gw="0" has_g=false
-      if [[ "$HAS_NVIDIA" == true ]] && command -v nvidia-smi >/dev/null 2>&1; then
-        local nv_p
-        nv_p="$(nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits 2>/dev/null | awk '{if($1~/^[0-9]+(\.[0-9]+)?$/){s+=$1; c++}} END{if(c>0) printf "%.2f", s}')"
-        if [[ -n "$nv_p" ]]; then gw="$nv_p"; has_g=true; fi
+    if [[ "$IS_MACOS" == true ]]; then
+      local can_pm=false pm_prefix=()
+      if command -v powermetrics >/dev/null 2>&1; then
+        if [[ $EUID -eq 0 ]]; then
+          can_pm=true
+        elif sudo -n true >/dev/null 2>&1; then
+          can_pm=true
+          pm_prefix=(sudo -n)
+        fi
       fi
-      if [[ "$HAS_AMD" == true ]]; then
-        local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}" card_dir hwmon_dir pa
-        for card_dir in "${drm_dir}"/card[0-9]*/device; do
-          for hwmon_dir in "$card_dir"/hwmon/hwmon*; do
-            if [[ -r "$hwmon_dir/power1_average" ]]; then
-              pa="$(cat "$hwmon_dir/power1_average" 2>/dev/null || echo 0)"
-              if [[ "$pa" =~ ^[0-9]+$ ]] && (( pa > 0 )); then
-                gw="$(awk -v a="$gw" -v b="$pa" 'BEGIN{printf "%.2f", a + b/1000000.0}')"
-                has_g=true
-                break
-              fi
+      while [[ "$stop" == false ]]; do
+        if [[ "$can_pm" == true ]]; then
+          local pm_out pm_parsed pg pc ps
+          pm_out="$("${pm_prefix[@]}" powermetrics -n 1 -i 250 --samplers cpu_power,gpu_power 2>/dev/null || true)"
+          if [[ -n "$pm_out" ]]; then
+            pm_parsed="$(awk '
+              /GPU Power:/ { if (match($0, /[0-9]+(\.[0-9]+)?[[:space:]]*m?W/)) { s=substr($0, RSTART, RLENGTH); v=s+0; gp=(s ~ /mW/) ? v/1000.0 : v } }
+              /CPU Power:/ { if (match($0, /[0-9]+(\.[0-9]+)?[[:space:]]*m?W/)) { s=substr($0, RSTART, RLENGTH); v=s+0; cp=(s ~ /mW/) ? v/1000.0 : v } }
+              /ANE Power:/ { if (match($0, /[0-9]+(\.[0-9]+)?[[:space:]]*m?W/)) { s=substr($0, RSTART, RLENGTH); v=s+0; anep=(s ~ /mW/) ? v/1000.0 : v } }
+              /Combined Power/ { if (match($0, /[0-9]+(\.[0-9]+)?[[:space:]]*m?W/)) { s=substr($0, RSTART, RLENGTH); v=s+0; sp=(s ~ /mW/) ? v/1000.0 : v } }
+              END {
+                if (sp == "" && gp != "" && cp != "") sp = gp + cp + anep
+                printf "%s|%s|%s", (gp!=""?sprintf("%.2f",gp):""), (cp!=""?sprintf("%.2f",cp):""), (sp!=""?sprintf("%.2f",sp):"")
+              }
+            ' <<< "$pm_out")"
+            IFS='|' read -r pg pc ps <<< "$pm_parsed"
+            if [[ -n "$pg" ]]; then
+              gpu_sum="$(awk -v a="$gpu_sum" -v b="$pg" 'BEGIN{printf "%.2f", a + b}')"
+              ((gpu_n++))
             fi
-          done
-        done
-      fi
-      if [[ "$HAS_INTEL_ARC" == true ]]; then
-        local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}" card_dir hwmon_dir ven did pa e_uj e_us de dt_us
-        for card_dir in "${drm_dir}"/card[0-9]*/device; do
-          [[ -r "$card_dir/vendor" && -r "$card_dir/device" ]] || continue
-          ven="$(tr '[:upper:]' '[:lower:]' < "$card_dir/vendor" 2>/dev/null || true)"
-          [[ "$ven" == "0x8086" ]] || continue
-          did="$(tr '[:upper:]' '[:lower:]' < "$card_dir/device" 2>/dev/null || true)"
-          _is_intel_discrete_pci_id "$did" || continue
-          for hwmon_dir in "$card_dir"/hwmon/hwmon*; do
-            if [[ -r "$hwmon_dir/power1_average" ]]; then
-              pa="$(cat "$hwmon_dir/power1_average" 2>/dev/null || echo 0)"
-              if [[ "$pa" =~ ^[0-9]+$ ]] && (( pa > 0 )); then
-                gw="$(awk -v a="$gw" -v b="$pa" 'BEGIN{printf "%.2f", a + b/1000000.0}')"
-                has_g=true
-                break
-              fi
-            elif [[ -r "$hwmon_dir/energy1_input" ]]; then
-              e_uj="$(cat "$hwmon_dir/energy1_input" 2>/dev/null || true)"
-              e_us="$(date +%s%6N 2>/dev/null || true)"
-              if [[ "$e_uj" =~ ^[0-9]+$ && "$e_us" =~ ^[0-9]+$ ]]; then
-                if [[ -n "${prev_intel_uj[$hwmon_dir]:-}" && -n "${prev_intel_us[$hwmon_dir]:-}" ]]; then
-                  de=$(( e_uj - prev_intel_uj[$hwmon_dir] ))
-                  dt_us=$(( e_us - prev_intel_us[$hwmon_dir] ))
-                  if (( de >= 0 && dt_us > 0 )); then
-                    gw="$(awk -v a="$gw" -v de="$de" -v dt="$dt_us" 'BEGIN{printf "%.2f", a + (de/dt)}')"
-                    has_g=true
-                  fi
-                fi
-                prev_intel_uj[$hwmon_dir]="$e_uj"
-                prev_intel_us[$hwmon_dir]="$e_us"
-                break
-              fi
-            fi
-          done
-        done
-      fi
-      if [[ "$has_g" == true ]]; then
-        gpu_sum="$(awk -v a="$gpu_sum" -v b="$gw" 'BEGIN{printf "%.2f", a + b}')"
-        ((gpu_n++))
-      fi
-      if [[ "$IS_JETSON" == true ]]; then
-        local j_sw="" j_gw="" j_cw=""
-        IFS='|' read -r j_sw j_gw j_cw <<< "$(read_jetson_ina3221_watts)"
-        if [[ "$has_g" == false && -n "$j_gw" ]]; then
-          gpu_sum="$(awk -v a="$gpu_sum" -v b="$j_gw" 'BEGIN{printf "%.2f", a + b}')"
-          ((gpu_n++))
-        fi
-        if [[ -n "$j_cw" ]]; then
-          cpu_sum="$(awk -v a="$cpu_sum" -v b="$j_cw" 'BEGIN{printf "%.2f", a + b}')"
-          ((cpu_n++))
-        fi
-        if [[ -n "$j_sw" ]]; then
-          sys_sum="$(awk -v a="$sys_sum" -v b="$j_sw" 'BEGIN{printf "%.2f", a + b}')"
-          ((sys_n++))
-        fi
-      fi
-
-      if [[ "$rapl_mode" != "none" ]]; then
-        local uj us
-        if [[ "$rapl_mode" == "direct" ]]; then
-          uj="$(cat "$rapl_f" 2>/dev/null || true)"
-        else
-          uj="$(sudo -n cat "$rapl_f" 2>/dev/null || true)"
-        fi
-        us="$(date +%s%6N 2>/dev/null || true)"
-        if [[ "$uj" =~ ^[0-9]+$ && "$us" =~ ^[0-9]+$ ]]; then
-          if [[ -n "$prev_uj" && -n "$prev_us" ]]; then
-            local de=$((uj - prev_uj)) dt=$((us - prev_us))
-            if (( de >= 0 && dt > 0 )); then
-              cpu_sum="$(awk -v a="$cpu_sum" -v de="$de" -v dt="$dt" 'BEGIN{printf "%.2f", a + (de/dt)}')"
+            if [[ -n "$pc" ]]; then
+              cpu_sum="$(awk -v a="$cpu_sum" -v b="$pc" 'BEGIN{printf "%.2f", a + b}')"
               ((cpu_n++))
             fi
-          fi
-          prev_uj="$uj"; prev_us="$us"
-        fi
-      fi
-
-      local sw="" hm_dir hm_name pf uw
-      for hm_dir in /sys/class/hwmon/hwmon*; do
-        [[ -r "$hm_dir/name" ]] || continue
-        hm_name="$(cat "$hm_dir/name" 2>/dev/null || true)"
-        case "$hm_name" in
-          corsair-psu|acpi_power_meter|power_meter)
-            for pf in "$hm_dir"/power1_input "$hm_dir"/power1_average; do
-              if [[ -r "$pf" ]]; then
-                uw="$(cat "$pf" 2>/dev/null || echo 0)"
-                [[ "$uw" =~ ^[0-9]+$ ]] && (( uw > 0 )) && { sw="$(awk -v u="$uw" 'BEGIN{printf "%.2f", u/1000000.0}')"; break 2; }
-              fi
-            done
-            ;;
-        esac
-      done
-      if [[ -z "$sw" ]]; then
-        local bat_d bat_st cur_ua volt_uv
-        for bat_d in /sys/class/power_supply/BAT*; do
-          [[ -d "$bat_d" ]] || continue
-          if [[ -r "$bat_d/power_now" ]]; then
-            uw="$(cat "$bat_d/power_now" 2>/dev/null || echo 0)"
-            [[ "$uw" =~ ^[0-9]+$ ]] && (( uw > 0 )) && { sw="$(awk -v u="$uw" 'BEGIN{printf "%.2f", u/1000000.0}')"; break; }
-          elif [[ -r "$bat_d/current_now" && -r "$bat_d/voltage_now" ]]; then
-            bat_st="$(cat "$bat_d/status" 2>/dev/null || true)"
-            cur_ua="$(cat "$bat_d/current_now" 2>/dev/null || echo 0)"
-            volt_uv="$(cat "$bat_d/voltage_now" 2>/dev/null || echo 0)"
-            if [[ "$bat_st" == "Discharging" && "$cur_ua" =~ ^[0-9]+$ && "$volt_uv" =~ ^[0-9]+$ ]] && (( cur_ua > 0 && volt_uv > 0 )); then
-              sw="$(awk -v c="$cur_ua" -v v="$volt_uv" 'BEGIN{printf "%.2f", (c/1000000.0)*(v/1000000.0)}')"
-              break
+            if [[ -n "$ps" ]]; then
+              sys_sum="$(awk -v a="$sys_sum" -v b="$ps" 'BEGIN{printf "%.2f", a + b}')"
+              ((sys_n++))
             fi
           fi
-        done
+          ((n++))
+          (sleep 0.1 2>/dev/null || sleep 1) &
+          wait $! 2>/dev/null || true
+        else
+          ((n++))
+          (sleep 0.5 2>/dev/null || sleep 1) &
+          wait $! 2>/dev/null || true
+        fi
+      done
+    else
+      local prev_uj="" prev_us="" rapl_f="/sys/class/powercap/intel-rapl:0/energy_uj" rapl_mode="none"
+      local -A prev_intel_uj=() prev_intel_us=()
+      if [[ -r "$rapl_f" ]]; then
+        rapl_mode="direct"
+      elif [[ -e "$rapl_f" ]] && sudo -n true >/dev/null 2>&1; then
+        rapl_mode="sudo"
       fi
-      if [[ -n "$sw" ]]; then
-        sys_sum="$(awk -v a="$sys_sum" -v b="$sw" 'BEGIN{printf "%.2f", a + b}')"
-        ((sys_n++))
-      fi
+      while [[ "$stop" == false ]]; do
+        local gw="0" has_g=false
+        if [[ "$HAS_NVIDIA" == true ]] && command -v nvidia-smi >/dev/null 2>&1; then
+          local nv_p
+          nv_p="$(nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits 2>/dev/null | awk '{if($1~/^[0-9]+(\.[0-9]+)?$/){s+=$1; c++}} END{if(c>0) printf "%.2f", s}')"
+          if [[ -n "$nv_p" ]]; then gw="$nv_p"; has_g=true; fi
+        fi
+        if [[ "$HAS_AMD" == true ]]; then
+          local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}" card_dir hwmon_dir pa
+          for card_dir in "${drm_dir}"/card[0-9]*/device; do
+            for hwmon_dir in "$card_dir"/hwmon/hwmon*; do
+              if [[ -r "$hwmon_dir/power1_average" ]]; then
+                pa="$(cat "$hwmon_dir/power1_average" 2>/dev/null || echo 0)"
+                if [[ "$pa" =~ ^[0-9]+$ ]] && (( pa > 0 )); then
+                  gw="$(awk -v a="$gw" -v b="$pa" 'BEGIN{printf "%.2f", a + b/1000000.0}')"
+                  has_g=true
+                  break
+                fi
+              fi
+            done
+          done
+        fi
+        if [[ "$HAS_INTEL_ARC" == true ]]; then
+          local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}" card_dir hwmon_dir ven did pa e_uj e_us de dt_us
+          for card_dir in "${drm_dir}"/card[0-9]*/device; do
+            [[ -r "$card_dir/vendor" && -r "$card_dir/device" ]] || continue
+            ven="$(tr '[:upper:]' '[:lower:]' < "$card_dir/vendor" 2>/dev/null || true)"
+            [[ "$ven" == "0x8086" ]] || continue
+            did="$(tr '[:upper:]' '[:lower:]' < "$card_dir/device" 2>/dev/null || true)"
+            _is_intel_discrete_pci_id "$did" || continue
+            for hwmon_dir in "$card_dir"/hwmon/hwmon*; do
+              if [[ -r "$hwmon_dir/power1_average" ]]; then
+                pa="$(cat "$hwmon_dir/power1_average" 2>/dev/null || echo 0)"
+                if [[ "$pa" =~ ^[0-9]+$ ]] && (( pa > 0 )); then
+                  gw="$(awk -v a="$gw" -v b="$pa" 'BEGIN{printf "%.2f", a + b/1000000.0}')"
+                  has_g=true
+                  break
+                fi
+              elif [[ -r "$hwmon_dir/energy1_input" ]]; then
+                e_uj="$(cat "$hwmon_dir/energy1_input" 2>/dev/null || true)"
+                e_us="$(date +%s%6N 2>/dev/null || true)"
+                if [[ "$e_uj" =~ ^[0-9]+$ && "$e_us" =~ ^[0-9]+$ ]]; then
+                  if [[ -n "${prev_intel_uj[$hwmon_dir]:-}" && -n "${prev_intel_us[$hwmon_dir]:-}" ]]; then
+                    de=$(( e_uj - prev_intel_uj[$hwmon_dir] ))
+                    dt_us=$(( e_us - prev_intel_us[$hwmon_dir] ))
+                    if (( de >= 0 && dt_us > 0 )); then
+                      gw="$(awk -v a="$gw" -v de="$de" -v dt="$dt_us" 'BEGIN{printf "%.2f", a + (de/dt)}')"
+                      has_g=true
+                    fi
+                  fi
+                  prev_intel_uj[$hwmon_dir]="$e_uj"
+                  prev_intel_us[$hwmon_dir]="$e_us"
+                  break
+                fi
+              fi
+            done
+          done
+        fi
+        if [[ "$has_g" == true ]]; then
+          gpu_sum="$(awk -v a="$gpu_sum" -v b="$gw" 'BEGIN{printf "%.2f", a + b}')"
+          ((gpu_n++))
+        fi
+        if [[ "$IS_JETSON" == true ]]; then
+          local j_sw="" j_gw="" j_cw=""
+          IFS='|' read -r j_sw j_gw j_cw <<< "$(read_jetson_ina3221_watts)"
+          if [[ "$has_g" == false && -n "$j_gw" ]]; then
+            gpu_sum="$(awk -v a="$gpu_sum" -v b="$j_gw" 'BEGIN{printf "%.2f", a + b}')"
+            ((gpu_n++))
+          fi
+          if [[ -n "$j_cw" ]]; then
+            cpu_sum="$(awk -v a="$cpu_sum" -v b="$j_cw" 'BEGIN{printf "%.2f", a + b}')"
+            ((cpu_n++))
+          fi
+          if [[ -n "$j_sw" ]]; then
+            sys_sum="$(awk -v a="$sys_sum" -v b="$j_sw" 'BEGIN{printf "%.2f", a + b}')"
+            ((sys_n++))
+          fi
+        fi
 
-      ((n++))
-      (sleep 0.25 2>/dev/null || sleep 1) &
-      wait $! 2>/dev/null || true
-    done
+        if [[ "$rapl_mode" != "none" ]]; then
+          local uj us
+          if [[ "$rapl_mode" == "direct" ]]; then
+            uj="$(cat "$rapl_f" 2>/dev/null || true)"
+          else
+            uj="$(sudo -n cat "$rapl_f" 2>/dev/null || true)"
+          fi
+          us="$(date +%s%6N 2>/dev/null || true)"
+          if [[ "$uj" =~ ^[0-9]+$ && "$us" =~ ^[0-9]+$ ]]; then
+            if [[ -n "$prev_uj" && -n "$prev_us" ]]; then
+              local de=$((uj - prev_uj)) dt=$((us - prev_us))
+              if (( de >= 0 && dt > 0 )); then
+                cpu_sum="$(awk -v a="$cpu_sum" -v de="$de" -v dt="$dt" 'BEGIN{printf "%.2f", a + (de/dt)}')"
+                ((cpu_n++))
+              fi
+            fi
+            prev_uj="$uj"; prev_us="$us"
+          fi
+        fi
+
+        local sw="" hm_dir hm_name pf uw
+        for hm_dir in /sys/class/hwmon/hwmon*; do
+          [[ -r "$hm_dir/name" ]] || continue
+          hm_name="$(cat "$hm_dir/name" 2>/dev/null || true)"
+          case "$hm_name" in
+            corsair-psu|acpi_power_meter|power_meter)
+              for pf in "$hm_dir"/power1_input "$hm_dir"/power1_average; do
+                if [[ -r "$pf" ]]; then
+                  uw="$(cat "$pf" 2>/dev/null || echo 0)"
+                  [[ "$uw" =~ ^[0-9]+$ ]] && (( uw > 0 )) && { sw="$(awk -v u="$uw" 'BEGIN{printf "%.2f", u/1000000.0}')"; break 2; }
+                fi
+              done
+              ;;
+          esac
+        done
+        if [[ -z "$sw" ]]; then
+          local bat_d bat_st cur_ua volt_uv
+          for bat_d in /sys/class/power_supply/BAT*; do
+            [[ -d "$bat_d" ]] || continue
+            if [[ -r "$bat_d/power_now" ]]; then
+              uw="$(cat "$bat_d/power_now" 2>/dev/null || echo 0)"
+              [[ "$uw" =~ ^[0-9]+$ ]] && (( uw > 0 )) && { sw="$(awk -v u="$uw" 'BEGIN{printf "%.2f", u/1000000.0}')"; break; }
+            elif [[ -r "$bat_d/current_now" && -r "$bat_d/voltage_now" ]]; then
+              bat_st="$(cat "$bat_d/status" 2>/dev/null || true)"
+              cur_ua="$(cat "$bat_d/current_now" 2>/dev/null || echo 0)"
+              volt_uv="$(cat "$bat_d/voltage_now" 2>/dev/null || echo 0)"
+              if [[ "$bat_st" == "Discharging" && "$cur_ua" =~ ^[0-9]+$ && "$volt_uv" =~ ^[0-9]+$ ]] && (( cur_ua > 0 && volt_uv > 0 )); then
+                sw="$(awk -v c="$cur_ua" -v v="$volt_uv" 'BEGIN{printf "%.2f", (c/1000000.0)*(v/1000000.0)}')"
+                break
+              fi
+            fi
+          done
+        fi
+        if [[ -n "$sw" ]]; then
+          sys_sum="$(awk -v a="$sys_sum" -v b="$sw" 'BEGIN{printf "%.2f", a + b}')"
+          ((sys_n++))
+        fi
+
+        ((n++))
+        (sleep 0.25 2>/dev/null || sleep 1) &
+        wait $! 2>/dev/null || true
+      done
+    fi
 
     local avg_g="" avg_c="" avg_s=""
     (( gpu_n > 0 )) && avg_g="$(awk -v s="$gpu_sum" -v c="$gpu_n" 'BEGIN{printf "%.1f", s/c}')"
@@ -6027,7 +7186,7 @@ stop_bench_power_sampler() {
 
 save_bench_history_entry() {
   local results_file="$1" mode="$2" avg_sys="$3" avg_gpu="$4" avg_cpu="$5" samples="$6" active_csv="$7" applicable_csv="$8"
-  command -v python3 >/dev/null 2>&1 || return 0
+  has_working_python3 || return 0
   local hist_dir
   hist_dir="$(dirname "$STRATA_BENCH_HISTORY_FILE")"
   run_as_user_exec mkdir -p "$hist_dir" 2>/dev/null || mkdir -p "$hist_dir"
@@ -6195,11 +7354,11 @@ PY
 }
 
 count_bench_history() {
-  command -v python3 >/dev/null 2>&1 || { echo 0; return 0; }
+  has_working_python3 || { echo 0; return 0; }
   local newest="" hist_mtime="0" newest_mtime="0" ckey
   newest="$(find_latest_results_json 0)"
-  [[ -r "$STRATA_BENCH_HISTORY_FILE" ]] && hist_mtime="$(stat -c '%Y' "$STRATA_BENCH_HISTORY_FILE" 2>/dev/null || echo 0)"
-  [[ -n "$newest" ]] && newest_mtime="$(stat -c '%Y' "$newest" 2>/dev/null || echo 0)"
+  [[ -r "$STRATA_BENCH_HISTORY_FILE" ]] && hist_mtime="$(file_mtime "$STRATA_BENCH_HISTORY_FILE")"
+  [[ -n "$newest" ]] && newest_mtime="$(file_mtime "$newest")"
   ckey="${STRATA_BENCH_HISTORY_FILE}:${hist_mtime}:${newest}:${newest_mtime}"
   if [[ "$ckey" == "$BENCH_HISTORY_COUNT_KEY" ]]; then
     echo "$BENCH_HISTORY_COUNT_CACHE"
@@ -6338,7 +7497,7 @@ show_benchmark_history() {
   local -A HIST_EXPANDED=()
   while true; do
     print_header none true
-    if ! command -v python3 >/dev/null 2>&1; then
+    if ! has_working_python3; then
       echo -e "${C_BOLD}Strata Benchmark History & Coupled Configurations${C_RESET}"
       echo -e "${C_DIM}----------------------------------------------------------------------${C_RESET}"
       echo -e "${C_DIM}python3 is required to parse benchmark results.${C_RESET}"
@@ -6712,7 +7871,7 @@ PY
 
       body+=$'\n'"${_tbl_top}"$'\n'
       local cur_line_no
-      cur_line_no="$(printf "%s" "$body" | wc -l)"
+      cur_line_no="$(printf "%s" "$body" | wc -l | tr -d '[:space:]')"
       HIST_HDR_LINES+=("$((cur_line_no + 1))")
       if (( idx == HIST_SELECTED )); then
         body+="${row_sel}"$'\n'
@@ -6749,7 +7908,7 @@ PY
     body+=$'\n'"$(echo -e "  ${C_DIM}Use [↑/↓] select, [e/Space] expand/collapse, [Enter] or [1-${#rows[@]} + Enter] apply active options, [b/q/Esc] back:${C_RESET}")"$'\n'
     printf "%s" "$body"
     local body_lines lines_up h_choice hi
-    body_lines="$(printf "%s" "$body" | wc -l)"
+    body_lines="$(printf "%s" "$body" | wc -l | tr -d '[:space:]')"
     for (( hi = 0; hi < ${#HIST_HDR_LINES[@]}; hi++ )); do
       HIST_HDR_LINES[$hi]=$(( body_lines - HIST_HDR_LINES[$hi] + 1 ))
     done
@@ -6900,6 +8059,7 @@ run_strata_benchmark() {
 ACTIVE_STRATA_OPTIONS=()
 
 strata_show_build_hip() {
+  [[ "$IS_MACOS" == true ]] && return 1
   (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )) && return 0
   _refresh_local_hip_engine_cache
   [[ -n "$LOCAL_HIP_INFO_CACHE_ANY" ]]
@@ -6919,7 +8079,13 @@ build_strata_options() {
 title_strata_install()   { echo "Install Strata (Niko1221/Strata)"; }
 title_strata_update()    { echo "Update Strata (strata update)"; }
 title_strata_remove()    { echo "Remove Strata & Uninstall Service"; }
-title_strata_service()   { echo "Manage Strata Systemd Service (strata.service)"; }
+title_strata_service()   {
+  if [[ "$HAS_LAUNCHD" == true ]]; then
+    echo "Manage Strata launchd Service (com.strata.server)"
+  else
+    echo "Manage Strata Systemd Service (strata.service)"
+  fi
+}
 title_strata_benchmark() { echo "Run Strata Benchmark (strata bench run)"; }
 title_strata_history()   { echo "View All Benchmark Results & Coupled Options"; }
 title_strata_build_hip() {
@@ -7034,11 +8200,13 @@ strata_action_remove() {
     echo -e "${C_YELLOW}Strata is not installed.${C_RESET}"
     return 0
   fi
-  echo -e "${C_YELLOW}This will stop any running Strata instance, uninstall strata.service (if installed), and remove ${STRATA_BIN:-the Strata binary}.${C_RESET}"
+  local svc_lbl
+  svc_lbl="$(strata_service_label)"
+  echo -e "${C_YELLOW}This will stop any running Strata instance, uninstall ${svc_lbl} (if installed), and remove ${STRATA_BIN:-the Strata binary}.${C_RESET}"
   confirm_yn "Remove Strata now? [y/N]: " "N" || return 0
   stop_strata_update_poller
   if strata_service_installed; then
-    remove_service strata.service && echo -e "${C_GREEN}strata.service uninstalled.${C_RESET}"
+    remove_service strata.service && echo -e "${C_GREEN}${svc_lbl} uninstalled.${C_RESET}"
   fi
   if [[ -n "$STRATA_BIN" ]]; then
     run_as_user_exec "$STRATA_BIN" launch --stop 2>/dev/null || true
@@ -7063,12 +8231,16 @@ strata_action_service() {
     fi
     return 0
   fi
+  local svc_lbl log_hint=""
+  svc_lbl="$(strata_service_label)"
+  [[ "$HAS_SYSTEMD" == true ]] && log_hint=" (check 'journalctl -u strata -n 50')"
+  [[ "$HAS_LAUNCHD" == true ]] && log_hint=" (check '${TARGET_HOME}/Library/Logs/strata.err.log')"
   if strata_service_installed; then
-    echo -e "${C_GREEN}strata.service is installed ($(unit_active strata.service && echo "active" || echo "inactive")).${C_RESET}"
-    echo "  1) Start / Restart strata.service"
-    echo "  2) Stop strata.service"
-    echo "  3) Change preset / reinstall strata.service"
-    echo "  4) Uninstall strata.service"
+    echo -e "${C_GREEN}${svc_lbl} is installed ($(unit_active strata.service && echo "active" || echo "inactive")).${C_RESET}"
+    echo "  1) Start / Restart ${svc_lbl}"
+    echo "  2) Stop ${svc_lbl}"
+    echo "  3) Change preset / reinstall ${svc_lbl}"
+    echo "  4) Uninstall ${svc_lbl}"
     echo "  5) Cancel"
     local svc_choice
     read -r -p "Choose [1-5]: " svc_choice
@@ -7077,29 +8249,29 @@ strata_action_service() {
         if service_ctl restart strata.service; then
           wait_for_strata_model_live 120
         else
-          echo -e "${C_RED}Failed to start strata.service$([[ "$HAS_SYSTEMD" == true ]] && echo " (check 'journalctl -u strata -n 50')").${C_RESET}"
+          echo -e "${C_RED}Failed to start ${svc_lbl}${log_hint}.${C_RESET}"
         fi
         ;;
       2)
-        service_ctl stop strata.service && echo -e "${C_GREEN}strata.service stopped.${C_RESET}"
+        service_ctl stop strata.service && echo -e "${C_GREEN}${svc_lbl} stopped.${C_RESET}"
         ;;
       3) install_strata_service_fn ;;
-      4) remove_service strata.service && echo -e "${C_GREEN}strata.service uninstalled.${C_RESET}" ;;
+      4) remove_service strata.service && echo -e "${C_GREEN}${svc_lbl} uninstalled.${C_RESET}" ;;
       5|"") ;;
       *) echo -e "${C_RED}Invalid selection '${svc_choice}'. Cancelled.${C_RESET}" ;;
     esac
   else
     local preset_count
-    preset_count="$(list_strata_presets | wc -l)"
+    preset_count="$(list_strata_presets | wc -l | tr -d '[:space:]')"
     if (( preset_count == 0 )); then
       echo -e "${C_YELLOW}No saved Strata presets found yet.${C_RESET}"
       if confirm_yn "Launch Strata interactively now ('strata launch') to create a preset? [y/N]: " "N"; then
         run_as_user_exec "$STRATA_BIN" launch
-        preset_count="$(list_strata_presets | wc -l)"
+        preset_count="$(list_strata_presets | wc -l | tr -d '[:space:]')"
       fi
     fi
     if (( preset_count > 0 )); then
-      confirm_yn "Saved presets detected ($preset_count). Install strata.service? [Y/n]: " "Y" && install_strata_service_fn
+      confirm_yn "Saved presets detected ($preset_count). Install ${svc_lbl}? [Y/n]: " "Y" && install_strata_service_fn
     fi
   fi
 }
@@ -7123,12 +8295,14 @@ EOF
 }
 
 explain_strata_update() {
-  cat <<'EOF'
+  local svc_lbl
+  svc_lbl="$(strata_service_label)"
+  cat <<EOF
 Impact:
   Checks whether a newer Strata engine/control release is available and runs
-  'strata update --yes'. Stops strata.service (if active) or any running
+  'strata update --yes'. Stops ${svc_lbl} (if active) or any running
   'strata launch' instance and waits until Strata is fully stopped before
-  updating, then restarts strata.service if it was active.
+  updating, then restarts ${svc_lbl} if it was active.
 EOF
   if [[ -n "$STRATA_BIN" ]]; then
     echo -e "\nInstalled: ${STRATA_VERSION:-$STRATA_BIN}"
@@ -7137,9 +8311,11 @@ EOF
 }
 
 explain_strata_remove() {
-  cat <<'EOF'
+  local svc_lbl
+  svc_lbl="$(strata_service_label)"
+  cat <<EOF
 Impact:
-  Stops any running Strata instance, uninstalls strata.service (if present),
+  Stops any running Strata instance, uninstalls ${svc_lbl} (if present),
   and removes the Strata binary from the host. Saved launch presets and
   coupled benchmark history are preserved.
 EOF
@@ -7147,18 +8323,31 @@ EOF
 }
 
 explain_strata_service() {
-  cat <<'EOF'
+  local svc_lbl
+  svc_lbl="$(strata_service_label)"
+  if [[ "$HAS_LAUNCHD" == true ]]; then
+    cat <<EOF
 Impact:
-  Configures strata.service (systemd) using a saved 'strata launch' preset
+  Configures ${svc_lbl} (launchd LaunchAgent) using a saved 'strata launch'
+  preset with AbandonProcessGroup=true and any configured Metal switches.
+  Lets you start, stop, restart, change preset, or uninstall the service.
+EOF
+  else
+    cat <<EOF
+Impact:
+  Configures ${svc_lbl} (systemd) using a saved 'strata launch' preset
   with LimitMEMLOCK=infinity (and numactl --interleave=all when enabled).
   Lets you start, stop, restart, change preset, or uninstall the service.
 EOF
+  fi
   local preset_count
-  preset_count="$(list_strata_presets | wc -l)"
+  preset_count="$(list_strata_presets | wc -l | tr -d '[:space:]')"
   echo -e "\nSaved presets: ${preset_count}"
 }
 
 explain_strata_benchmark() {
+  local svc_lbl
+  svc_lbl="$(strata_service_label)"
   cat <<'EOF'
 Impact:
   Runs Strata's built-in benchmark ('strata bench run') against the currently
@@ -7171,7 +8360,7 @@ EOF
   if [[ -n "$STRATA_RUNNING_URL" ]]; then
     echo -e "\nActive target: ${STRATA_RUNNING_PRESET:-active} (${STRATA_RUNNING_URL})"
   else
-    echo -e "\n${C_YELLOW}Strata is not currently serving. Start strata.service or 'strata launch' first.${C_RESET}"
+    echo -e "\n${C_YELLOW}Strata is not currently serving. Start ${svc_lbl} or 'strata launch' first.${C_RESET}"
   fi
 }
 
@@ -8144,7 +9333,7 @@ run_strata_option() {
       continue
     fi
     local body_lines lines_up
-    body_lines="$(printf "%s" "$body" | wc -l)"
+    body_lines="$(printf "%s" "$body" | wc -l | tr -d '[:space:]')"
     lines_up=$(( LIVE_STATS_COUNT + POST_HEADER_LINES + body_lines ))
     read_step_action action "$lines_up"
     case "$action" in
@@ -8231,396 +9420,561 @@ print_live_stats() {
   local cpu_pct="" ram_pct="" ram_used_gib="" ram_tot_gib=""
   local gpu_pct="" vram_pct="" vram_used_gib="" vram_tot_gib=""
   local pwr_w="" pwr_lim_w="" pwr_pct="" pwr_label="Power"
-
-  local rapl_file="/sys/class/powercap/intel-rapl:0/energy_uj" rapl_can_read=false
-  if [[ -r "$rapl_file" ]]; then
-    rapl_can_read=true
-  elif [[ -e "$rapl_file" ]] && sudo -n true >/dev/null 2>&1; then
-    rapl_can_read=true
-  fi
-
-  # CPU usage (/proc/stat delta; 150ms sample only on first call)
-  if [[ -r /proc/stat ]]; then
-    local u1 n1 s1 i1 w1 q1 sq1 st1 idle_now tot_now
-    if [[ -z "$PREV_CPU_TOTAL" ]]; then
-      read -r _ u1 n1 s1 i1 w1 q1 sq1 st1 _ < /proc/stat
-      PREV_CPU_IDLE=$((i1 + w1))
-      PREV_CPU_TOTAL=$((u1 + n1 + s1 + PREV_CPU_IDLE + q1 + sq1 + st1))
-      if [[ "$rapl_can_read" == true ]]; then
-        if [[ -r "$rapl_file" ]]; then
-          PREV_RAPL_UJ="$(cat "$rapl_file" 2>/dev/null || true)"
-        else
-          PREV_RAPL_UJ="$(sudo -n cat "$rapl_file" 2>/dev/null || true)"
-        fi
-        PREV_RAPL_US="$(date +%s%6N 2>/dev/null || true)"
-      fi
-      sleep 0.15
-    fi
-    read -r _ u1 n1 s1 i1 w1 q1 sq1 st1 _ < /proc/stat
-    idle_now=$((i1 + w1))
-    tot_now=$((u1 + n1 + s1 + idle_now + q1 + sq1 + st1))
-    local dt=$((tot_now - PREV_CPU_TOTAL)) di=$((idle_now - PREV_CPU_IDLE))
-    if (( dt > 0 )); then
-      cpu_pct=$(( (dt - di) * 100 / dt ))
-      PREV_CPU_TOTAL="$tot_now"
-      PREV_CPU_IDLE="$idle_now"
-    fi
-  fi
-
-  # RAM usage (/proc/meminfo)
-  if [[ -r /proc/meminfo ]]; then
-    local mem_stats
-    mem_stats="$(awk '
-      /^MemTotal:/ {t=$2}
-      /^MemAvailable:/ {a=$2}
-      END {
-        if (t > 0) {
-          u = t - a
-          printf "%d %.1f %.1f", int(u * 100 / t + 0.5), u / 1048576, t / 1048576
-        }
-      }' /proc/meminfo 2>/dev/null || true)"
-    if [[ -n "$mem_stats" ]]; then
-      read -r ram_pct ram_used_gib ram_tot_gib <<< "$mem_stats"
-    fi
-  fi
-
   local gpu_pcts=() vram_pcts=() vram_useds=() vram_tots=() vram_labels=() pwr_ws=() pwr_lim_ws=() pwr_pcts=() gpu_temps=() gpu_notes=() gpu_thr_tags=()
-  local total_gpu_pwr_w="" cpu_temp=""
+  local total_gpu_pwr_w="" cpu_temp="" sys_pwr_w="" cpu_pwr_w=""
+  local rapl_file="/sys/class/powercap/intel-rapl:0/energy_uj" rapl_can_read=false pm_attempted=false
 
-  # GPU, VRAM, Power, and Temp (supports NVIDIA, AMD, Intel Arc, and Jetson)
-  if [[ "$HAS_NVIDIA" == true ]] && command -v nvidia-smi >/dev/null 2>&1; then
-    local nv_lines nv_parsed nv_line
-    nv_lines="$(nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,power.draw,power.limit,temperature.gpu --format=csv,noheader,nounits 2>/dev/null || true)"
-    if [[ -n "$nv_lines" ]]; then
-      local -a nv_pstates=() nv_thr_active=()
-      local nv_extra="" eline ei_pstate ei_hw ei_sw
-      if [[ -z "$NVIDIA_LIVE_EXTRA_FIELDS" ]]; then
-        nv_extra="$(nvidia-smi --query-gpu=pstate,clocks_event_reasons.hw_thermal_slowdown,clocks_event_reasons.sw_thermal_slowdown --format=csv,noheader 2>/dev/null || true)"
-        if [[ -n "$nv_extra" ]] && ! grep -qiE "not a valid|field.*not" <<<"$nv_extra"; then
-          NVIDIA_LIVE_EXTRA_FIELDS="pstate,clocks_event_reasons.hw_thermal_slowdown,clocks_event_reasons.sw_thermal_slowdown"
+  if [[ "$IS_MACOS" == true ]]; then
+    # CPU usage (Mach host_statistics ticks delta, fallback ps aggregate)
+    if [[ "${PREV_CPU_TOTAL:-}" != "unavailable" ]] && has_working_python3; then
+      local _py_cpu_cmd tot_now="" idle_now=""
+      _py_cpu_cmd='import ctypes
+libc = ctypes.CDLL("/usr/lib/libc.dylib")
+class H(ctypes.Structure):
+    _fields_ = [("t", ctypes.c_uint * 4)]
+i = H(); c = ctypes.c_uint(4)
+if libc.host_statistics(libc.mach_host_self(), 3, ctypes.byref(i), ctypes.byref(c)) == 0:
+    u, s, idle, nice = i.t
+    print(f"{u + s + idle + nice} {idle}")'
+      if [[ -z "$PREV_CPU_TOTAL" ]]; then
+        read -r PREV_CPU_TOTAL PREV_CPU_IDLE <<< "$(python3 -c "$_py_cpu_cmd" 2>/dev/null || true)"
+        if [[ -n "$PREV_CPU_TOTAL" ]]; then
+          sleep 0.15
         else
-          nv_extra="$(nvidia-smi --query-gpu=pstate,clocks_throttle_reasons.hw_thermal_slowdown,clocks_throttle_reasons.sw_thermal_slowdown --format=csv,noheader 2>/dev/null || true)"
-          if [[ -n "$nv_extra" ]] && ! grep -qiE "not a valid|field.*not" <<<"$nv_extra"; then
-            NVIDIA_LIVE_EXTRA_FIELDS="pstate,clocks_throttle_reasons.hw_thermal_slowdown,clocks_throttle_reasons.sw_thermal_slowdown"
-          else
-            NVIDIA_LIVE_EXTRA_FIELDS="pstate"
-            nv_extra="$(nvidia-smi --query-gpu=pstate --format=csv,noheader 2>/dev/null || true)"
+          PREV_CPU_TOTAL="unavailable"
+        fi
+      fi
+      if [[ "$PREV_CPU_TOTAL" != "unavailable" ]]; then
+        read -r tot_now idle_now <<< "$(python3 -c "$_py_cpu_cmd" 2>/dev/null || true)"
+        if [[ "$tot_now" =~ ^[0-9]+$ && "$idle_now" =~ ^[0-9]+$ && "$PREV_CPU_TOTAL" =~ ^[0-9]+$ && "$PREV_CPU_IDLE" =~ ^[0-9]+$ ]]; then
+          local dt=$((tot_now - PREV_CPU_TOTAL)) di=$((idle_now - PREV_CPU_IDLE))
+          if (( dt > 0 )); then
+            cpu_pct=$(( (dt - di) * 100 / dt ))
+            (( cpu_pct < 0 )) && cpu_pct=0
+            (( cpu_pct > 100 )) && cpu_pct=100
+            PREV_CPU_TOTAL="$tot_now"
+            PREV_CPU_IDLE="$idle_now"
           fi
         fi
-      else
-        nv_extra="$(nvidia-smi --query-gpu="$NVIDIA_LIVE_EXTRA_FIELDS" --format=csv,noheader 2>/dev/null || true)"
       fi
-      while IFS= read -r eline; do
-        [[ -n "$eline" ]] || continue
-        ei_pstate="" ei_hw="" ei_sw=""
-        IFS=',' read -r ei_pstate ei_hw ei_sw <<< "$eline"
-        ei_pstate="${ei_pstate//[[:space:]]/}"
-        ei_hw="${ei_hw//[[:space:]]/}"
-        ei_sw="${ei_sw//[[:space:]]/}"
-        [[ "$ei_pstate" =~ ^P[0-9]+$ ]] || ei_pstate=""
-        nv_pstates+=("$ei_pstate")
-        if [[ "$ei_hw" == "Active" || "$ei_sw" == "Active" ]]; then
-          nv_thr_active+=("true")
-        else
-          nv_thr_active+=("false")
-        fi
-      done <<< "$nv_extra"
+    fi
+    if [[ -z "$cpu_pct" ]]; then
+      local _ncpu
+      _ncpu="${STRATA_MACOS_THREADS:-${MACOS_CPU_THREADS:-$(sysctl -n hw.logicalcpu 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)}}"
+      [[ "$_ncpu" =~ ^[0-9]+$ && "$_ncpu" -gt 0 ]] || _ncpu=1
+      cpu_pct="$(ps -A -o %cpu= 2>/dev/null | awk -v n="$_ncpu" '{s+=$1} END {p=int(s/n+0.5); if(p<0)p=0; if(p>100)p=100; print p}')"
+    fi
 
-      nv_parsed="$(awk -F', *' '
-        function isnum(s) { return s ~ /^[0-9]+(\.[0-9]+)?$/ }
-        {
-          for (i=1; i<=6; i++) gsub(/ /, "", $i)
-          gp = isnum($1) ? sprintf("%.0f", $1) : ""
-          gt = isnum($6) ? sprintf("%.0f", $6) : ""
-          vp = ""; vu = ""; vt = ""
-          if (isnum($2) && isnum($3) && ($3 + 0) > 0) {
-            vp = sprintf("%.0f", ($2 / $3) * 100)
-            vu = sprintf("%.1f", $2 / 1024)
-            vt = sprintf("%.1f", $3 / 1024)
-          }
-          pw = ""; plw = ""; pp = ""
-          if (isnum($4)) {
-            pw = sprintf("%.0f", $4)
-            if (isnum($5) && ($5 + 0) > 0) {
-              plw = sprintf("%.0f", $5)
-              pp = sprintf("%.0f", ($4 / $5) * 100)
-            }
-          }
-          printf "%s|%s|%s|%s|%s|%s|%s|%s\n", gp, vp, vu, vt, pw, plw, pp, gt
-        }
-      ' <<< "$nv_lines")"
-      local nv_ri=0
-      while IFS= read -r nv_line; do
-        [[ -n "$nv_line" ]] || continue
-        local g_pct="" v_pct="" v_used="" v_tot="" pw="" plw="" ppct="" gtmp="" v_lbl_tag="" g_note="" g_thr=""
-        IFS='|' read -r g_pct v_pct v_used v_tot pw plw ppct gtmp <<< "$nv_line"
-        if [[ "$IS_DGX_SPARK" == true && -z "$v_pct" && -n "$ram_pct" ]]; then
-          v_pct="$ram_pct"
-          v_used="$ram_used_gib"
-          v_tot="$ram_tot_gib"
-          v_lbl_tag="Unified"
+    # RAM usage (vm_stat + hw.memsize)
+    local mem_bytes vm_out
+    mem_bytes="${STRATA_MACOS_RAM_BYTES:-${MACOS_RAM_BYTES:-0}}"
+    if ! [[ "$mem_bytes" =~ ^[0-9]+$ ]] || (( mem_bytes == 0 )); then
+      mem_bytes="$(sysctl -n hw.memsize 2>/dev/null || echo 0)"
+    fi
+    vm_out="$(vm_stat 2>/dev/null || true)"
+    if [[ "$mem_bytes" =~ ^[0-9]+$ && "$mem_bytes" -gt 0 && -n "$vm_out" ]]; then
+      local mem_stats def_ps=4096
+      [[ "$IS_APPLE_SILICON" == true ]] && def_ps=16384
+      mem_stats="$(awk -v tot_b="$mem_bytes" -v def_ps="$def_ps" '
+        /page size of [0-9]+ bytes/ { for(i=1;i<=NF;i++) if($i~/^[0-9]+$/){ps=$i; break} }
+        /^Anonymous pages:/ { gsub(/\./,"",$NF); anon=$NF; has_anon=1 }
+        /^Pages purgeable:/ { gsub(/\./,"",$NF); pur=$NF }
+        /^Pages wired down:/ { gsub(/\./,"",$NF); wired=$NF }
+        /^Pages occupied by compressor:/ { gsub(/\./,"",$NF); comp=$NF }
+        /^Pages active:/ { gsub(/\./,"",$NF); active=$NF }
+        END {
+          if (ps <= 0) ps = def_ps
+          used_p = has_anon ? ((anon - pur) + wired + comp) : (active + wired + comp)
+          if (used_p < 0) used_p = 0
+          u = used_p * ps
+          if (u > tot_b) u = tot_b
+          printf "%d %.1f %.1f", int(u * 100 / tot_b + 0.5), u / 1073741824, tot_b / 1073741824
+        }' <<< "$vm_out")"
+      [[ -n "$mem_stats" ]] && read -r ram_pct ram_used_gib ram_tot_gib <<< "$mem_stats"
+    fi
+
+    # Apple Silicon GPU utilization, unified memory allocation, powermetrics wattage & thermal pressure
+    if [[ "$IS_APPLE_SILICON" == true ]]; then
+      local g_pct="" v_pct="" v_used="" v_tot="" pw="" g_note="" g_thr="" ioreg_out="" in_use_b=""
+      if command -v ioreg >/dev/null 2>&1; then
+        ioreg_out="$(ioreg -r -d 1 -w 0 -c IOAccelerator 2>/dev/null || true)"
+        if [[ -n "$ioreg_out" ]]; then
+          local _re_du='"Device Utilization %"[[:space:]]*=[[:space:]]*([0-9]+)'
+          local _re_ru='"Renderer Utilization %"[[:space:]]*=[[:space:]]*([0-9]+)'
+          local _re_mem='"In use system memory"[[:space:]]*=[[:space:]]*([0-9]+)'
+          local _re_amem='"Alloc system memory"[[:space:]]*=[[:space:]]*([0-9]+)'
+          if [[ "$ioreg_out" =~ $_re_du ]]; then
+            g_pct="${BASH_REMATCH[1]}"
+          elif [[ "$ioreg_out" =~ $_re_ru ]]; then
+            g_pct="${BASH_REMATCH[1]}"
+          fi
+          if [[ "$ioreg_out" =~ $_re_mem ]]; then
+            in_use_b="${BASH_REMATCH[1]}"
+          elif [[ "$ioreg_out" =~ $_re_amem ]]; then
+            in_use_b="${BASH_REMATCH[1]}"
+          fi
         fi
-        if [[ "$HAS_NVIDIA_DATACENTER" == true && -n "${nv_pstates[$nv_ri]:-}" ]]; then
-          g_note="${nv_pstates[$nv_ri]}"
+      fi
+      local pm_out="" pm_cmd=()
+      if command -v powermetrics >/dev/null 2>&1; then
+        if [[ $EUID -eq 0 ]]; then
+          pm_cmd=(powermetrics)
+        elif sudo -n true >/dev/null 2>&1; then
+          pm_cmd=(sudo -n powermetrics)
         fi
-        if [[ "${nv_thr_active[$nv_ri]:-false}" == true ]]; then
-          g_thr=" ${C_RED}[THROTTLE]${C_RESET}"
+      fi
+      if (( ${#pm_cmd[@]} > 0 )); then
+        pm_attempted=true
+        pm_out="$("${pm_cmd[@]}" -n 1 -i 200 --samplers cpu_power,gpu_power,thermal 2>/dev/null || true)"
+        if [[ -n "$pm_out" ]]; then
+          local pm_res pm_gp pm_cp pm_sp pm_thr
+          pm_res="$(awk '
+            /GPU (HW )?active residency:/ { if (match($0, /[0-9]+(\.[0-9]+)?%/)) { gres = sprintf("%.0f", substr($0, RSTART, RLENGTH-1)+0) } }
+            /GPU Power:/ { if (match($0, /[0-9]+(\.[0-9]+)?[[:space:]]*m?W/)) { s=substr($0,RSTART,RLENGTH); v=s+0; gp=(s~/mW/)?v/1000.0:v } }
+            /CPU Power:/ { if (match($0, /[0-9]+(\.[0-9]+)?[[:space:]]*m?W/)) { s=substr($0,RSTART,RLENGTH); v=s+0; cp=(s~/mW/)?v/1000.0:v } }
+            /ANE Power:/ { if (match($0, /[0-9]+(\.[0-9]+)?[[:space:]]*m?W/)) { s=substr($0,RSTART,RLENGTH); v=s+0; anep=(s~/mW/)?v/1000.0:v } }
+            /Combined Power/ { if (match($0, /[0-9]+(\.[0-9]+)?[[:space:]]*m?W/)) { s=substr($0,RSTART,RLENGTH); v=s+0; sp=(s~/mW/)?v/1000.0:v } }
+            /Current pressure level:/ { thr=$NF }
+            END {
+              if (sp == "" && gp != "" && cp != "") sp = gp + cp + anep
+              printf "%s|%s|%s|%s|%s", gres, (gp!=""?sprintf("%.0f",gp):""), (cp!=""?sprintf("%.0f",cp):""), (sp!=""?sprintf("%.0f",sp):""), thr
+            }' <<< "$pm_out")"
+          IFS='|' read -r pm_res pm_gp pm_cp pm_sp pm_thr <<< "$pm_res"
+          [[ -n "$pm_res" ]] && g_pct="$pm_res"
+          [[ -n "$pm_gp" ]] && { pw="$pm_gp"; total_gpu_pwr_w="$pm_gp"; }
+          [[ -n "$pm_cp" ]] && cpu_pwr_w="$pm_cp"
+          [[ -n "$pm_sp" ]] && sys_pwr_w="$pm_sp"
+          case "$pm_thr" in
+            Heavy|Trapping|Sleeping) g_thr=" ${C_RED}[THROTTLE]${C_RESET}" ;;
+            Moderate) g_note="Thermal: Moderate" ;;
+          esac
         fi
-        [[ -n "$pw" ]] && total_gpu_pwr_w=$(( ${total_gpu_pwr_w:-0} + pw ))
+      fi
+      if [[ "$in_use_b" =~ ^[0-9]+$ && "$RAM_GB" -gt 0 ]]; then
+        local wl_mb cap_gib
+        wl_mb="${STRATA_MACOS_WIRED_LIMIT_MB:-${MACOS_WIRED_LIMIT_MB:-}}"
+        if ! [[ "$wl_mb" =~ ^[0-9]+$ ]]; then
+          wl_mb="$(_macos_wired_limit_cur_mb)"
+        fi
+        if (( wl_mb > 0 )); then
+          cap_gib="$(awk -v m="$wl_mb" 'BEGIN{printf "%.1f", m/1024.0}')"
+        else
+          cap_gib="$(awk -v r="$RAM_GB" 'BEGIN{printf "%.1f", r*0.75}')"
+        fi
+        read -r v_pct v_used v_tot <<< "$(awk -v u="$in_use_b" -v c="$cap_gib" 'BEGIN{ug=u/1073741824.0; p=(c>0)?int((ug/c)*100+0.5):0; if(p>100)p=100; printf "%d %.1f %.1f", p, ug, c}')"
+      fi
+      if [[ -n "$g_pct" || -n "$v_pct" || -n "$pw" || -n "$g_note" || -n "$g_thr" ]]; then
         gpu_pcts+=("$g_pct")
         vram_pcts+=("$v_pct")
         vram_useds+=("$v_used")
         vram_tots+=("$v_tot")
-        vram_labels+=("$v_lbl_tag")
+        vram_labels+=("Unified")
+        pwr_ws+=("$pw")
+        pwr_lim_ws+=("")
+        pwr_pcts+=("")
+        gpu_temps+=("")
+        gpu_notes+=("$g_note")
+        gpu_thr_tags+=("$g_thr")
+      fi
+    fi
+  else
+    if [[ -r "$rapl_file" ]]; then
+      rapl_can_read=true
+    elif [[ -e "$rapl_file" ]] && sudo -n true >/dev/null 2>&1; then
+      rapl_can_read=true
+    fi
+
+    # CPU usage (/proc/stat delta; 150ms sample only on first call)
+    if [[ -r /proc/stat ]]; then
+      local u1 n1 s1 i1 w1 q1 sq1 st1 idle_now tot_now
+      if [[ -z "$PREV_CPU_TOTAL" ]]; then
+        read -r _ u1 n1 s1 i1 w1 q1 sq1 st1 _ < /proc/stat
+        PREV_CPU_IDLE=$((i1 + w1))
+        PREV_CPU_TOTAL=$((u1 + n1 + s1 + PREV_CPU_IDLE + q1 + sq1 + st1))
+        if [[ "$rapl_can_read" == true ]]; then
+          if [[ -r "$rapl_file" ]]; then
+            PREV_RAPL_UJ="$(cat "$rapl_file" 2>/dev/null || true)"
+          else
+            PREV_RAPL_UJ="$(sudo -n cat "$rapl_file" 2>/dev/null || true)"
+          fi
+          PREV_RAPL_US="$(date +%s%6N 2>/dev/null || true)"
+        fi
+        sleep 0.15
+      fi
+      read -r _ u1 n1 s1 i1 w1 q1 sq1 st1 _ < /proc/stat
+      idle_now=$((i1 + w1))
+      tot_now=$((u1 + n1 + s1 + idle_now + q1 + sq1 + st1))
+      local dt=$((tot_now - PREV_CPU_TOTAL)) di=$((idle_now - PREV_CPU_IDLE))
+      if (( dt > 0 )); then
+        cpu_pct=$(( (dt - di) * 100 / dt ))
+        PREV_CPU_TOTAL="$tot_now"
+        PREV_CPU_IDLE="$idle_now"
+      fi
+    fi
+
+    # RAM usage (/proc/meminfo)
+    if [[ -r /proc/meminfo ]]; then
+      local mem_stats
+      mem_stats="$(awk '
+        /^MemTotal:/ {t=$2}
+        /^MemAvailable:/ {a=$2}
+        END {
+          if (t > 0) {
+            u = t - a
+            printf "%d %.1f %.1f", int(u * 100 / t + 0.5), u / 1048576, t / 1048576
+          }
+        }' /proc/meminfo 2>/dev/null || true)"
+      if [[ -n "$mem_stats" ]]; then
+        read -r ram_pct ram_used_gib ram_tot_gib <<< "$mem_stats"
+      fi
+    fi
+
+    # GPU, VRAM, Power, and Temp (supports NVIDIA, AMD, Intel Arc, and Jetson)
+    if [[ "$HAS_NVIDIA" == true ]] && command -v nvidia-smi >/dev/null 2>&1; then
+      local nv_lines nv_parsed nv_line
+      nv_lines="$(nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,power.draw,power.limit,temperature.gpu --format=csv,noheader,nounits 2>/dev/null || true)"
+      if [[ -n "$nv_lines" ]]; then
+        local -a nv_pstates=() nv_thr_active=()
+        local nv_extra="" eline ei_pstate ei_hw ei_sw
+        if [[ -z "$NVIDIA_LIVE_EXTRA_FIELDS" ]]; then
+          nv_extra="$(nvidia-smi --query-gpu=pstate,clocks_event_reasons.hw_thermal_slowdown,clocks_event_reasons.sw_thermal_slowdown --format=csv,noheader 2>/dev/null || true)"
+          if [[ -n "$nv_extra" ]] && ! grep -qiE "not a valid|field.*not" <<<"$nv_extra"; then
+            NVIDIA_LIVE_EXTRA_FIELDS="pstate,clocks_event_reasons.hw_thermal_slowdown,clocks_event_reasons.sw_thermal_slowdown"
+          else
+            nv_extra="$(nvidia-smi --query-gpu=pstate,clocks_throttle_reasons.hw_thermal_slowdown,clocks_throttle_reasons.sw_thermal_slowdown --format=csv,noheader 2>/dev/null || true)"
+            if [[ -n "$nv_extra" ]] && ! grep -qiE "not a valid|field.*not" <<<"$nv_extra"; then
+              NVIDIA_LIVE_EXTRA_FIELDS="pstate,clocks_throttle_reasons.hw_thermal_slowdown,clocks_throttle_reasons.sw_thermal_slowdown"
+            else
+              NVIDIA_LIVE_EXTRA_FIELDS="pstate"
+              nv_extra="$(nvidia-smi --query-gpu=pstate --format=csv,noheader 2>/dev/null || true)"
+            fi
+          fi
+        else
+          nv_extra="$(nvidia-smi --query-gpu="$NVIDIA_LIVE_EXTRA_FIELDS" --format=csv,noheader 2>/dev/null || true)"
+        fi
+        while IFS= read -r eline; do
+          [[ -n "$eline" ]] || continue
+          ei_pstate="" ei_hw="" ei_sw=""
+          IFS=',' read -r ei_pstate ei_hw ei_sw <<< "$eline"
+          ei_pstate="${ei_pstate//[[:space:]]/}"
+          ei_hw="${ei_hw//[[:space:]]/}"
+          ei_sw="${ei_sw//[[:space:]]/}"
+          [[ "$ei_pstate" =~ ^P[0-9]+$ ]] || ei_pstate=""
+          nv_pstates+=("$ei_pstate")
+          if [[ "$ei_hw" == "Active" || "$ei_sw" == "Active" ]]; then
+            nv_thr_active+=("true")
+          else
+            nv_thr_active+=("false")
+          fi
+        done <<< "$nv_extra"
+
+        nv_parsed="$(awk -F', *' '
+          function isnum(s) { return s ~ /^[0-9]+(\.[0-9]+)?$/ }
+          {
+            for (i=1; i<=6; i++) gsub(/ /, "", $i)
+            gp = isnum($1) ? sprintf("%.0f", $1) : ""
+            gt = isnum($6) ? sprintf("%.0f", $6) : ""
+            vp = ""; vu = ""; vt = ""
+            if (isnum($2) && isnum($3) && ($3 + 0) > 0) {
+              vp = sprintf("%.0f", ($2 / $3) * 100)
+              vu = sprintf("%.1f", $2 / 1024)
+              vt = sprintf("%.1f", $3 / 1024)
+            }
+            pw = ""; plw = ""; pp = ""
+            if (isnum($4)) {
+              pw = sprintf("%.0f", $4)
+              if (isnum($5) && ($5 + 0) > 0) {
+                plw = sprintf("%.0f", $5)
+                pp = sprintf("%.0f", ($4 / $5) * 100)
+              }
+            }
+            printf "%s|%s|%s|%s|%s|%s|%s|%s\n", gp, vp, vu, vt, pw, plw, pp, gt
+          }
+        ' <<< "$nv_lines")"
+        local nv_ri=0
+        while IFS= read -r nv_line; do
+          [[ -n "$nv_line" ]] || continue
+          local g_pct="" v_pct="" v_used="" v_tot="" pw="" plw="" ppct="" gtmp="" v_lbl_tag="" g_note="" g_thr=""
+          IFS='|' read -r g_pct v_pct v_used v_tot pw plw ppct gtmp <<< "$nv_line"
+          if [[ "$IS_DGX_SPARK" == true && -z "$v_pct" && -n "$ram_pct" ]]; then
+            v_pct="$ram_pct"
+            v_used="$ram_used_gib"
+            v_tot="$ram_tot_gib"
+            v_lbl_tag="Unified"
+          fi
+          if [[ "$HAS_NVIDIA_DATACENTER" == true && -n "${nv_pstates[$nv_ri]:-}" ]]; then
+            g_note="${nv_pstates[$nv_ri]}"
+          fi
+          if [[ "${nv_thr_active[$nv_ri]:-false}" == true ]]; then
+            g_thr=" ${C_RED}[THROTTLE]${C_RESET}"
+          fi
+          [[ -n "$pw" ]] && total_gpu_pwr_w=$(( ${total_gpu_pwr_w:-0} + pw ))
+          gpu_pcts+=("$g_pct")
+          vram_pcts+=("$v_pct")
+          vram_useds+=("$v_used")
+          vram_tots+=("$v_tot")
+          vram_labels+=("$v_lbl_tag")
+          pwr_ws+=("$pw")
+          pwr_lim_ws+=("$plw")
+          pwr_pcts+=("$ppct")
+          gpu_temps+=("$gtmp")
+          gpu_notes+=("$g_note")
+          gpu_thr_tags+=("$g_thr")
+          ((nv_ri++))
+        done <<< "$nv_parsed"
+      fi
+    fi
+    if [[ "$HAS_AMD" == true ]]; then
+      local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}" card_node card_dir ven
+      for card_node in "$drm_dir"/card[0-9]*; do
+        [[ -e "$card_node" ]] || continue
+        [[ "$(basename "$card_node")" == *-* ]] && continue
+        card_dir="$card_node/device"
+        if [[ -r "$card_dir/vendor" ]]; then
+          ven="$(tr '[:upper:]' '[:lower:]' < "$card_dir/vendor" 2>/dev/null || true)"
+          [[ "$ven" == "0x1002" ]] || continue
+        fi
+        [[ -r "$card_dir/gpu_busy_percent" ]] || continue
+        local g_pct="" v_pct="" v_used="" v_tot="" pw="" plw="" ppct="" gtmp=""
+        g_pct="$(cat "$card_dir/gpu_busy_percent" 2>/dev/null || true)"
+        if [[ -r "$card_dir/mem_info_vram_used" && -r "$card_dir/mem_info_vram_total" ]]; then
+          local vu vt gu gt
+          vu="$(cat "$card_dir/mem_info_vram_used" 2>/dev/null || echo 0)"
+          vt="$(cat "$card_dir/mem_info_vram_total" 2>/dev/null || echo 0)"
+          if _is_drm_card_amd_apu "$card_dir" && [[ -r "$card_dir/mem_info_gtt_used" && -r "$card_dir/mem_info_gtt_total" ]]; then
+            gu="$(cat "$card_dir/mem_info_gtt_used" 2>/dev/null || echo 0)"
+            gt="$(cat "$card_dir/mem_info_gtt_total" 2>/dev/null || echo 0)"
+            if [[ "$vt" =~ ^[0-9]+$ && "$gt" =~ ^[0-9]+$ && "$vu" =~ ^[0-9]+$ && "$gu" =~ ^[0-9]+$ ]]; then
+              vu=$((vu + gu))
+              vt=$((vt + gt))
+            fi
+          fi
+          if [[ "$vt" =~ ^[0-9]+$ && "$vu" =~ ^[0-9]+$ ]] && (( vt > 0 )); then
+            read -r v_pct v_used v_tot <<< "$(awk "BEGIN {printf \"%.0f %.1f %.1f\", ($vu/$vt)*100, $vu/1073741824, $vt/1073741824}")"
+          fi
+        fi
+        local hwmon_dir
+        for hwmon_dir in "$card_dir"/hwmon/hwmon*; do
+          if [[ -z "$gtmp" && -r "$hwmon_dir/temp1_input" ]]; then
+            local mc
+            mc="$(cat "$hwmon_dir/temp1_input" 2>/dev/null || echo 0)"
+            [[ "$mc" =~ ^[0-9]+$ ]] && (( mc > 0 )) && gtmp=$((mc / 1000))
+          fi
+          if [[ -z "$pw" && -r "$hwmon_dir/power1_average" ]]; then
+            local pa pc
+            pa="$(cat "$hwmon_dir/power1_average" 2>/dev/null || echo 0)"
+            pw=$((pa / 1000000))
+            total_gpu_pwr_w=$(( ${total_gpu_pwr_w:-0} + pw ))
+            if [[ -r "$hwmon_dir/power1_cap" ]]; then
+              pc="$(cat "$hwmon_dir/power1_cap" 2>/dev/null || echo 0)"
+              if (( pc > 0 )); then
+                plw=$((pc / 1000000))
+                ppct=$((pa * 100 / pc))
+              fi
+            fi
+          fi
+        done
+        gpu_pcts+=("$g_pct")
+        vram_pcts+=("$v_pct")
+        vram_useds+=("$v_used")
+        vram_tots+=("$v_tot")
+        vram_labels+=("")
         pwr_ws+=("$pw")
         pwr_lim_ws+=("$plw")
         pwr_pcts+=("$ppct")
         gpu_temps+=("$gtmp")
-        gpu_notes+=("$g_note")
-        gpu_thr_tags+=("$g_thr")
-        ((nv_ri++))
-      done <<< "$nv_parsed"
+        gpu_notes+=("")
+        gpu_thr_tags+=("")
+      done
     fi
-  fi
-  if [[ "$HAS_AMD" == true ]]; then
-    local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}" card_node card_dir ven
-    for card_node in "$drm_dir"/card[0-9]*; do
-      [[ -e "$card_node" ]] || continue
-      [[ "$(basename "$card_node")" == *-* ]] && continue
-      card_dir="$card_node/device"
-      if [[ -r "$card_dir/vendor" ]]; then
+    if [[ "$HAS_INTEL_ARC" == true ]]; then
+      local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}" card_node card_dir ven did hwmon_dir
+      for card_node in "$drm_dir"/card[0-9]*; do
+        [[ -e "$card_node" ]] || continue
+        [[ "$(basename "$card_node")" == *-* ]] && continue
+        card_dir="$card_node/device"
+        [[ -r "$card_dir/vendor" && -r "$card_dir/device" ]] || continue
         ven="$(tr '[:upper:]' '[:lower:]' < "$card_dir/vendor" 2>/dev/null || true)"
-        [[ "$ven" == "0x1002" ]] || continue
-      fi
-      [[ -r "$card_dir/gpu_busy_percent" ]] || continue
-      local g_pct="" v_pct="" v_used="" v_tot="" pw="" plw="" ppct="" gtmp=""
-      g_pct="$(cat "$card_dir/gpu_busy_percent" 2>/dev/null || true)"
-      if [[ -r "$card_dir/mem_info_vram_used" && -r "$card_dir/mem_info_vram_total" ]]; then
-        local vu vt gu gt
-        vu="$(cat "$card_dir/mem_info_vram_used" 2>/dev/null || echo 0)"
-        vt="$(cat "$card_dir/mem_info_vram_total" 2>/dev/null || echo 0)"
-        if _is_drm_card_amd_apu "$card_dir" && [[ -r "$card_dir/mem_info_gtt_used" && -r "$card_dir/mem_info_gtt_total" ]]; then
-          gu="$(cat "$card_dir/mem_info_gtt_used" 2>/dev/null || echo 0)"
-          gt="$(cat "$card_dir/mem_info_gtt_total" 2>/dev/null || echo 0)"
-          if [[ "$vt" =~ ^[0-9]+$ && "$gt" =~ ^[0-9]+$ && "$vu" =~ ^[0-9]+$ && "$gu" =~ ^[0-9]+$ ]]; then
-            vu=$((vu + gu))
-            vt=$((vt + gt))
-          fi
-        fi
-        if [[ "$vt" =~ ^[0-9]+$ && "$vu" =~ ^[0-9]+$ ]] && (( vt > 0 )); then
-          read -r v_pct v_used v_tot <<< "$(awk "BEGIN {printf \"%.0f %.1f %.1f\", ($vu/$vt)*100, $vu/1073741824, $vt/1073741824}")"
-        fi
-      fi
-      local hwmon_dir
-      for hwmon_dir in "$card_dir"/hwmon/hwmon*; do
-        if [[ -z "$gtmp" && -r "$hwmon_dir/temp1_input" ]]; then
-          local mc
-          mc="$(cat "$hwmon_dir/temp1_input" 2>/dev/null || echo 0)"
-          [[ "$mc" =~ ^[0-9]+$ ]] && (( mc > 0 )) && gtmp=$((mc / 1000))
-        fi
-        if [[ -z "$pw" && -r "$hwmon_dir/power1_average" ]]; then
-          local pa pc
-          pa="$(cat "$hwmon_dir/power1_average" 2>/dev/null || echo 0)"
-          pw=$((pa / 1000000))
-          total_gpu_pwr_w=$(( ${total_gpu_pwr_w:-0} + pw ))
-          if [[ -r "$hwmon_dir/power1_cap" ]]; then
-            pc="$(cat "$hwmon_dir/power1_cap" 2>/dev/null || echo 0)"
-            if (( pc > 0 )); then
-              plw=$((pc / 1000000))
-              ppct=$((pa * 100 / pc))
-            fi
-          fi
-        fi
-      done
-      gpu_pcts+=("$g_pct")
-      vram_pcts+=("$v_pct")
-      vram_useds+=("$v_used")
-      vram_tots+=("$v_tot")
-      vram_labels+=("")
-      pwr_ws+=("$pw")
-      pwr_lim_ws+=("$plw")
-      pwr_pcts+=("$ppct")
-      gpu_temps+=("$gtmp")
-      gpu_notes+=("")
-      gpu_thr_tags+=("")
-    done
-  fi
-  if [[ "$HAS_INTEL_ARC" == true ]]; then
-    local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}" card_node card_dir ven did hwmon_dir
-    for card_node in "$drm_dir"/card[0-9]*; do
-      [[ -e "$card_node" ]] || continue
-      [[ "$(basename "$card_node")" == *-* ]] && continue
-      card_dir="$card_node/device"
-      [[ -r "$card_dir/vendor" && -r "$card_dir/device" ]] || continue
-      ven="$(tr '[:upper:]' '[:lower:]' < "$card_dir/vendor" 2>/dev/null || true)"
-      [[ "$ven" == "0x8086" ]] || continue
-      did="$(tr '[:upper:]' '[:lower:]' < "$card_dir/device" 2>/dev/null || true)"
-      _is_intel_discrete_pci_id "$did" || continue
-      local pw="" gtmp="" mc="" pa="" e_uj="" e_us="" de="" dt_us=""
-      for hwmon_dir in "$card_dir"/hwmon/hwmon*; do
-        [[ -d "$hwmon_dir" ]] || continue
-        if [[ -z "$gtmp" ]]; then
-          local tf
-          for tf in "$hwmon_dir/temp2_input" "$hwmon_dir/temp1_input"; do
-            if [[ -r "$tf" ]]; then
-              mc="$(cat "$tf" 2>/dev/null || echo 0)"
-              [[ "$mc" =~ ^[0-9]+$ ]] && (( mc > 0 )) && { gtmp=$((mc / 1000)); break; }
-            fi
-          done
-        fi
-        if [[ -z "$pw" && -r "$hwmon_dir/power1_average" ]]; then
-          pa="$(cat "$hwmon_dir/power1_average" 2>/dev/null || echo 0)"
-          if [[ "$pa" =~ ^[0-9]+$ ]] && (( pa > 0 )); then
-            pw=$((pa / 1000000))
-            total_gpu_pwr_w=$(( ${total_gpu_pwr_w:-0} + pw ))
-          fi
-        elif [[ -z "$pw" && -r "$hwmon_dir/energy1_input" ]]; then
-          e_uj="$(cat "$hwmon_dir/energy1_input" 2>/dev/null || true)"
-          e_us="$(date +%s%6N 2>/dev/null || true)"
-          if [[ "$e_uj" =~ ^[0-9]+$ && "$e_us" =~ ^[0-9]+$ ]]; then
-            if [[ -n "${PREV_INTEL_GPU_UJ_MAP[$card_dir]:-}" && -n "${PREV_INTEL_GPU_US_MAP[$card_dir]:-}" ]]; then
-              de=$(( e_uj - PREV_INTEL_GPU_UJ_MAP[$card_dir] ))
-              dt_us=$(( e_us - PREV_INTEL_GPU_US_MAP[$card_dir] ))
-              if (( de >= 0 && dt_us > 0 )); then
-                pw=$(( de / dt_us ))
-                total_gpu_pwr_w=$(( ${total_gpu_pwr_w:-0} + pw ))
+        [[ "$ven" == "0x8086" ]] || continue
+        did="$(tr '[:upper:]' '[:lower:]' < "$card_dir/device" 2>/dev/null || true)"
+        _is_intel_discrete_pci_id "$did" || continue
+        local pw="" gtmp="" mc="" pa="" e_uj="" e_us="" de="" dt_us=""
+        for hwmon_dir in "$card_dir"/hwmon/hwmon*; do
+          [[ -d "$hwmon_dir" ]] || continue
+          if [[ -z "$gtmp" ]]; then
+            local tf
+            for tf in "$hwmon_dir/temp2_input" "$hwmon_dir/temp1_input"; do
+              if [[ -r "$tf" ]]; then
+                mc="$(cat "$tf" 2>/dev/null || echo 0)"
+                [[ "$mc" =~ ^[0-9]+$ ]] && (( mc > 0 )) && { gtmp=$((mc / 1000)); break; }
               fi
-            fi
-            PREV_INTEL_GPU_UJ_MAP[$card_dir]="$e_uj"
-            PREV_INTEL_GPU_US_MAP[$card_dir]="$e_us"
+            done
           fi
+          if [[ -z "$pw" && -r "$hwmon_dir/power1_average" ]]; then
+            pa="$(cat "$hwmon_dir/power1_average" 2>/dev/null || echo 0)"
+            if [[ "$pa" =~ ^[0-9]+$ ]] && (( pa > 0 )); then
+              pw=$((pa / 1000000))
+              total_gpu_pwr_w=$(( ${total_gpu_pwr_w:-0} + pw ))
+            fi
+          elif [[ -z "$pw" && -r "$hwmon_dir/energy1_input" ]]; then
+            e_uj="$(cat "$hwmon_dir/energy1_input" 2>/dev/null || true)"
+            e_us="$(date +%s%6N 2>/dev/null || true)"
+            if [[ "$e_uj" =~ ^[0-9]+$ && "$e_us" =~ ^[0-9]+$ ]]; then
+              if [[ -n "${PREV_INTEL_GPU_UJ_MAP[$card_dir]:-}" && -n "${PREV_INTEL_GPU_US_MAP[$card_dir]:-}" ]]; then
+                de=$(( e_uj - PREV_INTEL_GPU_UJ_MAP[$card_dir] ))
+                dt_us=$(( e_us - PREV_INTEL_GPU_US_MAP[$card_dir] ))
+                if (( de >= 0 && dt_us > 0 )); then
+                  pw=$(( de / dt_us ))
+                  total_gpu_pwr_w=$(( ${total_gpu_pwr_w:-0} + pw ))
+                fi
+              fi
+              PREV_INTEL_GPU_UJ_MAP[$card_dir]="$e_uj"
+              PREV_INTEL_GPU_US_MAP[$card_dir]="$e_us"
+            fi
+          fi
+        done
+        if [[ -n "$gtmp" || -n "$pw" ]]; then
+          gpu_pcts+=("")
+          vram_pcts+=("")
+          vram_useds+=("")
+          vram_tots+=("")
+          vram_labels+=("")
+          pwr_ws+=("$pw")
+          pwr_lim_ws+=("")
+          pwr_pcts+=("")
+          gpu_temps+=("$gtmp")
+          gpu_notes+=("")
+          gpu_thr_tags+=("")
         fi
       done
-      if [[ -n "$gtmp" || -n "$pw" ]]; then
-        gpu_pcts+=("")
+    fi
+
+    if [[ "$IS_JETSON" == true && ${#gpu_pcts[@]} -eq 0 ]]; then
+      local j_load_f="" j_load="" j_gp="" j_gt="" tz_d tz_t j_mc
+      for j_load_f in /sys/devices/platform/17000000.ga10b/load /sys/devices/platform/*.ga10b/load /sys/devices/platform/*.gv11b/load /sys/devices/platform/gpu.0/load /sys/devices/gpu.0/load /sys/devices/*.gp10b/load /sys/devices/platform/host1x/*.gp10b/load; do
+        if [[ -r "$j_load_f" ]]; then
+          j_load="$(cat "$j_load_f" 2>/dev/null || true)"
+          [[ "$j_load" =~ ^[0-9]+$ ]] && { j_gp=$(( j_load / 10 )); break; }
+        fi
+      done
+      for tz_d in /sys/class/thermal/thermal_zone*; do
+        [[ -r "$tz_d/type" && -r "$tz_d/temp" ]] || continue
+        tz_t="$(cat "$tz_d/type" 2>/dev/null || true)"
+        if [[ "$tz_t" == "GPU-therm" || "$tz_t" == "gpu-thermal" || "$tz_t" == "tj-thermal" ]]; then
+          j_mc="$(cat "$tz_d/temp" 2>/dev/null || echo 0)"
+          [[ "$j_mc" =~ ^[0-9]+$ ]] && (( j_mc > 0 )) && { j_gt=$(( j_mc / 1000 )); break; }
+        fi
+      done
+      if [[ -n "$j_gp" || -n "$j_gt" ]]; then
+        gpu_pcts+=("${j_gp:-0}")
         vram_pcts+=("")
         vram_useds+=("")
         vram_tots+=("")
         vram_labels+=("")
-        pwr_ws+=("$pw")
+        pwr_ws+=("")
         pwr_lim_ws+=("")
         pwr_pcts+=("")
-        gpu_temps+=("$gtmp")
+        gpu_temps+=("$j_gt")
         gpu_notes+=("")
         gpu_thr_tags+=("")
       fi
-    done
-  fi
-
-  if [[ "$IS_JETSON" == true && ${#gpu_pcts[@]} -eq 0 ]]; then
-    local j_load_f="" j_load="" j_gp="" j_gt="" tz_d tz_t j_mc
-    for j_load_f in /sys/devices/platform/17000000.ga10b/load /sys/devices/platform/*.ga10b/load /sys/devices/platform/*.gv11b/load /sys/devices/platform/gpu.0/load /sys/devices/gpu.0/load /sys/devices/*.gp10b/load /sys/devices/platform/host1x/*.gp10b/load; do
-      if [[ -r "$j_load_f" ]]; then
-        j_load="$(cat "$j_load_f" 2>/dev/null || true)"
-        [[ "$j_load" =~ ^[0-9]+$ ]] && { j_gp=$(( j_load / 10 )); break; }
-      fi
-    done
-    for tz_d in /sys/class/thermal/thermal_zone*; do
-      [[ -r "$tz_d/type" && -r "$tz_d/temp" ]] || continue
-      tz_t="$(cat "$tz_d/type" 2>/dev/null || true)"
-      if [[ "$tz_t" == "GPU-therm" || "$tz_t" == "gpu-thermal" || "$tz_t" == "tj-thermal" ]]; then
-        j_mc="$(cat "$tz_d/temp" 2>/dev/null || echo 0)"
-        [[ "$j_mc" =~ ^[0-9]+$ ]] && (( j_mc > 0 )) && { j_gt=$(( j_mc / 1000 )); break; }
-      fi
-    done
-    if [[ -n "$j_gp" || -n "$j_gt" ]]; then
-      gpu_pcts+=("${j_gp:-0}")
-      vram_pcts+=("")
-      vram_useds+=("")
-      vram_tots+=("")
-      vram_labels+=("")
-      pwr_ws+=("")
-      pwr_lim_ws+=("")
-      pwr_pcts+=("")
-      gpu_temps+=("$j_gt")
-      gpu_notes+=("")
-      gpu_thr_tags+=("")
     fi
-  fi
 
-  local sys_pwr_w="" cpu_pwr_w=""
-  # Total system power & CPU temperature (hwmon)
-  local hm_dir hm_name
-  for hm_dir in /sys/class/hwmon/hwmon*; do
-    [[ -r "$hm_dir/name" ]] || continue
-    hm_name="$(cat "$hm_dir/name" 2>/dev/null || true)"
-    case "$hm_name" in
-      coretemp|k10temp|zenpower*)
-        if [[ -z "$cpu_temp" && -r "$hm_dir/temp1_input" ]]; then
+    # Total system power & CPU temperature (hwmon)
+    local hm_dir hm_name
+    for hm_dir in /sys/class/hwmon/hwmon*; do
+      [[ -r "$hm_dir/name" ]] || continue
+      hm_name="$(cat "$hm_dir/name" 2>/dev/null || true)"
+      case "$hm_name" in
+        coretemp|k10temp|zenpower*)
+          if [[ -z "$cpu_temp" && -r "$hm_dir/temp1_input" ]]; then
+            local mc
+            mc="$(cat "$hm_dir/temp1_input" 2>/dev/null || echo 0)"
+            [[ "$mc" =~ ^[0-9]+$ ]] && (( mc > 0 )) && cpu_temp=$((mc / 1000))
+          fi
+          ;;
+        applesmc)
+          if [[ -z "$cpu_temp" ]]; then
+            local _tf _tl _mc=""
+            for _tf in "$hm_dir"/temp*_input; do
+              [[ -r "$_tf" ]] || continue
+              _tl="$(cat "${_tf%_input}_label" 2>/dev/null || true)"
+              if [[ "$_tl" =~ ^(TC0[PDEFHc]|TC[01X][Cc]|TCSA)$ ]]; then
+                _mc="$(cat "$_tf" 2>/dev/null || echo 0)"
+                [[ "$_mc" =~ ^[0-9]+$ ]] && (( _mc > 0 )) && { cpu_temp=$((_mc / 1000)); break; }
+              fi
+            done
+          fi
+          ;;
+        corsair-psu|acpi_power_meter|power_meter)
+          if [[ -z "$sys_pwr_w" ]]; then
+            local pf="" uw=0
+            for pf in "$hm_dir"/power1_input "$hm_dir"/power1_average; do
+              if [[ -r "$pf" ]]; then
+                uw="$(cat "$pf" 2>/dev/null || echo 0)"
+                (( uw > 0 )) && { sys_pwr_w=$((uw / 1000000)); break; }
+              fi
+            done
+          fi
+          ;;
+      esac
+    done
+    if [[ -z "$cpu_temp" ]]; then
+      local tz_dir tz_type
+      for tz_dir in /sys/class/thermal/thermal_zone*; do
+        [[ -r "$tz_dir/type" && -r "$tz_dir/temp" ]] || continue
+        tz_type="$(cat "$tz_dir/type" 2>/dev/null || true)"
+        if [[ "$tz_type" == "x86_pkg_temp" || "$tz_type" == "cpu"* || "$tz_type" == "CPU-therm" || "$tz_type" == "BCPU-therm" || "$tz_type" == "MCPU-therm" ]]; then
           local mc
-          mc="$(cat "$hm_dir/temp1_input" 2>/dev/null || echo 0)"
-          [[ "$mc" =~ ^[0-9]+$ ]] && (( mc > 0 )) && cpu_temp=$((mc / 1000))
+          mc="$(cat "$tz_dir/temp" 2>/dev/null || echo 0)"
+          [[ "$mc" =~ ^[0-9]+$ ]] && (( mc > 0 )) && { cpu_temp=$((mc / 1000)); break; }
         fi
-        ;;
-      corsair-psu|acpi_power_meter|power_meter)
-        if [[ -z "$sys_pwr_w" ]]; then
-          local pf="" uw=0
-          for pf in "$hm_dir"/power1_input "$hm_dir"/power1_average; do
-            if [[ -r "$pf" ]]; then
-              uw="$(cat "$pf" 2>/dev/null || echo 0)"
-              (( uw > 0 )) && { sys_pwr_w=$((uw / 1000000)); break; }
-            fi
-          done
+      done
+    fi
+    if [[ -z "$sys_pwr_w" ]]; then
+      local bat_d bat_st cur_ua volt_uv uw
+      for bat_d in /sys/class/power_supply/BAT*; do
+        [[ -d "$bat_d" ]] || continue
+        if [[ -r "$bat_d/power_now" ]]; then
+          uw="$(cat "$bat_d/power_now" 2>/dev/null || echo 0)"
+          [[ "$uw" =~ ^[0-9]+$ ]] && (( uw > 0 )) && { sys_pwr_w=$((uw / 1000000)); break; }
+        elif [[ -r "$bat_d/current_now" && -r "$bat_d/voltage_now" ]]; then
+          bat_st="$(cat "$bat_d/status" 2>/dev/null || true)"
+          cur_ua="$(cat "$bat_d/current_now" 2>/dev/null || echo 0)"
+          volt_uv="$(cat "$bat_d/voltage_now" 2>/dev/null || echo 0)"
+          if [[ "$bat_st" == "Discharging" && "$cur_ua" =~ ^[0-9]+$ && "$volt_uv" =~ ^[0-9]+$ ]] && (( cur_ua > 0 && volt_uv > 0 )); then
+            sys_pwr_w="$(awk -v c="$cur_ua" -v v="$volt_uv" 'BEGIN{printf "%.0f", (c/1000000.0)*(v/1000000.0)}')"
+            break
+          fi
         fi
-        ;;
-    esac
-  done
-  if [[ -z "$cpu_temp" ]]; then
-    local tz_dir tz_type
-    for tz_dir in /sys/class/thermal/thermal_zone*; do
-      [[ -r "$tz_dir/type" && -r "$tz_dir/temp" ]] || continue
-      tz_type="$(cat "$tz_dir/type" 2>/dev/null || true)"
-      if [[ "$tz_type" == "x86_pkg_temp" || "$tz_type" == "cpu"* || "$tz_type" == "CPU-therm" || "$tz_type" == "BCPU-therm" || "$tz_type" == "MCPU-therm" ]]; then
-        local mc
-        mc="$(cat "$tz_dir/temp" 2>/dev/null || echo 0)"
-        [[ "$mc" =~ ^[0-9]+$ ]] && (( mc > 0 )) && { cpu_temp=$((mc / 1000)); break; }
-      fi
-    done
-  fi
-  if [[ -z "$sys_pwr_w" ]]; then
-    local bat_d bat_st cur_ua volt_uv uw
-    for bat_d in /sys/class/power_supply/BAT*; do
-      [[ -d "$bat_d" ]] || continue
-      if [[ -r "$bat_d/power_now" ]]; then
-        uw="$(cat "$bat_d/power_now" 2>/dev/null || echo 0)"
-        [[ "$uw" =~ ^[0-9]+$ ]] && (( uw > 0 )) && { sys_pwr_w=$((uw / 1000000)); break; }
-      elif [[ -r "$bat_d/current_now" && -r "$bat_d/voltage_now" ]]; then
-        bat_st="$(cat "$bat_d/status" 2>/dev/null || true)"
-        cur_ua="$(cat "$bat_d/current_now" 2>/dev/null || echo 0)"
-        volt_uv="$(cat "$bat_d/voltage_now" 2>/dev/null || echo 0)"
-        if [[ "$bat_st" == "Discharging" && "$cur_ua" =~ ^[0-9]+$ && "$volt_uv" =~ ^[0-9]+$ ]] && (( cur_ua > 0 && volt_uv > 0 )); then
-          sys_pwr_w="$(awk -v c="$cur_ua" -v v="$volt_uv" 'BEGIN{printf "%.0f", (c/1000000.0)*(v/1000000.0)}')"
-          break
-        fi
-      fi
-    done
-  fi
+      done
+    fi
 
-  if [[ "$IS_JETSON" == true ]]; then
-    local j_sw="" j_gw="" j_cw=""
-    IFS='|' read -r j_sw j_gw j_cw <<< "$(read_jetson_ina3221_watts)"
-    [[ -n "$j_sw" && -z "$sys_pwr_w" ]] && sys_pwr_w="$(awk -v w="$j_sw" 'BEGIN{printf "%.0f", w}')"
-    [[ -n "$j_cw" && -z "$cpu_pwr_w" ]] && cpu_pwr_w="$(awk -v w="$j_cw" 'BEGIN{printf "%.0f", w}')"
-    if [[ -n "$j_gw" && "${#gpu_pcts[@]}" -gt 0 && -z "${pwr_ws[0]:-}" ]]; then
-      pwr_ws[0]="$(awk -v w="$j_gw" 'BEGIN{printf "%.0f", w}')"
-    fi
-  fi
-  if (( ${#gpu_pcts[@]} > 0 )) && [[ -n "$cpu_pwr_w" ]]; then true; fi
-  if [[ "$rapl_can_read" == true ]]; then
-    local rapl_now us_now
-    if [[ -r "$rapl_file" ]]; then
-      rapl_now="$(cat "$rapl_file" 2>/dev/null || true)"
-    else
-      rapl_now="$(sudo -n cat "$rapl_file" 2>/dev/null || true)"
-    fi
-    us_now="$(date +%s%6N 2>/dev/null || true)"
-    if [[ "$rapl_now" =~ ^[0-9]+$ && "$us_now" =~ ^[0-9]+$ ]]; then
-      if [[ -n "$PREV_RAPL_UJ" && -n "$PREV_RAPL_US" ]]; then
-        local de=$((rapl_now - PREV_RAPL_UJ)) dt_us=$((us_now - PREV_RAPL_US))
-        (( de >= 0 && dt_us > 0 )) && cpu_pwr_w=$(( de / dt_us ))
+    if [[ "$IS_JETSON" == true ]]; then
+      local j_sw="" j_gw="" j_cw=""
+      IFS='|' read -r j_sw j_gw j_cw <<< "$(read_jetson_ina3221_watts)"
+      [[ -n "$j_sw" && -z "$sys_pwr_w" ]] && sys_pwr_w="$(awk -v w="$j_sw" 'BEGIN{printf "%.0f", w}')"
+      [[ -n "$j_cw" && -z "$cpu_pwr_w" ]] && cpu_pwr_w="$(awk -v w="$j_cw" 'BEGIN{printf "%.0f", w}')"
+      if [[ -n "$j_gw" && "${#gpu_pcts[@]}" -gt 0 && -z "${pwr_ws[0]:-}" ]]; then
+        pwr_ws[0]="$(awk -v w="$j_gw" 'BEGIN{printf "%.0f", w}')"
       fi
-      PREV_RAPL_UJ="$rapl_now"
-      PREV_RAPL_US="$us_now"
+    fi
+    if [[ "$rapl_can_read" == true ]]; then
+      local rapl_now us_now
+      if [[ -r "$rapl_file" ]]; then
+        rapl_now="$(cat "$rapl_file" 2>/dev/null || true)"
+      else
+        rapl_now="$(sudo -n cat "$rapl_file" 2>/dev/null || true)"
+      fi
+      us_now="$(date +%s%6N 2>/dev/null || true)"
+      if [[ "$rapl_now" =~ ^[0-9]+$ && "$us_now" =~ ^[0-9]+$ ]]; then
+        if [[ -n "$PREV_RAPL_UJ" && -n "$PREV_RAPL_US" ]]; then
+          local de=$((rapl_now - PREV_RAPL_UJ)) dt_us=$((us_now - PREV_RAPL_US))
+          (( de >= 0 && dt_us > 0 )) && cpu_pwr_w=$(( de / dt_us ))
+        fi
+        PREV_RAPL_UJ="$rapl_now"
+        PREV_RAPL_US="$us_now"
+      fi
     fi
   fi
 
@@ -8670,7 +10024,9 @@ print_live_stats() {
   done
   if [[ -n "$cpu_pwr_w" ]]; then
     pwr_parts+=("CPU ${cpu_pwr_w}W")
-  elif [[ -e "$rapl_file" && "$rapl_can_read" == false ]]; then
+  elif [[ "$IS_MACOS" == true && "$IS_APPLE_SILICON" == true && "$pm_attempted" == false ]]; then
+    pwr_parts+=("$(printf "%bGPU/CPU/Sys n/a (sudo needed for powermetrics)%b" "${C_DIM}" "${C_RESET}")")
+  elif [[ "$IS_MACOS" == false && -e "$rapl_file" && "$rapl_can_read" == false ]]; then
     pwr_parts+=("$(printf "%bCPU/Sys n/a (sudo needed for RAPL)%b" "${C_DIM}" "${C_RESET}")")
   fi
   if [[ -n "$sys_pwr_w" ]]; then
@@ -8728,7 +10084,16 @@ build_sys_info_lines() {
   SYS_INFO_LINES+=("$(printf "CPU:    %b%s%b" "${C_DIM}" "$CPU_SUMMARY" "${C_RESET}")")
   SYS_INFO_LINES+=("$(printf "RAM:    %b%s GiB%s%b" "${C_DIM}" "$RAM_GB" "$RAM_DETAILS" "${C_RESET}")")
   SYS_INFO_LINES+=("$(printf "GPU(s): %b%s%b" "${C_DIM}" "$GPU_SUMMARY" "${C_RESET}")")
-  if [[ "$IS_DGX_SPARK" == true || ( "$HAS_NVIDIA_UNIFIED_MEM" == true && "$TOTAL_VRAM_MB" -eq 0 ) ]]; then
+  if [[ "$IS_MACOS" == true && "$IS_APPLE_SILICON" == true ]]; then
+    local _mwl _mwl_txt
+    _mwl="$(_macos_wired_limit_cur_mb)"
+    if (( _mwl > 0 )); then
+      _mwl_txt="$(awk -v m="$_mwl" 'BEGIN{printf "%.1f GiB wired limit (%d MiB)", m/1024.0, m}')"
+    else
+      _mwl_txt="$(awk -v r="$RAM_GB" 'BEGIN{printf "Metal default ~75%% (~%.1f GiB wired cap)", r*0.75}')"
+    fi
+    SYS_INFO_LINES+=("$(printf "VRAM:   %b%s GiB unified (%s)%b" "${C_DIM}" "$RAM_GB" "$_mwl_txt" "${C_RESET}")")
+  elif [[ "$IS_DGX_SPARK" == true || ( "$HAS_NVIDIA_UNIFIED_MEM" == true && "$TOTAL_VRAM_MB" -eq 0 ) ]]; then
     SYS_INFO_LINES+=("$(printf "VRAM:   %b%s GiB unified (GB10)%b" "${C_DIM}" "$RAM_GB" "${C_RESET}")")
   elif (( TOTAL_VRAM_MB > 0 )) || [[ "$HAS_AMD_APU" == true && "$AMD_GTT_TOTAL_MB" -gt 0 ]]; then
     local total_vram_gb="" gtt_gb=""
@@ -8855,7 +10220,7 @@ collect_strata_stats_lines() {
   fi
 
   local model="" live_str="0.0 tok/s (idle)" avg_str="—"
-  if [[ -n "$STRATA_RUNNING_URL" ]] && command -v curl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+  if [[ -n "$STRATA_RUNNING_URL" ]] && command -v curl >/dev/null 2>&1 && has_working_python3; then
     local m_json curl_args=(-fsS --max-time 1)
     [[ -n "${STRATA_API_KEY:-}" ]] && curl_args+=(-H "Authorization: Bearer ${STRATA_API_KEY}" -H "X-API-Key: ${STRATA_API_KEY}")
     m_json="$(curl "${curl_args[@]}" "${STRATA_RUNNING_URL}/metrics" 2>/dev/null || true)"
@@ -8916,7 +10281,7 @@ format_pct_delta() {
 collect_strata_bench_lines() {
   local newest="" hist_mtime="0"
   newest="$(find_latest_results_json 0)"
-  [[ -r "$STRATA_BENCH_HISTORY_FILE" ]] && hist_mtime="$(stat -c '%Y' "$STRATA_BENCH_HISTORY_FILE" 2>/dev/null || echo 0)"
+  [[ -r "$STRATA_BENCH_HISTORY_FILE" ]] && hist_mtime="$(file_mtime "$STRATA_BENCH_HISTORY_FILE")"
 
   if [[ -z "$newest" && "$hist_mtime" == "0" ]]; then
     STRATA_BENCH_CACHE_KEY=""
@@ -8930,14 +10295,14 @@ collect_strata_bench_lines() {
   fi
 
   local mtime="0" cache_key
-  [[ -n "$newest" ]] && mtime="$(stat -c '%Y' "$newest" 2>/dev/null || echo 0)"
+  [[ -n "$newest" ]] && mtime="$(file_mtime "$newest")"
   cache_key="${newest}:${mtime}:${hist_mtime}"
   if [[ "$cache_key" == "$STRATA_BENCH_CACHE_KEY" && ${#STRATA_BENCH_LINES[@]} -gt 0 ]]; then
     return 0
   fi
 
   local parsed=""
-  if command -v python3 >/dev/null 2>&1; then
+  if has_working_python3; then
     parsed="$(python3 - "$STRATA_BENCH_HISTORY_FILE" "$PWD/bench/results" "$PWD/bench-results" "$TARGET_HOME/bench/results" "$TARGET_HOME/bench-results" "$TARGET_HOME/.local/share/strata/bench-results" "$TARGET_HOME/.config/strata/bench-results" <<'PY' 2>/dev/null || true
 import datetime, glob, json, os, statistics, sys
 
@@ -9757,7 +11122,7 @@ run_step_view() {
 
     printf "%s" "$body"
     local body_lines lines_up
-    body_lines="$(printf "%s" "$body" | wc -l)"
+    body_lines="$(printf "%s" "$body" | wc -l | tr -d '[:space:]')"
     lines_up=$(( LIVE_STATS_COUNT + POST_HEADER_LINES + body_lines ))
     read_step_action action "$lines_up"
     case "$action" in
@@ -9932,6 +11297,7 @@ declare -A STEP_GAIN_PTS=(
   [nvidia_fabricmanager]=5
   [gpu_unlock]=5
   [amd_apu_memory]=5
+  [macos_wired_limit]=5
   [amd_cwsr_disable]=4
   [nvidia_mig_disable]=4
   [nvidia_sm70_table]=4
@@ -9940,6 +11306,9 @@ declare -A STEP_GAIN_PTS=(
   [intel_compute_stack]=4
   [lact_overclock]=4
   [jetson_perf]=4
+  [macos_power_mode]=4
+  [macos_spotlight_exclude]=4
+  [macos_metal_tuning]=4
   [nvidia_power_limit]=2
   [nvidia_power_cap]=3
   [pcie_acs_disable]=3
@@ -9960,6 +11329,7 @@ declare -A STEP_GAIN_PTS=(
   [dell_thermal]=3
   [system76_perf]=3
   [tuxedo_perf]=3
+  [apple_smc_cooling]=3
   [acpi_platform_profile]=3
   [intel_pcore_pinning]=3
   [zram_swap]=3
@@ -10074,7 +11444,7 @@ show_stats_page() {
     body+="$(echo -e "  ${C_DIM}Live-updating every 1s. Press ${C_BOLD}[i / b / Enter / Esc]${C_RESET}${C_DIM} to return to Index, or ${C_BOLD}[q]${C_RESET}${C_DIM} to Quit.${C_RESET}")"$'\n\n'
     printf "%s" "$body"
     local body_lines lines_up action=""
-    body_lines="$(printf "%s" "$body" | wc -l)"
+    body_lines="$(printf "%s" "$body" | wc -l | tr -d '[:space:]')"
     lines_up=$(( LIVE_STATS_COUNT + POST_HEADER_LINES + body_lines ))
     read_step_action action "$lines_up"
     case "$action" in
@@ -10399,8 +11769,10 @@ show_index() {
     done
 
     local -a legend_items=()
+    local opt_desc="Opt-in trade-off (power cap / partitioning / RAM reserve)"
+    [[ "$IS_MACOS" == true ]] && opt_desc="Opt-in trade-off (wired RAM cap / Metal switches)"
     [[ "$has_warn_flag" == true ]] && legend_items+=("$(echo -e "${C_YELLOW}[!]${C_RESET} ${C_DIM}Higher idle power, minimal gain${C_RESET}")")
-    [[ "$has_opt_flag" == true ]] && legend_items+=("$(echo -e "${C_BLUE}[OPT]${C_RESET} ${C_DIM}Opt-in trade-off (power cap / partitioning / RAM reserve)${C_RESET}")")
+    [[ "$has_opt_flag" == true ]] && legend_items+=("$(echo -e "${C_BLUE}[OPT]${C_RESET} ${C_DIM}${opt_desc}${C_RESET}")")
     [[ "$has_exp_flag" == true ]] && legend_items+=("$(echo -e "${C_MAGENTA}[EXP]${C_RESET} ${C_DIM}Experimental / third-party or hardware-dependent${C_RESET}")")
     [[ "$IS_LAPTOP" == true ]] && legend_items+=("$(echo -e "${C_CYAN}[L]${C_RESET} ${C_DIM}Laptop-recommended (low idle battery impact)${C_RESET}")")
 
@@ -10438,11 +11810,14 @@ show_index() {
       body+="$(echo -e "  ${C_CYAN}[h]${C_RESET} Benchmark history & restore coupled options (${hist_count})")"$'\n'
       ((footer_lines++))
     fi
-    local -a excl_parts=("high-idle-power options")
+    local -a excl_parts=()
+    [[ "$has_warn_flag" == true ]] && excl_parts+=("high-idle-power options")
     [[ "$has_opt_flag" == true ]] && excl_parts+=("opt-in trade-offs")
     [[ "$has_exp_flag" == true ]] && excl_parts+=("experimental options")
-    local rec_excl="${excl_parts[0]}"
-    if (( ${#excl_parts[@]} == 2 )); then
+    local rec_excl="none"
+    if (( ${#excl_parts[@]} == 1 )); then
+      rec_excl="${excl_parts[0]}"
+    elif (( ${#excl_parts[@]} == 2 )); then
       rec_excl="${excl_parts[0]} and ${excl_parts[1]}"
     elif (( ${#excl_parts[@]} == 3 )); then
       rec_excl="${excl_parts[0]}, ${excl_parts[1]}, and ${excl_parts[2]}"
@@ -10459,7 +11834,7 @@ show_index() {
 
     printf "%s" "$body"
     local body_lines toggle_up
-    body_lines="$(printf "%s" "$body" | wc -l)"
+    body_lines="$(printf "%s" "$body" | wc -l | tr -d '[:space:]')"
     toggle_up=$(( 1 + POST_HEADER_LINES + body_lines ))
     read_choice_with_live_stats choice "$footer_lines" "$toggle_up"
 
@@ -10494,7 +11869,7 @@ show_index() {
         ;;
       x|X) run_recommended_batch "revert" ;;
       r|R)
-        confirm_yn "Reboot this system now? [y/N]: " "N" && { if [[ "$HAS_SYSTEMD" == true ]]; then run_root systemctl reboot; else run_root reboot; fi; exit 0; }
+        confirm_yn "Reboot this system now? [y/N]: " "N" && { if [[ "$HAS_SYSTEMD" == true ]]; then run_root systemctl reboot; elif [[ "$IS_MACOS" == true ]]; then run_root shutdown -r now; else run_root reboot; fi; exit 0; }
         sleep 1
         ;;
       q|Q) exit 0 ;;
@@ -10561,6 +11936,7 @@ is_step_managed_by_wizard() {
     nvidia_persistenced) unit_exists nvidia-persistenced.service || service_installed strata-nvidia-persistenced.service ;;
     cstate_limit)        service_installed strata-cstate-limit.service ;;
     pcie_aspm)           [[ -f /etc/udev/rules.d/99-strata-pcie-aspm.rules ]] || grep -q "pcie_aspm=off" /proc/cmdline 2>/dev/null ;;
+    macos_wired_limit)   service_installed strata-macos-wired-limit.service ;;
     *)                   return 0 ;;
   esac
 }
@@ -10569,15 +11945,35 @@ print_check_summary() {
   build_active_steps
 
   local init_desc="systemd"
-  [[ "$HAS_SYSTEMD" != true ]] && init_desc="non-systemd"
+  if [[ "$HAS_LAUNCHD" == true ]]; then
+    init_desc="launchd"
+  elif [[ "$HAS_SYSTEMD" != true ]]; then
+    init_desc="non-systemd"
+  fi
   local platform_tags=()
+  if [[ "$IS_MACOS" == true ]]; then
+    if [[ "$IS_APPLE_SILICON" == true ]]; then
+      platform_tags+=("macOS Apple Silicon")
+    else
+      platform_tags+=("macOS Intel")
+    fi
+  fi
+  if [[ "$IS_ASAHI_LINUX" == true ]]; then
+    platform_tags+=("Apple Silicon / Asahi Linux")
+  elif [[ "$IS_APPLE_LINUX" == true ]]; then
+    platform_tags+=("Apple Mac Linux")
+  fi
   [[ "$IS_UNRAID" == true ]] && platform_tags+=("Unraid")
   [[ "$IS_TRUENAS" == true ]] && platform_tags+=("TrueNAS")
   [[ "$IS_SYNOLOGY" == true ]] && platform_tags+=("Synology")
   [[ "$IS_JETSON" == true ]] && platform_tags+=("Jetson")
+  [[ "$IS_LAPTOP" == true ]] && platform_tags+=("laptop")
   [[ -n "$IS_VIRT" ]] && platform_tags+=("VM:${IS_VIRT}")
-  local tag_str=""
-  [[ ${#platform_tags[@]} -gt 0 ]] && tag_str=" (${platform_tags[*]})"
+  local tag_str="" _tag_joined=""
+  if (( ${#platform_tags[@]} > 0 )); then
+    printf -v _tag_joined ', %s' "${platform_tags[@]}"
+    tag_str=" (${_tag_joined:2})"
+  fi
 
   local strata_desc="not detected"
   if [[ -n "$STRATA_BIN" ]]; then
@@ -10596,6 +11992,9 @@ print_check_summary() {
   echo "  CPU:      ${CPU_SUMMARY:-Unknown} (sockets: ${CPU_SOCKETS}, NUMA nodes: ${NUMA_NODES})"
   echo "  RAM:      ${RAM_GB} GiB${RAM_DETAILS}"
   echo "  GPU(s):   ${GPU_SUMMARY:-Unknown}"
+  if [[ "$IS_MACOS" == true && "$IS_APPLE_SILICON" == true ]]; then
+    echo "    Platform: Apple Silicon (${MACOS_CHIP:-Apple}, ${MACOS_MODEL_ID:-Mac}, macOS ${MACOS_VER:-unknown})"
+  fi
   if [[ "$HAS_NVIDIA" == true && ${#NVIDIA_GPU_INDICES[@]} -gt 0 ]]; then
     local i mi mig_info cc_info vram_info
     for (( i = 0; i < ${#NVIDIA_GPU_INDICES[@]}; i++ )); do
@@ -10649,6 +12048,13 @@ print_check_summary() {
     [[ -n "$_hl" ]] && printf "  %s\n" "$_hl"
   done
   echo "  Strata:   ${strata_desc}"
+  local _hw_warns _hw_line
+  _hw_warns="$(format_strata_hw_warnings)"
+  if [[ -n "$_hw_warns" ]]; then
+    while IFS= read -r _hw_line; do
+      [[ -n "$_hw_line" ]] && echo "  ${_hw_line}"
+    done <<< "$_hw_warns"
+  fi
   echo ""
   echo -e "${C_BOLD}Applicable Steps (${#ACTIVE_STEPS[@]}):${C_RESET}"
 
@@ -10707,7 +12113,7 @@ show_check_page() {
     body+="$(echo -e "  ${C_DIM}Read-only summary. Press ${C_BOLD}[i / b / Enter / Esc]${C_RESET}${C_DIM} to return to Index, or ${C_BOLD}[q]${C_RESET}${C_DIM} to Quit.${C_RESET}")"$'\n\n'
     printf "%s" "$body"
     local body_lines lines_up action=""
-    body_lines="$(printf "%s" "$body" | wc -l)"
+    body_lines="$(printf "%s" "$body" | wc -l | tr -d '[:space:]')"
     lines_up=$(( LIVE_STATS_COUNT + POST_HEADER_LINES + body_lines ))
     read_step_action action "$lines_up"
     case "$action" in
@@ -10764,7 +12170,11 @@ if [[ "$CHECK_ONLY" == true ]]; then
 fi
 
 if [[ $EUID -ne 0 && -t 0 ]] && command -v sudo >/dev/null 2>&1 && ! sudo -n true >/dev/null 2>&1; then
-  echo -e "${C_DIM}Sudo access is used for hardware sensors (RAPL CPU power, DMI RAM info) and applying optimizations.${C_RESET}"
+  if [[ "$IS_MACOS" == true ]]; then
+    echo -e "${C_DIM}Sudo access is used for hardware sensors (powermetrics GPU/CPU power) and applying optimizations.${C_RESET}"
+  else
+    echo -e "${C_DIM}Sudo access is used for hardware sensors (RAPL CPU power, DMI RAM info) and applying optimizations.${C_RESET}"
+  fi
   sudo -v || true
 fi
 detect_platform_basics
