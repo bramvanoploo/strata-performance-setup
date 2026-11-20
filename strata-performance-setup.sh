@@ -34,14 +34,16 @@ STRATA_API_KEY="${STRATA_API_KEY:-}"
 CHECK_ONLY=false
 DISTRO_FAMILY="unknown" DISTRO_ID="unknown" OS_PRETTY="" KERNEL_VER="" AUR_HELPER="" HAS_SYSTEMD=true IS_UNRAID=false IS_TRUENAS=false IS_SYNOLOGY=false
 HAS_NVIDIA=false HAS_NVIDIA_POWERD=false HAS_AMD=false HAS_INTEL_GPU=false HAS_INTEL_ARC=false
+HAS_AMD_APU=false HAS_AMD_PREBUILT_GFX=false AMD_GTT_TOTAL_MB=0
 HAS_NVIDIA_TESLA=false HAS_NVIDIA_NON_TESLA=false NVIDIA_COMPUTE_MODE_NON_DEFAULT=false
-GPU_SUMMARY="" GPU_RAW="" CPU_SUMMARY="" RAM_GB=0 RAM_DETAILS="" NVIDIA_VRAM_MB=0 TOTAL_VRAM_MB=0
+GPU_SUMMARY="" GPU_RAW="" AMD_GFX_SUMMARY="" AMD_MISSING_GFX_SUMMARY="" CPU_SUMMARY="" RAM_GB=0 RAM_DETAILS="" NVIDIA_VRAM_MB=0 TOTAL_VRAM_MB=0
 HAS_MSI_EC=false SYS_VENDOR="" PRODUCT_NAME="" IS_LAPTOP=false HAS_ASPM=false
 IS_JETSON=false IS_JETSON_TX2=false JETSON_MODEL="" JETSON_L4T_REL="" JETSON_SOC=""
 NVIDIA_DEFAULT_PL="" NVIDIA_MAX_PL="" NVIDIA_CURRENT_PL=""
 NVIDIA_MAX_GFX_CLK="" NVIDIA_MAX_MEM_CLK="" NVIDIA_ECC_CUR="" NVIDIA_ECC_PEND=""
 IS_VIRT="" NUMA_NODES=1 CPU_SOCKETS=1 DISCRETE_GPU_COUNT=0 DMI_MEM_CACHE=""
 declare -a RAM_HEALTH_LINES=() GPU_TOPO_LINES=()
+declare -a AMD_GFX_ARCHS=() AMD_MISSING_GFX_ARCHS=()
 declare -a NVIDIA_GPU_INDICES=() NVIDIA_GPU_NAMES=() NVIDIA_GPU_CUR_PL=() NVIDIA_GPU_DEF_PL=() NVIDIA_GPU_MAX_PL=() NVIDIA_GPU_VRAM=() NVIDIA_GPU_COMPUTE_MODE=() NVIDIA_GPU_IS_TESLA=() NVIDIA_GPU_PL_SUPPORTED=()
 declare -a NVIDIA_GPU_MAX_GFX_CLK=() NVIDIA_GPU_MAX_MEM_CLK=() NVIDIA_ECC_INDICES=()
 RYZENADJ_MARKER="/etc/strata-ryzenadj.prev" RAPL_MARKER="/etc/strata-rapl.prev" TUNED_MARKER="/etc/strata-tuned.prev" NUMACTL_MARKER="/etc/strata-numactl.enabled"
@@ -53,6 +55,7 @@ TERM_COLS_CACHED=120 LIVE_COMPACT_SYS="" LIVE_COMPACT_STRATA=""
 declare -a LIVE_STAT_LINES=() SYS_INFO_LINES=() STRATA_STAT_LINES=() STRATA_BENCH_LINES=()
 STRATA_BENCH_CACHE_KEY=""
 BENCH_HISTORY_COUNT_KEY="" BENCH_HISTORY_COUNT_CACHE=0
+LOCAL_HIP_INFO_CACHE_KEY="" LOCAL_HIP_INFO_CACHE_MATCH="" LOCAL_HIP_INFO_CACHE_ANY=""
 STRATA_BENCH_HISTORY_FILE="$TARGET_HOME/.local/share/strata-performance-setup/bench-history.json"
 BENCH_POWER_SAMPLER_PID="" BENCH_POWER_TMP_FILE=""
 ACTIVE_SAMPLER_PID="" ACTIVE_SAMPLER_TMP=""
@@ -70,8 +73,16 @@ run_root() {
 }
 
 run_as_user() {
-  local env_prefix=""
+  local env_prefix="" _ag _has_1150=false _has_1103=false
   [[ -n "${STRATA_API_KEY:-}" ]] && printf -v env_prefix 'export STRATA_API_KEY=%q; ' "$STRATA_API_KEY"
+  if (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )); then
+    for _ag in "${AMD_MISSING_GFX_ARCHS[@]}"; do
+      case "$_ag" in
+        gfx1150) [[ "$_has_1150" == false ]] && { env_prefix+="export STRATA_EXPERIMENTAL_GFX1150=1; "; _has_1150=true; } ;;
+        gfx1103) [[ "$_has_1103" == false ]] && { env_prefix+="export STRATA_EXPERIMENTAL_GFX1103=1; "; _has_1103=true; } ;;
+      esac
+    done
+  fi
   if [[ $EUID -eq 0 && "$TARGET_USER" != "root" ]]; then
     if command -v runuser >/dev/null 2>&1; then
       runuser -u "$TARGET_USER" -- bash -c "${env_prefix}$*"
@@ -85,8 +96,18 @@ run_as_user() {
 
 # Argument-safe execution as TARGET_USER without extra shell interpolation.
 run_as_user_exec() {
-  local -a env_cmd=()
-  [[ -n "${STRATA_API_KEY:-}" ]] && env_cmd=(env "STRATA_API_KEY=${STRATA_API_KEY}")
+  local -a env_args=() env_cmd=()
+  local _ag _has_1150=false _has_1103=false
+  [[ -n "${STRATA_API_KEY:-}" ]] && env_args+=("STRATA_API_KEY=${STRATA_API_KEY}")
+  if (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )); then
+    for _ag in "${AMD_MISSING_GFX_ARCHS[@]}"; do
+      case "$_ag" in
+        gfx1150) [[ "$_has_1150" == false ]] && { env_args+=("STRATA_EXPERIMENTAL_GFX1150=1"); _has_1150=true; } ;;
+        gfx1103) [[ "$_has_1103" == false ]] && { env_args+=("STRATA_EXPERIMENTAL_GFX1103=1"); _has_1103=true; } ;;
+      esac
+    done
+  fi
+  (( ${#env_args[@]} > 0 )) && env_cmd=(env "${env_args[@]}")
   if [[ $EUID -eq 0 && "$TARGET_USER" != "root" ]]; then
     if command -v runuser >/dev/null 2>&1; then
       runuser -u "$TARGET_USER" -- ${env_cmd[@]+"${env_cmd[@]}"} "$@"
@@ -199,10 +220,23 @@ install_service() {
   fi
 
   local name="${unit%.service}" rc_script="/etc/rc.d/rc.strata.${unit%.service}"
-  local content start_cmds="" stop_cmds="" line cmd ignore_err
+  local content env_cmds="" start_cmds="" stop_cmds="" line cmd ignore_err ev ek evv
   content="$(cat)"
   while IFS= read -r line; do
-    if [[ "$line" =~ ^ExecStart=(.*)$ ]]; then
+    if [[ "$line" =~ ^Environment=(.*)$ ]]; then
+      ev="${BASH_REMATCH[1]}"
+      [[ "$ev" == \"*\" ]] && ev="${ev#\"}" && ev="${ev%\"}"
+      if [[ "$ev" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+        ek="${BASH_REMATCH[1]}"
+        evv="${BASH_REMATCH[2]}"
+        if [[ "$evv" =~ ^[A-Za-z0-9_.,:/+-]*$ ]]; then
+          env_cmds+="export ${ek}=${evv}"$'\n'
+        else
+          evv="$(printf "%s" "$evv" | sed "s/'/'\\\\''/g")"
+          env_cmds+="export ${ek}='${evv}'"$'\n'
+        fi
+      fi
+    elif [[ "$line" =~ ^ExecStart=(.*)$ ]]; then
       cmd="${BASH_REMATCH[1]}"
       ignore_err=""
       if [[ "$cmd" == -* ]]; then cmd="${cmd#-}"; ignore_err=" || true"; fi
@@ -218,7 +252,7 @@ install_service() {
   run_root tee "$rc_script" >/dev/null <<EOF
 #!/bin/sh
 # Managed by strata-performance-setup (${unit})
-case "\$1" in
+${env_cmds}case "\$1" in
   start)
 ${start_cmds:-    :}
     ;;
@@ -787,6 +821,348 @@ detect_jetson_platform() {
   fi
 }
 
+_array_contains_val() {
+  local needle="$1"; shift
+  local item
+  for item in "$@"; do
+    [[ "$item" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+amd_gfx_has_prebuilt() {
+  case "$1" in
+    gfx1200|gfx1201|gfx1100|gfx1101|gfx1102|gfx1030|gfx1031|gfx1032|gfx1151) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+amd_gfx_is_missing_target() {
+  amd_gfx_has_prebuilt "$1" && return 1
+  case "$1" in
+    gfx1036) return 1 ;; # 2-CU Raphael/Granite Ridge desktop display iGPU
+    gfx101[0-9a-f]|gfx103[0-9a-f]|gfx110[0-9a-f]|gfx115[0-9a-f]|gfx120[0-9a-f]|gfx906) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+amd_gfx_is_uma_apu() {
+  case "$1" in
+    gfx115[0-9a-f]|gfx1103|gfx1033|gfx1035|gfx1036|gfx1037|gfx90c|gfx902|gfx909) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+_is_amd_compute_apu_gfx() {
+  case "$1" in
+    gfx115[0-9a-f]|gfx1103|gfx1033|gfx1035|gfx1037|gfx90c|gfx902|gfx909) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+amd_has_gfx() {
+  (( ${#AMD_GFX_ARCHS[@]} > 0 )) && _array_contains_val "$1" "${AMD_GFX_ARCHS[@]}"
+}
+
+amd_missing_has_gfx() {
+  (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )) && _array_contains_val "$1" "${AMD_MISSING_GFX_ARCHS[@]}"
+}
+
+strata_amd_opt_in_env_list() {
+  amd_missing_has_gfx "gfx1150" && echo "STRATA_EXPERIMENTAL_GFX1150=1"
+  amd_missing_has_gfx "gfx1103" && echo "STRATA_EXPERIMENTAL_GFX1103=1"
+  return 0
+}
+
+amd_gfx_label() {
+  case "$1" in
+    gfx1150) echo "Radeon 890M / 880M (Strix Point APU)" ;;
+    gfx1151) echo "Radeon 8060S / 8050S (Strix Halo APU)" ;;
+    gfx1152) echo "Radeon 860M / 840M (Krackan Point APU)" ;;
+    gfx1153) echo "Radeon APU (RDNA 3.5)" ;;
+    gfx1103) echo "Radeon 780M / 760M / 740M (Phoenix / Hawk Point APU)" ;;
+    gfx1010) echo "Radeon RX 5700 / 5600 (RDNA1)" ;;
+    gfx1011) echo "Radeon Pro V520 / 5600M (RDNA1)" ;;
+    gfx1012) echo "Radeon RX 5500 (RDNA1)" ;;
+    gfx1033) echo "Radeon Graphics (Van Gogh APU)" ;;
+    gfx1034) echo "Radeon RX 6500 XT / 6400 (RDNA2)" ;;
+    gfx906)  echo "Instinct MI50 / MI60 / Radeon VII (Vega 20 wave64)" ;;
+    gfx1201) echo "Radeon RX 9070 / AI PRO R9700 (RDNA4)" ;;
+    gfx1200) echo "Radeon RX 9060 (RDNA4)" ;;
+    gfx1100) echo "Radeon RX 7900 / W7900 (RDNA3)" ;;
+    gfx1101) echo "Radeon RX 7800 / 7700 (RDNA3)" ;;
+    gfx1102) echo "Radeon RX 7600 (RDNA3)" ;;
+    gfx1030) echo "Radeon RX 6900 / 6800 (RDNA2)" ;;
+    gfx1031) echo "Radeon RX 6700 XT (RDNA2)" ;;
+    gfx1032) echo "Radeon RX 6600 (RDNA2)" ;;
+    gfx1035) echo "Radeon 680M / 660M (Rembrandt APU)" ;;
+    gfx1036) echo "Radeon Graphics (Raphael / Granite Ridge iGPU)" ;;
+    gfx1037) echo "Radeon 610M (Mendocino APU)" ;;
+    gfx90c)  echo "Radeon Vega iGPU (Cezanne / Renoir APU)" ;;
+    gfx902)  echo "Radeon Vega iGPU (Raven Ridge / Picasso APU)" ;;
+    gfx909)  echo "Radeon Vega iGPU (Renoir / Picasso APU)" ;;
+    *)       echo "AMD Radeon ($1)" ;;
+  esac
+}
+
+amd_gfx_therock_family() {
+  case "$1" in
+    gfx115[0-9a-f]) echo "$1" ;;
+    gfx110[0-9a-f]) echo "gfx110X-all" ;;
+    gfx103[0-9a-f]) echo "gfx103X-all" ;;
+    gfx101[0-9a-f]) echo "gfx101X-dgpu" ;;
+    gfx120[0-9a-f]) echo "gfx120X-all" ;;
+    gfx125[0-9a-f]) echo "gfx125X-dcgpu" ;;
+    *) return 1 ;;
+  esac
+}
+
+amd_gfx_from_pci_id() {
+  case "${1,,}" in
+    0x150e) echo "gfx1150" ;;
+    0x1586) echo "gfx1151" ;;
+    0x1114|0x1902) echo "gfx1152" ;;
+    0x15bf|0x15c8|0x164f|0x1900|0x1901) echo "gfx1103" ;;
+    0x7550|0x7551) echo "gfx1201" ;;
+    0x7590) echo "gfx1200" ;;
+    0x744c|0x7448|0x745e) echo "gfx1100" ;;
+    0x747e) echo "gfx1101" ;;
+    0x7480) echo "gfx1102" ;;
+    0x73bf|0x73af|0x73a5|0x73a1) echo "gfx1030" ;;
+    0x73df) echo "gfx1031" ;;
+    0x73ff|0x73ef|0x73e3) echo "gfx1032" ;;
+    0x163f) echo "gfx1033" ;;
+    0x743f|0x7422|0x7423|0x7424) echo "gfx1034" ;;
+    0x1681) echo "gfx1035" ;;
+    0x164e|0x13c0) echo "gfx1036" ;;
+    0x1506) echo "gfx1037" ;;
+    0x1638|0x1636) echo "gfx90c" ;;
+    0x731f|0x7310|0x7312|0x7318|0x7319|0x731a|0x731b|0x731e) echo "gfx1010" ;;
+    0x7360|0x7362) echo "gfx1011" ;;
+    0x7340|0x7341|0x7347|0x734f) echo "gfx1012" ;;
+    0x66a0|0x66a1|0x66a2|0x66a3|0x66a7|0x66af) echo "gfx906" ;;
+    *) return 1 ;;
+  esac
+}
+
+_is_amd_apu_pci_id() {
+  case "${1,,}" in
+    0x1586|0x150e|0x1114|0x1902|0x15bf|0x15c8|0x164f|0x1900|0x1901|0x163f|0x1681|0x1506|0x1638|0x1636|0x15d8|0x15e7) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+_is_drm_card_amd_apu() {
+  local dev_dir="$1" ven="" did="" gfx="" vt="" gt=""
+  [[ -d "$dev_dir" ]] || return 1
+  if [[ -r "$dev_dir/vendor" ]]; then
+    ven="$(tr '[:upper:]' '[:lower:]' < "$dev_dir/vendor" 2>/dev/null || true)"
+    [[ "$ven" == "0x1002" ]] || return 1
+  fi
+  if [[ -r "$dev_dir/device" ]]; then
+    did="$(tr '[:upper:]' '[:lower:]' < "$dev_dir/device" 2>/dev/null || true)"
+    if [[ "$did" =~ ^0x[0-9a-f]+$ ]]; then
+      _is_amd_apu_pci_id "$did" && return 0
+      gfx="$(amd_gfx_from_pci_id "$did" || true)"
+      if [[ -n "$gfx" ]]; then
+        _is_amd_compute_apu_gfx "$gfx" && return 0
+        [[ "$gfx" == "gfx1036" && "$HAS_AMD_APU" == true ]] && return 0
+        return 1
+      fi
+    fi
+  fi
+  [[ "$HAS_AMD_APU" == true ]] || return 1
+  [[ -r "$dev_dir/mem_info_vram_total" && -r "$dev_dir/mem_info_gtt_total" ]] || return 1
+  vt="$(cat "$dev_dir/mem_info_vram_total" 2>/dev/null || echo 0)"
+  gt="$(cat "$dev_dir/mem_info_gtt_total" 2>/dev/null || echo 0)"
+  [[ "$vt" =~ ^[0-9]+$ && "$gt" =~ ^[0-9]+$ ]] || return 1
+  (( vt == 0 || (vt <= 34359738368 && gt > vt) ))
+}
+
+amd_gfx_from_name() {
+  local name="$1"
+  if grep -qiE '\b(8060S|8050S|8040S)\b|Strix Halo|Ryzen AI Max' <<<"$name"; then echo "gfx1151"
+  elif grep -qiE '\b(890M|880M)\b|Strix Point' <<<"$name"; then echo "gfx1150"
+  elif grep -qiE '\b(860M|840M)\b|Krackan' <<<"$name"; then echo "gfx1152"
+  elif grep -qiE '\b(780M|760M|740M)\b|Phoenix|Hawk Point' <<<"$name"; then echo "gfx1103"
+  elif grep -qiE '\b(680M|660M)\b|Rembrandt' <<<"$name"; then echo "gfx1035"
+  elif grep -qiE '\b610M\b|Mendocino' <<<"$name"; then echo "gfx1037"
+  elif grep -qiE 'Van Gogh' <<<"$name"; then echo "gfx1033"
+  elif grep -qiE '\bRX 9070\b|\bR9700\b' <<<"$name"; then echo "gfx1201"
+  elif grep -qiE '\bRX 9060\b' <<<"$name"; then echo "gfx1200"
+  elif grep -qiE '\bRX 7900\b' <<<"$name"; then echo "gfx1100"
+  elif grep -qiE '\bRX 7[78]00\b' <<<"$name"; then echo "gfx1101"
+  elif grep -qiE '\bRX 7600\b' <<<"$name"; then echo "gfx1102"
+  elif grep -qiE '\bRX 6(800|900|950)\b' <<<"$name"; then echo "gfx1030"
+  elif grep -qiE '\bRX 67[05]0\b' <<<"$name"; then echo "gfx1031"
+  elif grep -qiE '\bRX 66[05]0\b' <<<"$name"; then echo "gfx1032"
+  elif grep -qiE '\bRX 6(400|500)\b' <<<"$name"; then echo "gfx1034"
+  elif grep -qiE '\bRX 5[67]00\b' <<<"$name"; then echo "gfx1010"
+  elif grep -qiE 'Pro V520|\b5600M\b' <<<"$name"; then echo "gfx1011"
+  elif grep -qiE '\bRX 5500\b' <<<"$name"; then echo "gfx1012"
+  elif grep -qiE '\bMI50\b|\bMI60\b|Radeon VII' <<<"$name"; then echo "gfx906"
+  elif grep -qiE 'Raphael|Granite Ridge' <<<"$name"; then echo "gfx1036"
+  else return 1; fi
+}
+
+_append_unique_amd_gfx() {
+  local g="$1"
+  [[ -n "$g" ]] || return 0
+  if (( ${#AMD_GFX_ARCHS[@]} == 0 )) || ! _array_contains_val "$g" "${AMD_GFX_ARCHS[@]}"; then
+    AMD_GFX_ARCHS+=("$g")
+  fi
+}
+
+detect_amd_gfx_archs() {
+  AMD_GFX_ARCHS=()
+  AMD_MISSING_GFX_ARCHS=()
+  AMD_GFX_SUMMARY=""
+  AMD_MISSING_GFX_SUMMARY=""
+  HAS_AMD_APU=false
+  HAS_AMD_PREBUILT_GFX=false
+  AMD_GTT_TOTAL_MB=0
+
+  local kfd_dir="${STRATA_KFD_NODES_DIR:-/sys/class/kfd/kfd/topology/nodes}"
+  local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}"
+
+  # 1. Primary probe: KFD sysfs topology
+  if [[ -d "$kfd_dir" ]]; then
+    local prop val n_dec gfx
+    for prop in "$kfd_dir"/*/properties; do
+      [[ -r "$prop" ]] || continue
+      val="$(awk '$1 == "gfx_target_version" {print $2; exit}' "$prop" 2>/dev/null || true)"
+      if [[ "$val" =~ ^[0-9]+$ ]] && (( 10#$val > 0 )); then
+        n_dec=$(( 10#$val ))
+        gfx="$(printf 'gfx%d%x%x' "$(( n_dec / 10000 ))" "$(( (n_dec / 100) % 100 ))" "$(( n_dec % 100 ))")"
+        _append_unique_amd_gfx "$gfx"
+      fi
+    done
+  fi
+
+  # 2. Secondary probe: rocminfo
+  if (( ${#AMD_GFX_ARCHS[@]} == 0 )) && command -v rocminfo >/dev/null 2>&1; then
+    local r_out gfx
+    r_out="$(rocminfo 2>/dev/null || true)"
+    while IFS= read -r gfx; do
+      _append_unique_amd_gfx "$gfx"
+    done < <(awk '/^[[:space:]]*Name:[[:space:]]*gfx[0-9a-fA-F]+/ {print tolower($2)}' <<<"$r_out")
+  fi
+
+  # 3. Tertiary probe: PCI device IDs (sysfs DRM, then lspci -nn)
+  local card ven did gfx found_pci=false
+  if (( ${#AMD_GFX_ARCHS[@]} == 0 )) && [[ -d "$drm_dir" ]]; then
+    for card in "$drm_dir"/card[0-9]*; do
+      [[ -e "$card" ]] || continue
+      [[ "$(basename "$card")" == *-* ]] && continue
+      ven="$(tr '[:upper:]' '[:lower:]' < "$card/device/vendor" 2>/dev/null || true)"
+      [[ "$ven" == "0x1002" ]] || continue
+      did="$(tr '[:upper:]' '[:lower:]' < "$card/device/device" 2>/dev/null || true)"
+      [[ "$did" =~ ^0x[0-9a-f]+$ ]] || continue
+      found_pci=true
+      _is_amd_apu_pci_id "$did" && HAS_AMD_APU=true
+      gfx="$(amd_gfx_from_pci_id "$did" || true)"
+      _append_unique_amd_gfx "$gfx"
+    done
+  fi
+  if (( ${#AMD_GFX_ARCHS[@]} == 0 )) && [[ "$found_pci" == false ]] && command -v lspci >/dev/null 2>&1; then
+    local lspci_nn l
+    lspci_nn="$(lspci -nn 2>/dev/null | grep -iE "vga|3d|display" || true)"
+    while IFS= read -r l; do
+      [[ -n "$l" ]] || continue
+      if [[ "$l" =~ \[1002:([0-9a-fA-F]{4})\] ]]; then
+        did="0x${BASH_REMATCH[1],,}"
+        _is_amd_apu_pci_id "$did" && HAS_AMD_APU=true
+        gfx="$(amd_gfx_from_pci_id "$did" || true)"
+        _append_unique_amd_gfx "$gfx"
+      fi
+    done <<<"$lspci_nn"
+  fi
+
+  # 4. Quaternary probe: marketing name fallback from lspci
+  if (( ${#AMD_GFX_ARCHS[@]} == 0 )) && [[ "$HAS_AMD" == true && -n "$GPU_RAW" ]]; then
+    local gline gfx
+    while IFS= read -r gline; do
+      [[ -n "$gline" ]] || continue
+      grep -qiE "amd|ati|radeon" <<<"$gline" || continue
+      gfx="$(amd_gfx_from_name "$gline" || true)"
+      _append_unique_amd_gfx "$gfx"
+    done <<<"$GPU_RAW"
+  fi
+
+  # Ensure LXC / container KFD-only hosts still set HAS_AMD and GPU_SUMMARY
+  if (( ${#AMD_GFX_ARCHS[@]} > 0 )); then
+    HAS_AMD=true
+    if [[ -z "$GPU_SUMMARY" || "$GPU_SUMMARY" == "Unknown" ]]; then
+      local a sum="" lbl
+      for a in "${AMD_GFX_ARCHS[@]}"; do
+        lbl="AMD $(amd_gfx_label "$a") [$a]"
+        sum="${sum:+${sum}; }${lbl}"
+      done
+      [[ -n "$sum" ]] && GPU_SUMMARY="$sum"
+    fi
+  fi
+
+  # Classify detected architectures
+  local a has_display_igpu=false
+  if (( ${#AMD_GFX_ARCHS[@]} > 0 )); then
+    for a in "${AMD_GFX_ARCHS[@]}"; do
+      amd_gfx_has_prebuilt "$a" && HAS_AMD_PREBUILT_GFX=true
+      if amd_gfx_is_missing_target "$a"; then
+        if (( ${#AMD_MISSING_GFX_ARCHS[@]} == 0 )) || ! _array_contains_val "$a" "${AMD_MISSING_GFX_ARCHS[@]}"; then
+          AMD_MISSING_GFX_ARCHS+=("$a")
+        fi
+      fi
+      if _is_amd_compute_apu_gfx "$a"; then
+        HAS_AMD_APU=true
+      elif [[ "$a" == "gfx1036" ]]; then
+        has_display_igpu=true
+      fi
+    done
+  fi
+
+  if [[ "$HAS_AMD_APU" == false && "$HAS_NVIDIA" == false && "$HAS_INTEL_ARC" == false && "$HAS_AMD_PREBUILT_GFX" == false && ${#AMD_MISSING_GFX_ARCHS[@]} -eq 0 ]]; then
+    if [[ "$has_display_igpu" == true ]]; then
+      HAS_AMD_APU=true
+    elif [[ "$HAS_AMD" == true && -n "$GPU_RAW" ]]; then
+      grep -iE "AMD|ATI|Radeon" <<<"$GPU_RAW" | grep -qiE "Raphael|Granite Ridge|Radeon Graphics" && HAS_AMD_APU=true
+    fi
+  fi
+  if [[ "$HAS_AMD_APU" == false && "$HAS_AMD" == true && -n "$GPU_RAW" ]]; then
+    grep -iE "AMD|ATI|Radeon" <<<"$GPU_RAW" | grep -qiE "Strix|Phoenix|Hawk Point|Rembrandt|Barcelo|Cezanne|Renoir|Lucienne|Mendocino|Krackan|Kraken|Picasso|Raven|Van Gogh|Vega Series|Vega Mobile|Radeon [0-9]{3}M|Radeon 8[0-9]{2,3}S" && HAS_AMD_APU=true
+  fi
+
+  if (( ${#AMD_GFX_ARCHS[@]} > 0 )); then
+    local IFS=,
+    AMD_GFX_SUMMARY="${AMD_GFX_ARCHS[*]}"
+  fi
+  if (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )); then
+    local IFS=,
+    AMD_MISSING_GFX_SUMMARY="${AMD_MISSING_GFX_ARCHS[*]}"
+  fi
+
+  # Record AMD APU GTT pool size across AMD DRM cards (shared system-RAM TTM pool: take max, not sum)
+  if [[ "$HAS_AMD_APU" == true && -d "$drm_dir" ]]; then
+    local gt gt_mb max_apu_gtt=0 max_any_gtt=0
+    for card in "$drm_dir"/card[0-9]*; do
+      [[ -e "$card" ]] || continue
+      [[ "$(basename "$card")" == *-* ]] && continue
+      [[ -r "$card/device/mem_info_gtt_total" ]] || continue
+      if [[ -r "$card/device/vendor" ]]; then
+        ven="$(tr '[:upper:]' '[:lower:]' < "$card/device/vendor" 2>/dev/null || true)"
+        [[ "$ven" == "0x1002" ]] || continue
+      fi
+      gt="$(cat "$card/device/mem_info_gtt_total" 2>/dev/null || echo 0)"
+      [[ "$gt" =~ ^[0-9]+$ ]] && (( gt > 0 )) || continue
+      gt_mb=$(( gt / 1048576 ))
+      (( gt_mb > max_any_gtt )) && max_any_gtt=$gt_mb
+      if _is_drm_card_amd_apu "$card/device"; then
+        (( gt_mb > max_apu_gtt )) && max_apu_gtt=$gt_mb
+      fi
+    done
+    AMD_GTT_TOTAL_MB=$(( max_apu_gtt > 0 ? max_apu_gtt : max_any_gtt ))
+  fi
+}
+
 PLATFORM_BASICS_DONE=false
 detect_platform_basics() {
   [[ "$PLATFORM_BASICS_DONE" == true ]] && return 0
@@ -898,6 +1274,8 @@ ensure_script_tools() {
 
 detect_environment() {
   detect_platform_basics
+  TOTAL_VRAM_MB=0
+  NVIDIA_VRAM_MB=0
 
   if command -v nvidia-smi >/dev/null 2>&1; then
     local nv_q
@@ -981,18 +1359,26 @@ detect_environment() {
     GPU_SUMMARY=""
   fi
   [[ -z "$GPU_SUMMARY" ]] && GPU_SUMMARY="Unknown"
+  if echo "$gpu_lines" | grep -qi "intel"; then
+    HAS_INTEL_GPU=true
+    echo "$gpu_lines" | grep -qiE "Arc|DG2|Battlemage|Alchemist" && HAS_INTEL_ARC=true
+  fi
   echo "$gpu_lines" | grep -qiE "amd|ati|radeon" && HAS_AMD=true
+  detect_amd_gfx_archs
   if [[ "$HAS_AMD" == true ]]; then
-    local vram_file vt
-    for vram_file in /sys/class/drm/card*/device/mem_info_vram_total; do
+    local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}" card ven vram_file vt
+    for card in "$drm_dir"/card[0-9]*; do
+      [[ -e "$card" ]] || continue
+      [[ "$(basename "$card")" == *-* ]] && continue
+      if [[ -r "$card/device/vendor" ]]; then
+        ven="$(tr '[:upper:]' '[:lower:]' < "$card/device/vendor" 2>/dev/null || true)"
+        [[ "$ven" == "0x1002" ]] || continue
+      fi
+      vram_file="$card/device/mem_info_vram_total"
       [[ -r "$vram_file" ]] || continue
       vt="$(cat "$vram_file" 2>/dev/null || echo 0)"
       [[ "$vt" =~ ^[0-9]+$ ]] && (( vt > 0 )) && TOTAL_VRAM_MB=$((TOTAL_VRAM_MB + vt / 1048576))
     done
-  fi
-  if echo "$gpu_lines" | grep -qi "intel"; then
-    HAS_INTEL_GPU=true
-    echo "$gpu_lines" | grep -qiE "Arc|DG2|Battlemage|Alchemist" && HAS_INTEL_ARC=true
   fi
 
   if [[ "$IS_JETSON" == true && "$HAS_NVIDIA" == false ]]; then
@@ -1309,7 +1695,7 @@ append_gpu_pcie_lines() {
 # Step Registry
 # ------------------------------------------------------------------------------
 ALL_STEPS=(
-  gpu_unlock amd_apu_memory
+  gpu_unlock amd_apu_memory amd_cwsr_disable
   gpu_groups intel_compute_stack lact_overclock jetson_perf jetson_fan
   nvidia_power_limit amd_gpu_perf intel_gpu_perf ryzenadj_tdp nvidia_ecc nvidia_compute_mode
   headless_target numactl_interleave amd_x3d_mode intel_rapl msi_cooling lenovo_legion
@@ -2904,18 +3290,20 @@ amd_apu_gtt_pages() {
   echo $(( (kb - reserve) / 4 ))
 }
 applicable_amd_apu_memory() {
-  [[ "$HAS_AMD" == true ]] || return 1
-  compgen -G "/sys/class/drm/card*/device/mem_info_gtt_total" >/dev/null 2>&1 || return 1
-  grep -iE "AMD|ATI|Radeon" <<<"$GPU_RAW" | grep -qiE "Strix|Phoenix|Hawk Point|Rembrandt|Barcelo|Cezanne|Renoir|Lucienne|Raphael|Granite Ridge|Mendocino|Krackan|Kraken|Picasso|Raven|Van Gogh|Vega Series|Vega Mobile|Radeon Graphics|Radeon [0-9]{3}M|Radeon 8[0-9]{2,3}S"
+  [[ "$HAS_AMD" == true && "$HAS_AMD_APU" == true ]] || return 1
+  local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}"
+  compgen -G "${drm_dir}/card*/device/mem_info_gtt_total" >/dev/null 2>&1
 }
 title_amd_apu_memory() { echo "AMD APU Unified Memory GPU Limit (ttm.pages_limit ~ $(( $(amd_apu_gtt_pages) * 4 / 1048576 )) GiB)"; }
 status_amd_apu_memory() { [[ -n "$(kernel_param_value ttm.pages_limit || true)" ]]; }
 explain_amd_apu_memory() {
   cat <<EOF
 Impact:
-  Raises the amount of system RAM the GPU can address (GTT) from the default of
-  about half of RAM to ~$(( $(amd_apu_gtt_pages) * 4 / 1048576 )) GiB (all RAM minus a 4 GiB / 12.5% reserve) by adding
-  'ttm.pages_limit' and 'ttm.page_pool_size' to the bootloader kernel command line.
+  Raises the amount of system RAM unified-memory AMD APUs (Strix Point gfx1150,
+  Strix Halo gfx1151, Krackan gfx1152, Phoenix/Hawk Point gfx1103, etc.) can
+  address via GTT from the default of about half of RAM to ~$(( $(amd_apu_gtt_pages) * 4 / 1048576 )) GiB
+  (all RAM minus a 4 GiB / 12.5% reserve) by adding 'ttm.pages_limit' and
+  'ttm.page_pool_size' to the bootloader kernel command line.
   Lets large models fully offload to the integrated GPU. Requires a reboot.
 EOF
 }
@@ -2932,6 +3320,24 @@ revert_amd_apu_memory() {
     [[ -n "$v" ]] && remove_kernel_param "${n}=${v}"
   done
 }
+
+# 12j2. AMD Radeon 780M/760M MES Reset Workaround (gfx1103)
+applicable_amd_cwsr_disable() {
+  amd_has_gfx "gfx1103" || has_kernel_param "amdgpu.cwsr_enable=0"
+}
+title_amd_cwsr_disable() { echo "AMD Radeon 780M/760M MES Reset Workaround (amdgpu.cwsr_enable=0)"; }
+status_amd_cwsr_disable() { has_kernel_param "amdgpu.cwsr_enable=0"; }
+explain_amd_cwsr_disable() {
+  cat <<'EOF'
+Impact:
+  Disables Compute Wave Save/Restore (CWSR) preemption by adding
+  'amdgpu.cwsr_enable=0' to the bootloader kernel command line. Stops MES
+  REMOVE_QUEUE GPU resets seen on Linux with Radeon 780M / 760M (gfx1103,
+  Strata #6132) without increasing idle power draw. Requires a reboot.
+EOF
+}
+apply_amd_cwsr_disable() { add_kernel_param "amdgpu.cwsr_enable=0"; }
+revert_amd_cwsr_disable() { remove_kernel_param "amdgpu.cwsr_enable=0"; }
 
 # 12k. NVMe Tuning
 applicable_nvme_tuning() { compgen -G "/sys/block/nvme*n*" >/dev/null 2>&1; }
@@ -3548,6 +3954,136 @@ applicable_strata_manager() { return 0; }
 title_strata_manager() { echo "Strata: Install, Update, Launch & Systemd Service"; }
 strata_service_installed() { service_installed strata.service; }
 
+strata_components_engine_dir() {
+  local base="${STRATA_COMPONENTS_DIR:-}"
+  if [[ -z "$base" ]]; then
+    local xdg=""
+    [[ -n "${XDG_DATA_HOME:-}" && ( $EUID -ne 0 || "$TARGET_USER" == "root" ) ]] && xdg="$XDG_DATA_HOME"
+    base="${xdg:-$TARGET_HOME/.local/share}/strata/components"
+  fi
+  echo "${base%/}/engine"
+}
+
+invalidate_local_hip_engine_cache() {
+  LOCAL_HIP_INFO_CACHE_KEY=""
+  LOCAL_HIP_INFO_CACHE_MATCH=""
+  LOCAL_HIP_INFO_CACHE_ANY=""
+}
+
+_refresh_local_hip_engine_cache() {
+  local eng_dir=""
+  eng_dir="$(strata_components_engine_dir)"
+  if [[ ! -d "$eng_dir" ]]; then
+    invalidate_local_hip_engine_cache
+    return 0
+  fi
+
+  local missing_key="" mtime_sig="" ckey=""
+  if (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )); then
+    local IFS=','
+    missing_key="${AMD_MISSING_GFX_ARCHS[*]}"
+  fi
+  mtime_sig="$(stat -c '%n:%Y:%s' "$eng_dir" "$eng_dir"/*/engine-component.json 2>/dev/null || true)"
+  ckey="${eng_dir}|${missing_key}|${mtime_sig}"
+  [[ "$ckey" == "$LOCAL_HIP_INFO_CACHE_KEY" ]] && return 0
+
+  LOCAL_HIP_INFO_CACHE_MATCH=""
+  LOCAL_HIP_INFO_CACHE_ANY=""
+  if command -v python3 >/dev/null 2>&1; then
+    local py_out="" line=""
+    py_out="$(python3 - "$eng_dir" "${AMD_MISSING_GFX_ARCHS[@]+"${AMD_MISSING_GFX_ARCHS[@]}"}" <<'PY' 2>/dev/null || true
+import json, os, re, sys
+
+eng_dir = sys.argv[1]
+missing = set(sys.argv[2:])
+
+def ver_key(v):
+    return tuple(int(x) for x in re.findall(r"\d+", str(v or "")))
+
+best_match = None
+best_any = None
+try:
+    entries = os.listdir(eng_dir)
+except OSError:
+    sys.exit(0)
+
+for name in entries:
+    pkg_dir = os.path.join(eng_dir, name)
+    manifest = os.path.join(pkg_dir, "engine-component.json")
+    if not os.path.isfile(manifest):
+        continue
+    try:
+        with open(manifest, encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception:
+        continue
+    if d.get("backend") != "hip":
+        continue
+    entry = d.get("entrypoint") or "strata"
+    if not os.path.isfile(os.path.join(pkg_dir, entry)):
+        continue
+    archs = [str(a) for a in (d.get("archs") or []) if a]
+    arch_set = set(archs)
+    is_local = (bool(d.get("local")) or (d.get("signature") is None)
+                or str(d.get("variant") or "").startswith("local") or "-local" in name)
+    covers_all = 1 if (not missing or missing <= arch_set) else 0
+    ver = str(d.get("version") or "0")
+    cand = (covers_all, ver_key(ver), name, ver, ",".join(archs))
+    if missing and (arch_set & missing):
+        if best_match is None or cand[:3] > best_match[:3]:
+            best_match = cand
+        if best_any is None or cand[:3] > best_any[:3]:
+            best_any = cand
+    elif is_local:
+        if best_any is None or cand[:3] > best_any[:3]:
+            best_any = cand
+
+if best_match is not None:
+    print(f"MATCH:{best_match[2]}|{best_match[3]}|{best_match[4]}|{best_match[0]}")
+if best_any is not None:
+    print(f"ANY:{best_any[2]}|{best_any[3]}|{best_any[4]}|{best_any[0]}")
+PY
+)"
+    while IFS= read -r line; do
+      case "$line" in
+        MATCH:*) LOCAL_HIP_INFO_CACHE_MATCH="${line#MATCH:}" ;;
+        ANY:*)   LOCAL_HIP_INFO_CACHE_ANY="${line#ANY:}" ;;
+      esac
+    done <<< "$py_out"
+  fi
+  LOCAL_HIP_INFO_CACHE_KEY="$ckey"
+  return 0
+}
+
+strata_local_hip_engine_info() {
+  local any_local=false
+  [[ "${1:-}" == "--any-local" ]] && any_local=true
+  if [[ "$any_local" == false ]] && (( ${#AMD_MISSING_GFX_ARCHS[@]} == 0 )); then
+    return 0
+  fi
+  _refresh_local_hip_engine_cache
+  if [[ "$any_local" == true ]]; then
+    [[ -n "$LOCAL_HIP_INFO_CACHE_ANY" ]] && printf '%s\n' "$LOCAL_HIP_INFO_CACHE_ANY"
+  else
+    [[ -n "$LOCAL_HIP_INFO_CACHE_MATCH" ]] && printf '%s\n' "$LOCAL_HIP_INFO_CACHE_MATCH"
+  fi
+  return 0
+}
+
+_amd_gfx_covered_by_local_hip() {
+  local gfx="$1" arch_csv=""
+  _refresh_local_hip_engine_cache
+  [[ -n "$LOCAL_HIP_INFO_CACHE_ANY" ]] || return 1
+  IFS='|' read -r _ _ arch_csv _ <<< "$LOCAL_HIP_INFO_CACHE_ANY"
+  [[ ",${arch_csv}," == *",${gfx},"* ]]
+}
+
+status_strata_build_hip() {
+  (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )) || return 1
+  _refresh_local_hip_engine_cache
+  [[ -n "$LOCAL_HIP_INFO_CACHE_MATCH" && "${LOCAL_HIP_INFO_CACHE_MATCH##*|}" == "1" ]]
+}
+
 check_strata_update_sync() {
   [[ -n "$STRATA_BIN" ]] || return 1
   local json_out parsed=""
@@ -3803,6 +4339,11 @@ format_strata_hw_warnings() {
   elif [[ "$HAS_NVIDIA" == true && "$NVIDIA_VRAM_MB" -gt 0 && "$NVIDIA_VRAM_MB" -lt 6144 ]]; then
     echo -e "${C_YELLOW}[WARNING] NVIDIA GPU VRAM is $((NVIDIA_VRAM_MB / 1024)) GiB (< 6 GiB). Larger Strata models may not fit in VRAM.${C_RESET}"
   fi
+  if (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )) && [[ "$HAS_NVIDIA" == false && "$HAS_AMD_PREBUILT_GFX" == false && "$HAS_INTEL_ARC" == false ]]; then
+    if ! status_strata_build_hip; then
+      echo -e "${C_YELLOW}[NOTE] AMD GPU (${AMD_MISSING_GFX_SUMMARY}) has no official prebuilt Strata Linux engine. Open [STRATA] -> Build Local HIP Engine to compile & register support from source.${C_RESET}"
+    fi
+  fi
   if [[ "$HAS_NVIDIA_TESLA" == true && ${#NVIDIA_GPU_INDICES[@]} -eq 0 ]]; then
     echo -e "${C_YELLOW}[WARNING] NVIDIA Tesla GPU detected without active nvidia-smi. Ensure Above 4G Decoding is enabled in BIOS and use the proprietary nvidia driver (not nvidia-open) for pre-Turing Tesla (V100/P100/P40/P4/M40/M60), or R470 legacy for Kepler (K80/K40).${C_RESET}"
   fi
@@ -3851,8 +4392,11 @@ install_strata_service_fn() {
   fi
   selected_preset="${presets[$((choice-1))]}"
   user_group="$(id -gn "$TARGET_USER")"
-  local numa_prefix=""
+  local numa_prefix="" env_lines="" kv=""
   [[ -f "$NUMACTL_MARKER" ]] && command -v numactl >/dev/null 2>&1 && numa_prefix="$(command -v numactl) --interleave=all "
+  while IFS= read -r kv; do
+    [[ -n "$kv" ]] && env_lines+="Environment=${kv}"$'\n'
+  done < <(strata_amd_opt_in_env_list)
 
   install_service strata.service <<EOF
 [Unit]
@@ -3866,7 +4410,7 @@ RemainAfterExit=yes
 User=${TARGET_USER}
 Group=${user_group}
 WorkingDirectory=${TARGET_HOME}
-ExecStart=${numa_prefix}${STRATA_BIN} launch --preset "${selected_preset}" --no-tui --yes
+${env_lines:+${env_lines%$'\n'}$'\n'}ExecStart=${numa_prefix}${STRATA_BIN} launch --preset "${selected_preset}" --no-tui --yes
 ExecStop=${STRATA_BIN} launch --stop --preset "${selected_preset}"
 LimitMEMLOCK=infinity
 TimeoutStartSec=0
@@ -4949,11 +5493,20 @@ run_strata_benchmark() {
 
 ACTIVE_STRATA_OPTIONS=()
 
+strata_show_build_hip() {
+  (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )) && return 0
+  _refresh_local_hip_engine_cache
+  [[ -n "$LOCAL_HIP_INFO_CACHE_ANY" ]]
+}
+
 build_strata_options() {
   if [[ -z "$STRATA_BIN" ]]; then
     ACTIVE_STRATA_OPTIONS=(install)
   else
     ACTIVE_STRATA_OPTIONS=(update remove service benchmark history)
+  fi
+  if strata_show_build_hip; then
+    ACTIVE_STRATA_OPTIONS+=(build_hip)
   fi
 }
 
@@ -4963,6 +5516,13 @@ title_strata_remove()    { echo "Remove Strata & Uninstall Service"; }
 title_strata_service()   { echo "Manage Strata Systemd Service (strata.service)"; }
 title_strata_benchmark() { echo "Run Strata Benchmark (strata bench run)"; }
 title_strata_history()   { echo "View All Benchmark Results & Coupled Options"; }
+title_strata_build_hip() {
+  if (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )); then
+    echo "Build Local Strata HIP Engine (${AMD_MISSING_GFX_SUMMARY})"
+  else
+    echo "Manage Local Strata HIP Engine"
+  fi
+}
 
 badge_strata_install() {
   [[ -n "$STRATA_BIN" ]] && echo "${C_GREEN}[INSTALLED]    ${C_RESET}" || echo "${C_YELLOW}[NOT INSTALLED]${C_RESET}"
@@ -5006,6 +5566,16 @@ badge_strata_history() {
     echo "${C_DIM}[NONE SAVED]   ${C_RESET}"
   fi
 }
+badge_strata_build_hip() {
+  _refresh_local_hip_engine_cache
+  if (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )) && [[ -n "$LOCAL_HIP_INFO_CACHE_MATCH" && "${LOCAL_HIP_INFO_CACHE_MATCH##*|}" == "1" ]]; then
+    echo "${C_GREEN}[BUILT]        ${C_RESET}"
+  elif [[ -n "$LOCAL_HIP_INFO_CACHE_ANY" ]]; then
+    echo "${C_CYAN}[LOCAL BUILD]  ${C_RESET}"
+  else
+    echo "${C_YELLOW}[NOT BUILT]    ${C_RESET}"
+  fi
+}
 
 strata_action_install() {
   refresh_strata_bin
@@ -5024,6 +5594,12 @@ strata_action_install() {
     run_as_user "curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh | sh"
     refresh_strata_bin
     [[ -n "$STRATA_BIN" && -z "$STRATA_POLLER_PID" ]] && start_strata_update_poller
+    if [[ -n "$STRATA_BIN" ]] && (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )) && ! status_strata_build_hip; then
+      echo ""
+      if confirm_yn "Detected AMD GPU (${AMD_MISSING_GFX_SUMMARY}) has no prebuilt Strata engine package. Build and register a local HIP engine from source now? [Y/n]: " "Y"; then
+        strata_action_build_hip || true
+      fi
+    fi
   fi
 }
 
@@ -5209,6 +5785,872 @@ EOF
   echo -e "\nRecorded benchmark results: ${cnt}"
 }
 
+_user_cache_dir() {
+  if [[ -n "${XDG_CACHE_HOME:-}" && ( $EUID -ne 0 || "$TARGET_USER" == "root" ) ]]; then
+    echo "${XDG_CACHE_HOME%/}"
+  else
+    echo "${TARGET_HOME}/.cache"
+  fi
+}
+
+_is_usable_rocm_root() {
+  local r="${1:-}"
+  [[ -n "$r" && -d "$r" ]] || return 1
+  [[ -x "$r/lib/llvm/bin/clang++" || -x "$r/llvm/bin/clang++" ]] || return 1
+  [[ -d "$r/lib/cmake/hipblas" || -d "$r/lib64/cmake/hipblas" ]]
+}
+
+_resolve_rocm_root_in_dir() {
+  local d="$1" sub=""
+  if _is_usable_rocm_root "$d"; then
+    printf '%s\n' "$d"
+    return 0
+  fi
+  for sub in "$d"/*; do
+    if [[ -d "$sub" ]] && _is_usable_rocm_root "$sub"; then
+      printf '%s\n' "$sub"
+      return 0
+    fi
+  done
+  return 1
+}
+
+_detect_rocm_paths() {
+  local sdk="$1" hip_clang="" hip_cc="" bitcode="" sysdeps_lib="" prefix="" ld_path="" d
+  if [[ -x "$sdk/lib/llvm/bin/clang++" ]]; then
+    hip_clang="$sdk/lib/llvm/bin/clang++"
+    hip_cc="$sdk/lib/llvm/bin/clang"
+  elif [[ -x "$sdk/llvm/bin/clang++" ]]; then
+    hip_clang="$sdk/llvm/bin/clang++"
+    hip_cc="$sdk/llvm/bin/clang"
+  fi
+  for d in "$sdk/lib/llvm/amdgcn/bitcode" "$sdk/amdgcn/bitcode" "$sdk/llvm/amdgcn/bitcode"; do
+    if [[ -d "$d" ]]; then
+      bitcode="$d"
+      break
+    fi
+  done
+  [[ -d "$sdk/lib/rocm_sysdeps/lib" ]] && sysdeps_lib="$sdk/lib/rocm_sysdeps/lib"
+  prefix="$sdk"
+  [[ -d "$sdk/lib/rocm_sysdeps" ]] && prefix+=";${sdk}/lib/rocm_sysdeps"
+  [[ -d "$sdk/lib/llvm" ]] && prefix+=";${sdk}/lib/llvm"
+  [[ -d "$sdk/llvm" ]] && prefix+=";${sdk}/llvm"
+  for d in "$sdk/lib" "$sdk/lib64" "$sysdeps_lib" "$sdk/lib/llvm/lib" "$sdk/llvm/lib"; do
+    [[ -n "$d" && -d "$d" ]] && ld_path="${ld_path:+${ld_path}:}${d}"
+  done
+  printf '%s|%s|%s|%s|%s|%s\n' "$hip_clang" "$hip_cc" "$bitcode" "$sysdeps_lib" "$prefix" "$ld_path"
+}
+
+_ensure_hip_build_deps() {
+  local missing_cmds=() pkgs=() cmd pkg
+  for cmd in git cmake ninja patchelf python3 curl tar; do
+    command -v "$cmd" >/dev/null 2>&1 || missing_cmds+=("$cmd")
+  done
+  if ! command -v g++ >/dev/null 2>&1 && ! command -v c++ >/dev/null 2>&1; then
+    missing_cmds+=("g++")
+  fi
+
+  if (( ${#missing_cmds[@]} > 0 )); then
+    case "$DISTRO_FAMILY" in
+      arch|fedora|debian|suse)
+        for cmd in "${missing_cmds[@]}"; do
+          case "${DISTRO_FAMILY}:${cmd}" in
+            arch:python3)   pkg="python" ;;
+            arch:g++)       pkg="gcc" ;;
+            fedora:ninja)   pkg="ninja-build" ;;
+            fedora:g++)     pkg="gcc-c++" ;;
+            debian:ninja)   pkg="ninja-build" ;;
+            suse:g++)       pkg="gcc-c++" ;;
+            *)              pkg="$cmd" ;;
+          esac
+          if (( ${#pkgs[@]} == 0 )) || ! _array_contains_val "$pkg" "${pkgs[@]}"; then
+            pkgs+=("$pkg")
+          fi
+        done
+        prompt_install_deps repo "${pkgs[@]}" || true
+        ;;
+      *)
+        echo -e "${C_YELLOW}Missing build tools (automatic install unavailable on ${DISTRO_FAMILY}): ${missing_cmds[*]}${C_RESET}"
+        ;;
+    esac
+  fi
+
+  local still_missing=()
+  for cmd in git cmake ninja patchelf python3 curl tar; do
+    command -v "$cmd" >/dev/null 2>&1 || still_missing+=("$cmd")
+  done
+  if ! command -v g++ >/dev/null 2>&1 && ! command -v c++ >/dev/null 2>&1; then
+    still_missing+=("g++")
+  fi
+  if (( ${#still_missing[@]} > 0 )); then
+    echo -e "${C_RED}Missing required build tools: ${still_missing[*]}${C_RESET}"
+    return 1
+  fi
+
+  local cm_ver="" cm_maj=0 cm_min=0
+  cm_ver="$(cmake --version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+' | head -n1 || true)"
+  if [[ "$cm_ver" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
+    cm_maj="${BASH_REMATCH[1]}"
+    cm_min="${BASH_REMATCH[2]}"
+    if (( cm_maj < 3 || (cm_maj == 3 && cm_min < 24) )); then
+      echo -e "${C_YELLOW}[WARNING] CMake ${cm_ver} detected (< 3.24); Strata requires CMake >= 3.24 and configuration may fail.${C_RESET}"
+    fi
+  fi
+  return 0
+}
+
+_ACQUIRED_ROCM_SDK=""
+_acquire_therock_sdk() {
+  local family="$1" cache_base="$2"
+  _ACQUIRED_ROCM_SDK=""
+  local sdk_cache="${cache_base}/rocm-therock-${family}"
+  local sdk="${sdk_cache}/sdk"
+  local resolved=""
+
+  resolved="$(_resolve_rocm_root_in_dir "$sdk" || true)"
+  if [[ -n "$resolved" && -f "${resolved}/.strata_extracted" ]]; then
+    echo -e "${C_GREEN}Reusing cached AMD TheRock ROCm SDK (${family}) at ${resolved}.${C_RESET}"
+    _ACQUIRED_ROCM_SDK="$resolved"
+    return 0
+  fi
+
+  run_as_user_exec mkdir -p "$sdk_cache" || return 1
+  local url="https://repo.amd.com/rocm/tarball-multi-arch/therock-dist-linux-${family}-7.14.1.tar.gz"
+  if ! curl -fsIL --connect-timeout 15 "$url" >/dev/null 2>&1; then
+    echo -e "${C_DIM}TheRock 7.14.1 tarball not directly at default URL; checking AMD multi-arch index for ${family}...${C_RESET}"
+    local index_html="" fname=""
+    index_html="$(curl -fsSL --connect-timeout 15 "https://repo.amd.com/rocm/tarball-multi-arch/" 2>/dev/null || true)"
+    if [[ -n "$index_html" ]]; then
+      fname="$(python3 - "$family" <<<"$index_html" <<'PY' 2>/dev/null || true
+import re, sys
+fam = re.escape(sys.argv[1])
+html = sys.stdin.read()
+hits = re.findall(rf'(therock-dist-linux-{fam}-([0-9]+(?:\.[0-9]+)*)\.tar\.gz)', html)
+best = None
+for fname, ver in hits:
+    if "-tests-" in fname:
+        continue
+    key = tuple(int(x) for x in ver.split("."))
+    if best is None or key > best[0]:
+        best = (key, fname)
+if best:
+    print(best[1])
+PY
+)"
+    fi
+    if [[ -z "$fname" ]]; then
+      echo -e "${C_RED}Could not locate an AMD TheRock Linux tarball for family '${family}'.${C_RESET}"
+      return 1
+    fi
+    url="https://repo.amd.com/rocm/tarball-multi-arch/${fname}"
+  fi
+
+  local tarball="${sdk_cache}/$(basename "$url")"
+  echo -e "${C_CYAN}Downloading AMD TheRock ROCm SDK (${family}): ${url}${C_RESET}"
+  echo -e "${C_DIM}This archive is ~1.7 GB and extracts to ~8 GB; downloads resume automatically if interrupted.${C_RESET}"
+  if ! run_as_user_exec curl -fL --connect-timeout 15 --retry 3 -C - -o "$tarball" "$url"; then
+    run_as_user_exec rm -f "$tarball"
+    run_as_user_exec curl -fL --connect-timeout 15 --retry 3 -o "$tarball" "$url" || {
+      echo -e "${C_RED}Failed to download ${url}.${C_RESET}"
+      return 1
+    }
+  fi
+
+  echo -e "${C_CYAN}Extracting TheRock ROCm SDK into ${sdk}...${C_RESET}"
+  run_as_user_exec rm -rf "$sdk"
+  run_as_user_exec mkdir -p "$sdk"
+  if ! run_as_user_exec tar -xzf "$tarball" -C "$sdk"; then
+    echo -e "${C_RED}Failed to extract ${tarball} (corrupt or incomplete archive); cleaning up cached files.${C_RESET}"
+    run_as_user_exec rm -rf "$tarball" "$sdk"
+    return 1
+  fi
+
+  resolved="$(_resolve_rocm_root_in_dir "$sdk" || true)"
+  if [[ -n "$resolved" ]]; then
+    sdk="$resolved"
+  else
+    echo -e "${C_RED}Extracted ROCm directory at ${sdk} does not appear to contain clang++ and hipblas.${C_RESET}"
+    run_as_user_exec rm -rf "$sdk"
+    return 1
+  fi
+
+  run_as_user_exec touch "${sdk}/.strata_extracted"
+  _ACQUIRED_ROCM_SDK="$sdk"
+  return 0
+}
+
+_PREPARED_STRATA_COMMIT=""
+_prepare_strata_source() {
+  local src_dir="$1" is_wave32="$2"; shift 2
+  local targets=("$@")
+  _PREPARED_STRATA_COMMIT="unknown"
+
+  if [[ -d "${src_dir}/.git" ]]; then
+    echo -e "${C_CYAN}Updating Strata source checkout at ${src_dir}...${C_RESET}"
+    if ! ( run_as_user_exec git -C "$src_dir" fetch --depth 1 origin main && run_as_user_exec git -C "$src_dir" reset --hard origin/main ); then
+      echo -e "${C_YELLOW}Existing checkout update failed; re-cloning cleanly...${C_RESET}"
+      run_as_user_exec rm -rf "$src_dir"
+    fi
+  fi
+
+  if [[ ! -d "${src_dir}/.git" ]]; then
+    echo -e "${C_CYAN}Cloning https://github.com/Niko1221/Strata.git (shallow) into ${src_dir}...${C_RESET}"
+    run_as_user_exec mkdir -p "$(dirname "$src_dir")"
+    run_as_user_exec git clone --depth 1 https://github.com/Niko1221/Strata.git "$src_dir" || return 1
+  fi
+
+  _PREPARED_STRATA_COMMIT="$(run_as_user_exec git -C "$src_dir" rev-parse --short=9 HEAD 2>/dev/null || echo "unknown")"
+
+  if [[ "$is_wave32" == true ]]; then
+    local hip_cmake=""
+    if [[ -f "${src_dir}/engine/cmake/hip_backend.cmake" ]]; then
+      hip_cmake="${src_dir}/engine/cmake/hip_backend.cmake"
+    elif [[ -f "${src_dir}/cmake/hip_backend.cmake" ]]; then
+      hip_cmake="${src_dir}/cmake/hip_backend.cmake"
+    fi
+    if [[ -n "$hip_cmake" ]]; then
+      local patch_msg=""
+      patch_msg="$(run_as_user_exec python3 - "$hip_cmake" "${targets[@]}" <<'PY'
+import re, sys
+
+path = sys.argv[1]
+targets = sys.argv[2:]
+with open(path, encoding="utf-8") as f:
+    text = f.read()
+
+present = set()
+for var in ("_strata_hip_validated", "_strata_hip_community", "_strata_hip_unvalidated"):
+    m = re.search(rf'set\({var}\s+([^\)]+)\)', text, re.DOTALL)
+    if m:
+        present.update(re.findall(r'\bgfx[0-9a-f]+\b', m.group(1).lower()))
+
+missing = [t for t in targets if t not in present]
+if not missing:
+    sys.exit(0)
+
+m = re.search(r'(set\(_strata_hip_unvalidated\s+)([^\)]+)(\))', text, re.DOTALL)
+if not m:
+    print("WARN: could not locate _strata_hip_unvalidated in " + path)
+    sys.exit(0)
+
+suffix = "\n" if "\n" in m.group(2) else ""
+updated = text[:m.start(2)] + m.group(2).rstrip() + " " + " ".join(missing) + suffix + text[m.end(2):]
+with open(path, "w", encoding="utf-8") as f:
+    f.write(updated)
+print("PATCHED:" + ",".join(missing))
+PY
+)"
+      if [[ "$patch_msg" == PATCHED:* ]]; then
+        echo -e "${C_CYAN}Applied Issue #1217-style CMake patch in ${hip_cmake}: added ${patch_msg#PATCHED:} to _strata_hip_unvalidated.${C_RESET}"
+      elif [[ -n "$patch_msg" ]]; then
+        echo -e "${C_YELLOW}${patch_msg}${C_RESET}"
+      fi
+    fi
+  fi
+  return 0
+}
+
+_STRATA_WAS_ACTIVE=false
+_STRATA_WAS_LAUNCH=false
+_stop_strata_if_running() {
+  _STRATA_WAS_ACTIVE=false
+  _STRATA_WAS_LAUNCH=false
+  unit_active strata.service && _STRATA_WAS_ACTIVE=true
+  if [[ "$_STRATA_WAS_ACTIVE" == true ]]; then
+    echo -e "${C_CYAN}Stopping strata.service before updating component files...${C_RESET}"
+    service_ctl stop strata.service || true
+    wait_for_strata_stopped 60 || return 1
+  else
+    refresh_strata_running
+    if [[ -n "$STRATA_RUNNING_PRESET" && -n "$STRATA_BIN" ]]; then
+      _STRATA_WAS_LAUNCH=true
+      echo -e "${C_CYAN}Stopping Strata ('strata launch --stop') before updating component files...${C_RESET}"
+      run_as_user_exec "$STRATA_BIN" launch --stop || true
+      wait_for_strata_stopped 60 || return 1
+    fi
+  fi
+  return 0
+}
+
+_print_local_hip_post_install_notes() {
+  local comma_archs="$1" installed_path="$2" has_tuning="$3" noted=false
+  echo -e "\n${C_BOLD}Next Steps & Hardware Notes:${C_RESET}"
+  echo -e "  Installed component: ${C_CYAN}${installed_path}${C_RESET}"
+  if [[ ",${comma_archs}," == *",gfx1150,"* ]]; then
+    noted=true
+    echo -e "  - Launch Strata with: ${C_BOLD}STRATA_EXPERIMENTAL_GFX1150=1 strata launch${C_RESET}"
+    echo -e "    (Note: strata.service & wizard CLI calls automatically export STRATA_EXPERIMENTAL_GFX1150=1.)"
+    echo -e "  - Apply ${C_BOLD}amd_apu_memory${C_RESET} (ttm.pages_limit) & ${C_BOLD}gpu_groups${C_RESET} (render/video) from the main index."
+    if [[ "$has_tuning" == true ]]; then
+      echo -e "  - Optional prompt speedup: set ${C_BOLD}STRATA_HIPBLASLT_TABLE=on${C_RESET} (matching gfx1150 table was staged)."
+    fi
+  fi
+  if [[ ",${comma_archs}," == *",gfx1103,"* ]]; then
+    noted=true
+    echo -e "  - Launch Strata with: ${C_BOLD}STRATA_EXPERIMENTAL_GFX1103=1 strata launch${C_RESET}"
+    echo -e "    (Note: strata.service & wizard CLI calls automatically export STRATA_EXPERIMENTAL_GFX1103=1.)"
+    echo -e "  - Apply ${C_BOLD}amd_apu_memory${C_RESET}, ${C_BOLD}amd_cwsr_disable${C_RESET} (amdgpu.cwsr_enable=0, stops MES GPU resets), and ${C_BOLD}gpu_groups${C_RESET}."
+    if [[ "$has_tuning" == true ]]; then
+      echo -e "  - Optional prompt speedup: set ${C_BOLD}STRATA_HIPBLASLT_TABLE=on${C_RESET} (matching gfx1103 table was staged)."
+    fi
+  fi
+  if [[ "$noted" == false ]]; then
+    echo -e "  - Verify registered engine with: ${C_BOLD}strata components engines${C_RESET}"
+    echo -e "  - Upstream setup.py does not yet list ${comma_archs} in AMD_ARCHS; you can also invoke"
+    echo -e "    ${installed_path}/strata directly or via terminal/serve/server.py (see Strata docs/AMD_HIP.md & docs/OLDER_GPUS.md)."
+  fi
+}
+
+explain_strata_build_hip() {
+  cat <<'EOF'
+Impact:
+  Builds and registers a self-contained local Strata HIP engine package for AMD
+  architectures that lack an official prebuilt Linux release (such as gfx1150
+  Strix Point / Radeon 890M, gfx1103 Radeon 780M, gfx1152 Krackan, gfx1153,
+  RDNA1 gfx1010/1011/1012, gfx1034, or wave64 gfx906).
+
+  Workflow:
+    1. Acquires AMD's TheRock ROCm SDK (or uses a compatible system /opt/rocm)
+    2. Clones/updates Niko1221/Strata and patches cmake/hip_backend.cmake if needed
+    3. Compiles strata (and best-effort vision readers) with Ninja & clang++
+    4. Bundles ROCm runtime libraries + matching hipBLASLt tuning tables,
+       verifies package integrity, installs under Strata's components folder,
+       and activates it with 'strata components use'
+EOF
+  local info=""
+  info="$(strata_local_hip_engine_info --any-local)"
+  if [[ -n "$info" ]]; then
+    local fn ver archs
+    IFS='|' read -r fn ver archs _ <<< "$info"
+    echo -e "\nInstalled local/matching HIP engine: ${C_GREEN}${fn}${C_RESET} (v${ver}, archs: ${archs})"
+  fi
+  if amd_missing_has_gfx "gfx1150"; then
+    echo -e "Opt-in wiring: ${C_DIM}STRATA_EXPERIMENTAL_GFX1150=1 will be set automatically for wizard/service runs.${C_RESET}"
+  fi
+  if amd_missing_has_gfx "gfx1103"; then
+    echo -e "Opt-in wiring: ${C_DIM}STRATA_EXPERIMENTAL_GFX1103=1 will be set automatically for wizard/service runs.${C_RESET}"
+  fi
+}
+
+strata_action_build_hip() {
+  refresh_strata_bin
+  local arch_m=""
+  arch_m="$(uname -m 2>/dev/null || echo unknown)"
+  if [[ "$arch_m" != "x86_64" && "$arch_m" != "amd64" ]]; then
+    echo -e "${C_RED}Local AMD HIP builds require Linux x86_64 (detected: ${arch_m}).${C_RESET}"
+    return 1
+  fi
+
+  local existing=""
+  existing="$(strata_local_hip_engine_info --any-local)"
+  if [[ -n "$existing" ]]; then
+    local ex_folder ex_ver ex_archs ex_cov
+    IFS='|' read -r ex_folder ex_ver ex_archs ex_cov <<< "$existing"
+    echo -e "${C_GREEN}Found local/matching HIP engine package: ${C_BOLD}${ex_folder}${C_RESET} (v${ex_ver}, archs: ${ex_archs})"
+    echo "  1) Rebuild / update local HIP engine from latest Niko1221/Strata source"
+    echo "  2) Activate / pin this local HIP engine (strata components use)"
+    echo "  3) Remove this local HIP engine package"
+    echo "  4) Cancel"
+    local mchoice=""
+    read -r -p "Choose [1-4]: " mchoice
+    case "$mchoice" in
+      1) ;;
+      2)
+        if [[ -z "$STRATA_BIN" ]]; then
+          echo -e "${C_YELLOW}Strata CLI is not installed yet; install Strata first via [s1].${C_RESET}"
+          return 1
+        fi
+        run_as_user_exec "$STRATA_BIN" components use "$ex_folder" && echo -e "${C_GREEN}Activated ${ex_folder}.${C_RESET}"
+        return $?
+        ;;
+      3)
+        confirm_yn "Remove local HIP engine package '${ex_folder}'? [y/N]: " "N" || return 0
+        stop_strata_update_poller
+        _stop_strata_if_running || { start_strata_update_poller; return 1; }
+        if [[ -n "$STRATA_BIN" ]]; then
+          run_as_user_exec "$STRATA_BIN" components use newest >/dev/null 2>&1 || true
+          run_as_user_exec "$STRATA_BIN" components remove "$ex_folder" >/dev/null 2>&1 || true
+        fi
+        local target_rm=""
+        if [[ -n "$ex_folder" && "$ex_folder" != */* && "$ex_folder" != "." && "$ex_folder" != ".." ]]; then
+          target_rm="$(strata_components_engine_dir)/${ex_folder}"
+          if [[ -d "$target_rm" ]]; then
+            run_as_user_exec rm -rf "$target_rm" 2>/dev/null || run_root rm -rf "$target_rm"
+          fi
+        fi
+        invalidate_local_hip_engine_cache
+        echo -e "${C_GREEN}Removed ${ex_folder}.${C_RESET}"
+        start_strata_update_poller
+        return 0
+        ;;
+      4|"") return 0 ;;
+      *) echo -e "${C_RED}Invalid selection '${mchoice}'. Cancelled.${C_RESET}"; return 1 ;;
+    esac
+  fi
+
+  local -a targets=("${AMD_MISSING_GFX_ARCHS[@]+"${AMD_MISSING_GFX_ARCHS[@]}"}")
+  if (( ${#targets[@]} == 0 )); then
+    local raw_arch="" tok=""
+    read -r -p "Enter target AMD gfx architecture(s) (e.g. gfx1150 or gfx1150;gfx1103): " raw_arch
+    for tok in ${raw_arch//[;,]/ }; do
+      tok="${tok,,}"
+      if [[ "$tok" =~ ^gfx[0-9a-f]+$ ]]; then
+        if (( ${#targets[@]} == 0 )) || ! _array_contains_val "$tok" "${targets[@]}"; then
+          targets+=("$tok")
+        fi
+      elif [[ -n "$tok" ]]; then
+        echo -e "${C_RED}Invalid gfx target '${tok}'.${C_RESET}"
+        return 1
+      fi
+    done
+    (( ${#targets[@]} > 0 )) || { echo -e "${C_YELLOW}No target architecture specified. Cancelled.${C_RESET}"; return 0; }
+  fi
+
+  if _array_contains_val "gfx906" "${targets[@]}" && (( ${#targets[@]} > 1 )); then
+    echo -e "${C_YELLOW}gfx906 (wave64) cannot be combined with wave32 architectures in one Strata binary.${C_RESET}"
+    echo "  1) Build for wave32 targets only"
+    echo "  2) Build for gfx906 (wave64) only"
+    local wchoice="" filtered=() t
+    read -r -p "Choose [1-2]: " wchoice
+    case "$wchoice" in
+      1)
+        for t in "${targets[@]}"; do [[ "$t" != "gfx906" ]] && filtered+=("$t"); done
+        targets=("${filtered[@]}")
+        ;;
+      2) targets=("gfx906") ;;
+      *) echo -e "${C_YELLOW}Cancelled.${C_RESET}"; return 0 ;;
+    esac
+  fi
+
+  local is_wave32=true
+  [[ "${targets[0]}" == "gfx906" ]] && is_wave32=false
+
+  if [[ -z "$existing" ]]; then
+    local tgt_desc="" t=""
+    for t in "${targets[@]}"; do
+      tgt_desc="${tgt_desc:+${tgt_desc}, }${t} ($(amd_gfx_label "$t"))"
+    done
+    echo -e "${C_BOLD}Local Strata HIP Engine Build Summary:${C_RESET}"
+    echo -e "  Target(s):       ${C_CYAN}${tgt_desc}${C_RESET}"
+    echo -e "  Disk space:      ${C_DIM}~10-15 GB temporary build/ROCm cache; ~150-400 MB installed package${C_RESET}"
+    confirm_yn "Proceed with building local Strata HIP engine for ${targets[*]}? [Y/n]: " "Y" || return 0
+  fi
+
+  if [[ -z "$STRATA_BIN" ]]; then
+    echo -e "${C_YELLOW}Strata CLI is not installed yet.${C_RESET}"
+    if confirm_yn "Install Strata Terminal first before building the local HIP engine? [Y/n]: " "Y"; then
+      command -v curl >/dev/null 2>&1 || prompt_install_deps repo curl || return 1
+      run_as_user "curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh | sh"
+      refresh_strata_bin
+      [[ -n "$STRATA_BIN" && -z "$STRATA_POLLER_PID" ]] && start_strata_update_poller
+    fi
+  fi
+
+  _ensure_hip_build_deps || return 1
+
+  local cache_base sdk="" sys_rocm="${ROCM_PATH:-/opt/rocm}"
+  local -a extra_sdks=() therock_cache_dirs=()
+  cache_base="$(_user_cache_dir)/strata-performance-setup"
+  run_as_user_exec mkdir -p "$cache_base" || return 1
+
+  if [[ "$is_wave32" == false ]]; then
+    if _is_usable_rocm_root "$sys_rocm"; then
+      echo -e "${C_GREEN}Using ROCm toolchain at ${sys_rocm} for gfx906.${C_RESET}"
+      sdk="$sys_rocm"
+    else
+      echo -e "${C_YELLOW}AMD's TheRock 7.x tarballs do not support gfx906 (wave64).${C_RESET}"
+      echo -e "Please build inside a ROCm 6.x / community gfx906 environment (e.g. ${C_BOLD}mixa3607/rocm-gfx906:7.14-complete${C_RESET}),"
+      echo -e "or set ${C_BOLD}ROCM_PATH${C_RESET} to a compatible gfx906 ROCm root (see Strata's ${C_DIM}docs/AMD_HIP.md${C_RESET})."
+      return 1
+    fi
+  else
+    local -a therock_families=()
+    local fam="" t="" use_therock=false
+    for t in "${targets[@]}"; do
+      fam="$(amd_gfx_therock_family "$t" || true)"
+      if [[ -n "$fam" ]] && { (( ${#therock_families[@]} == 0 )) || ! _array_contains_val "$fam" "${therock_families[@]}"; }; then
+        therock_families+=("$fam")
+      fi
+    done
+
+    if (( ${#therock_families[@]} == 0 )); then
+      if _is_usable_rocm_root "$sys_rocm"; then
+        sdk="$sys_rocm"
+      else
+        echo -e "${C_RED}No AMD TheRock tarball family known for '${targets[0]}' and no usable ROCm at ${sys_rocm}.${C_RESET}"
+        return 1
+      fi
+    elif _is_usable_rocm_root "$sys_rocm"; then
+      echo -e "\n${C_BOLD}Select ROCm toolchain for building (${targets[*]}):${C_RESET}"
+      echo "  1) AMD TheRock 7.14.1 tarball (Recommended — matches shipped hipBLASLt 100401 tuning tables)"
+      echo "  2) Existing system ROCm at ${sys_rocm}"
+      local rchoice=""
+      read -r -p "Choose [1-2, default 1]: " rchoice
+      if [[ "$rchoice" == "2" ]]; then
+        sdk="$sys_rocm"
+      else
+        use_therock=true
+      fi
+    else
+      use_therock=true
+    fi
+
+    if [[ "$use_therock" == true ]]; then
+      _acquire_therock_sdk "${therock_families[0]}" "$cache_base" || return 1
+      sdk="$_ACQUIRED_ROCM_SDK"
+      therock_cache_dirs+=("${cache_base}/rocm-therock-${therock_families[0]}")
+      local fi_idx
+      for (( fi_idx = 1; fi_idx < ${#therock_families[@]}; fi_idx++ )); do
+        fam="${therock_families[$fi_idx]}"
+        _acquire_therock_sdk "$fam" "$cache_base" || return 1
+        extra_sdks+=("$_ACQUIRED_ROCM_SDK")
+        therock_cache_dirs+=("${cache_base}/rocm-therock-${fam}")
+      done
+    fi
+  fi
+
+  local hip_clang="" hip_cc="" bitcode="" sysdeps_lib="" prefix_path="" sdk_ld_path=""
+  IFS='|' read -r hip_clang hip_cc bitcode sysdeps_lib prefix_path sdk_ld_path <<< "$(_detect_rocm_paths "$sdk")"
+  if [[ -z "$hip_clang" || ! -x "$hip_clang" ]]; then
+    echo -e "${C_RED}HIP clang++ compiler not found under ${sdk}.${C_RESET}"
+    return 1
+  fi
+
+  local src_dir="${cache_base}/Strata-src"
+  _prepare_strata_source "$src_dir" "$is_wave32" "${targets[@]}" || return 1
+  local commit="$_PREPARED_STRATA_COMMIT"
+
+  local jobs=4 ram_cap=4
+  jobs="$(nproc 2>/dev/null || echo 4)"
+  if [[ "$RAM_GB" =~ ^[0-9]+$ ]] && (( RAM_GB > 0 )); then
+    ram_cap=$(( RAM_GB / 3 ))
+    (( ram_cap < 2 )) && ram_cap=2
+    (( jobs > ram_cap )) && jobs="$ram_cap"
+  fi
+
+  local cmake_archs="" data_archs="" space_archs=""
+  {
+    local IFS=';'
+    cmake_archs="${targets[*]}"
+  }
+  {
+    local IFS=','
+    data_archs="${targets[*]}"
+  }
+  space_archs="${targets[*]}"
+
+  local bdir="${cache_base}/build-hip-${targets[0]}"
+  local stage="${bdir}/stage"
+  local pkg_out="${bdir}/pkg_out"
+  run_as_user_exec rm -rf "$bdir"
+  run_as_user_exec mkdir -p "$bdir/engine" "$stage" "$pkg_out"
+
+  local llvm_bin_dir
+  llvm_bin_dir="$(dirname "$hip_clang")"
+  local -a build_env=(
+    "ROCM_PATH=${sdk}"
+    "HIP_PATH=${sdk}"
+    "HIP_PLATFORM=amd"
+    "HIP_COMPILER=clang"
+    "HIP_RUNTIME=rocclr"
+    "PATH=${sdk}/bin:${llvm_bin_dir}:${PATH}"
+    "LD_LIBRARY_PATH=${sdk_ld_path}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+  )
+  local hip_flag_str="-isystem ${sdk}/include --rocm-path=${sdk}"
+  [[ -n "$bitcode" ]] && hip_flag_str+=" --rocm-device-lib-path=${bitcode}"
+
+  echo -e "\n${C_CYAN}Configuring Strata engine for ${cmake_archs} (jobs=${jobs})...${C_RESET}"
+  if [[ "$is_wave32" == true ]]; then
+    run_as_user_exec env "${build_env[@]}" cmake -G Ninja -S "${src_dir}/engine" -B "${bdir}/engine" \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DSTRATA_ENABLE_HIP=ON \
+      -DSTRATA_ENABLE_CUDA=OFF \
+      -DSTRATA_BUILD_TESTS=OFF \
+      -DSTRATA_PORTABLE=ON \
+      "-DCMAKE_HIP_ARCHITECTURES=${cmake_archs}" \
+      "-DCMAKE_HIP_COMPILER=${hip_clang}" \
+      "-DCMAKE_HIP_COMPILER_ROCM_ROOT=${sdk}" \
+      "-DCMAKE_PREFIX_PATH=${prefix_path}" \
+      "-DCMAKE_HIP_FLAGS=${hip_flag_str}" \
+      "-DCMAKE_EXE_LINKER_FLAGS=-Wl,-rpath,'\$ORIGIN' -Wl,--enable-new-dtags" || {
+      echo -e "${C_RED}CMake configuration failed for Strata HIP engine.${C_RESET}"
+      return 1
+    }
+  else
+    run_as_user_exec env "${build_env[@]}" cmake -G Ninja -S "${src_dir}/engine" -B "${bdir}/engine" \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DSTRATA_HIP_GFX906=ON \
+      -DCMAKE_HIP_ARCHITECTURES=gfx906 \
+      -DSTRATA_BUILD_TESTS=OFF \
+      -DSTRATA_PORTABLE=ON \
+      "-DCMAKE_C_COMPILER=${hip_cc}" \
+      "-DCMAKE_CXX_COMPILER=${hip_clang}" \
+      "-DCMAKE_PREFIX_PATH=${prefix_path}" \
+      "-DCMAKE_EXE_LINKER_FLAGS=-Wl,-rpath,'\$ORIGIN' -Wl,--enable-new-dtags" || {
+      echo -e "${C_RED}CMake configuration failed for Strata gfx906 engine.${C_RESET}"
+      return 1
+    }
+  fi
+
+  echo -e "${C_CYAN}Compiling Strata engine (this may take 10-20 minutes)...${C_RESET}"
+  run_as_user_exec env "${build_env[@]}" cmake --build "${bdir}/engine" --target strata -j "$jobs" || {
+    echo -e "${C_RED}Strata engine build failed.${C_RESET}"
+    return 1
+  }
+  [[ -x "${bdir}/engine/strata" ]] || { echo -e "${C_RED}Built binary missing at ${bdir}/engine/strata.${C_RESET}"; return 1; }
+
+  # Best-effort picture readers (failures never abort engine registration)
+  local has_cpu_vis=false has_gpu_vis=false
+  if [[ -f "${src_dir}/terminal/tools/vision/CMakeLists.txt" ]]; then
+    echo -e "${C_CYAN}Building optional CPU picture reader (strata-vision)...${C_RESET}"
+    if run_as_user_exec env "${build_env[@]}" cmake -G Ninja -S "${src_dir}/terminal/tools/vision" -B "${bdir}/bv" \
+         -DCMAKE_BUILD_TYPE=Release -DSTRATA_VISION_CUDA=OFF -DSTRATA_PORTABLE=ON >/dev/null 2>&1 && \
+       run_as_user_exec env "${build_env[@]}" cmake --build "${bdir}/bv" --target strata-vision -j "$jobs" >/dev/null 2>&1 && \
+       [[ -x "${bdir}/bv/bin/strata-vision" ]]; then
+      has_cpu_vis=true
+    else
+      echo -e "${C_YELLOW}Note: CPU picture reader build skipped/failed (text inference unaffected).${C_RESET}"
+    fi
+    if [[ "$is_wave32" == true ]]; then
+      echo -e "${C_CYAN}Building optional HIP GPU picture reader (strata-vision-hip)...${C_RESET}"
+      if run_as_user_exec env "${build_env[@]}" cmake -G Ninja -S "${src_dir}/terminal/tools/vision" -B "${bdir}/bh" \
+           -DCMAKE_BUILD_TYPE=Release -DSTRATA_VISION_HIP=ON \
+           "-DSTRATA_VISION_HIP_ARCHS=${cmake_archs}" -DSTRATA_PORTABLE=ON \
+           "-DCMAKE_HIP_COMPILER=${hip_clang}" \
+           "-DCMAKE_HIP_COMPILER_ROCM_ROOT=${sdk}" \
+           "-DCMAKE_PREFIX_PATH=${prefix_path}" \
+           "-DCMAKE_HIP_FLAGS=${hip_flag_str}" >/dev/null 2>&1 && \
+         run_as_user_exec env "${build_env[@]}" cmake --build "${bdir}/bh" --target strata-vision -j "$jobs" >/dev/null 2>&1 && \
+         [[ -x "${bdir}/bh/bin/strata-vision-hip" ]]; then
+        has_gpu_vis=true
+      else
+        echo -e "${C_YELLOW}Note: GPU picture reader build skipped/failed (CPU reader / text unaffected).${C_RESET}"
+      fi
+    fi
+  fi
+
+  local eng_ver="" raw_ver=""
+  raw_ver="$(run_as_user_exec env "LD_LIBRARY_PATH=${sdk_ld_path}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" "${bdir}/engine/strata" --version 2>/dev/null || true)"
+  eng_ver="$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?' <<<"$raw_ver" | head -n1 || true)"
+  if [[ -z "$eng_ver" && -f "${src_dir}/engine/CMakeLists.txt" ]]; then
+    eng_ver="$(sed -nE 's/^[[:space:]]*project\(strata[[:space:]]+VERSION[[:space:]]+([0-9]+\.[0-9]+(\.[0-9]+)*).*/\1/p' "${src_dir}/engine/CMakeLists.txt" | head -n1 || true)"
+  fi
+  [[ -n "$eng_ver" ]] || eng_ver="0.1.0"
+
+  local variant="local-${targets[0]}"
+  local vision_mode="none"
+  [[ "$has_cpu_vis" == true ]] && vision_mode="cpu"
+  [[ "$has_gpu_vis" == true ]] && vision_mode="gpu"
+
+  run_as_user_exec python3 - "${stage}/BUILD.json" "$eng_ver" "$commit" "$variant" "$vision_mode" "${targets[@]}" <<'PY'
+import json, sys
+out, ver, commit, variant, vis, *archs = sys.argv[1:]
+d = {"version": ver, "source": f"local-hip {commit}", "backend": "hip", "variant": variant,
+     "archs": archs, "portable": True, "vision": vis}
+if vis in ("cpu", "gpu"):
+    d["vision_cpu"] = "strata-vision"
+if vis == "gpu":
+    d["vision_gpu"] = "strata-vision-hip"
+    d["vision_archs"] = archs
+with open(out, "w", encoding="utf-8") as f:
+    json.dump(d, f, indent=1)
+    f.write("\n")
+PY
+
+  # Collect shared libraries and ROCm kernel data
+  echo -e "${C_CYAN}Collecting ROCm runtime libraries & kernel data...${C_RESET}"
+  local -a collect_search=() collect_data=() data_sdks=("$sdk")
+  (( ${#extra_sdks[@]} > 0 )) && data_sdks+=("${extra_sdks[@]}")
+  local sdir sdk_item=""
+  for sdir in "$sdk/lib" "$sdk/lib64" "$sysdeps_lib" "$sdk/lib/llvm/lib" "$sdk/llvm/lib"; do
+    [[ -n "$sdir" && -d "$sdir" ]] && collect_search+=(--search "$sdir")
+  done
+  for sdk_item in "${data_sdks[@]}"; do
+    for sdir in "$sdk_item/lib/rocblas/library" "$sdk_item/lib64/rocblas/library" "$sdk_item/rocblas/lib/library"; do
+      if [[ -d "$sdir" ]]; then
+        collect_data+=(--data "${sdir}=rocblas/library")
+        break
+      fi
+    done
+    for sdir in "$sdk_item/lib/hipblaslt/library" "$sdk_item/lib64/hipblaslt/library" "$sdk_item/hipblaslt/lib/library"; do
+      if [[ -d "$sdir" ]]; then
+        collect_data+=(--data "${sdir}=hipblaslt/library")
+        break
+      fi
+    done
+  done
+
+  run_as_user_exec python3 "${src_dir}/tools/packaging/collect_libs.py" \
+    --binary "${bdir}/engine/strata" \
+    "${collect_search[@]}" \
+    --also 'libamd_comgr.so*' --also 'libhiprtc*.so*' \
+    --out "$stage" \
+    ${collect_data[@]+"${collect_data[@]}"} --data-arch "$data_archs" || {
+    echo -e "${C_RED}collect_libs.py failed.${C_RESET}"
+    return 1
+  }
+
+  if [[ "$has_gpu_vis" == true ]]; then
+    run_as_user_exec python3 "${src_dir}/tools/packaging/collect_libs.py" \
+      --binary "${bdir}/bh/bin/strata-vision-hip" \
+      "${collect_search[@]}" \
+      --also 'libamd_comgr.so*' --also 'libhiprtc*.so*' \
+      --out "$stage" || true
+  fi
+
+  # ROCm 10.x kpack archives if present
+  local ka="" kpack_made=false
+  for sdk_item in "${data_sdks[@]}"; do
+    if [[ -d "${sdk_item}/.kpack" ]]; then
+      if [[ "$kpack_made" == false ]]; then
+        run_as_user_exec mkdir -p "${stage}/kpack"
+        kpack_made=true
+      fi
+      for ka in "${targets[@]}"; do
+        [[ -f "${sdk_item}/.kpack/blas_lib_${ka}.kpack" ]] && run_as_user_exec cp "${sdk_item}/.kpack/blas_lib_${ka}.kpack" "${stage}/kpack/"
+      done
+    fi
+  done
+
+  run_as_user_exec cp "${bdir}/engine/strata" "${stage}/strata"
+  [[ "$has_cpu_vis" == true ]] && run_as_user_exec cp "${bdir}/bv/bin/strata-vision" "${stage}/strata-vision"
+  [[ "$has_gpu_vis" == true ]] && run_as_user_exec cp "${bdir}/bh/bin/strata-vision-hip" "${stage}/strata-vision-hip"
+
+  run_as_user_exec sh -c 'for f in "$1"/*.so "$1"/*.so.* "$1/strata" "$1/strata-vision" "$1/strata-vision-hip"; do [ -f "$f" ] && [ ! -L "$f" ] && patchelf --set-rpath '\''$ORIGIN'\'' "$f" 2>/dev/null || true; done' _ "$stage"
+
+  # Stage matching hipBLASLt tuning tables or set fallback hipblaslt_version
+  local hbl_ver="" has_tuning=false
+  if [[ -f "${sdk}/include/hipblaslt/hipblaslt-version.h" ]]; then
+    run_as_user_exec python3 "${src_dir}/tools/packaging/stage_tuning.py" \
+      --stage "$stage" --archs "$space_archs" --rocm "$sdk" || true
+  elif [[ -f "${sdk}/hipblaslt/include/hipblaslt/hipblaslt-version.h" ]]; then
+    hbl_ver="$(python3 - "${sdk}/hipblaslt/include/hipblaslt/hipblaslt-version.h" <<'PY' 2>/dev/null || true
+import re, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    t = f.read()
+vals = []
+for k in ("MAJOR", "MINOR", "PATCH"):
+    m = re.search(rf"#define\s+HIPBLASLT_VERSION_{k}\s+(\d+)", t)
+    if not m:
+        sys.exit(0)
+    vals.append(int(m.group(1)))
+print(vals[0]*100000 + vals[1]*100 + vals[2])
+PY
+)"
+    if [[ "$hbl_ver" =~ ^[0-9]+$ ]]; then
+      run_as_user_exec python3 "${src_dir}/tools/packaging/stage_tuning.py" \
+        --stage "$stage" --archs "$space_archs" --version "$hbl_ver" || true
+    fi
+  fi
+  if ! grep -q '"hipblaslt_version"' "${stage}/BUILD.json" 2>/dev/null; then
+    run_as_user_exec python3 - "${stage}/BUILD.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+with open(p, encoding="utf-8") as f:
+    d = json.load(f)
+d["hipblaslt_version"] = 1
+with open(p, "w", encoding="utf-8") as f:
+    json.dump(d, f, indent=1)
+    f.write("\n")
+PY
+  fi
+  compgen -G "${stage}/tuning/*.txt" >/dev/null 2>&1 && has_tuning=true
+
+  # Package and verify component
+  local -a pkg_args=(
+    --src "$stage"
+    --backend hip
+    --version "$eng_ver"
+    --out "$pkg_out"
+    --variant "$variant"
+    --build-id "${commit}+local-rocm"
+    --notes "Local HIP build for ${data_archs} via strata-performance-setup"
+    --tree
+  )
+  local t=""
+  for t in "${targets[@]}"; do pkg_args+=(--arch "$t"); done
+  if [[ -r "${stage}/SYSTEM-LIBS.txt" ]]; then
+    local slib=""
+    while IFS= read -r slib; do
+      [[ -n "$slib" ]] && pkg_args+=(--allow-lib "$slib")
+    done < "${stage}/SYSTEM-LIBS.txt"
+  fi
+
+  echo -e "${C_CYAN}Packaging and verifying Strata HIP engine component...${C_RESET}"
+  run_as_user_exec python3 "${src_dir}/tools/packaging/package_engine.py" "${pkg_args[@]}" || {
+    echo -e "${C_RED}package_engine.py failed.${C_RESET}"
+    return 1
+  }
+
+  local pkg_dir="" pkg_folder_name=""
+  pkg_dir="$(find "$pkg_out" -mindepth 1 -maxdepth 1 -type d | head -n1 || true)"
+  [[ -n "$pkg_dir" && -f "${pkg_dir}/engine-component.json" ]] || {
+    echo -e "${C_RED}Packaged folder not found in ${pkg_out}.${C_RESET}"
+    return 1
+  }
+  pkg_folder_name="$(basename "$pkg_dir")"
+
+  run_as_user_exec python3 - "${src_dir}/terminal" "$pkg_dir" <<'PY' || { echo -e "${C_RED}Package integrity verification failed for ${pkg_dir}.${C_RESET}"; return 1; }
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from strata_control import engine_component as ec
+c = ec.read_manifest_any(Path(sys.argv[2]))
+ec.verify(c, full=True)
+print(f"Verified manifest integrity: {c.root.name} ({len(c.files)} files)")
+PY
+  if ! run_as_user_exec python3 "${src_dir}/tools/packaging/package_engine.py" --verify "$pkg_dir" >/dev/null 2>&1; then
+    echo -e "${C_DIM}Note: standalone binary_deps check flagged host system libraries listed in SYSTEM-LIBS.txt (allowed for local-host install).${C_RESET}"
+  fi
+
+  # Install into Strata components/engine atomically
+  local comp_eng_dir="" dest_dir=""
+  comp_eng_dir="$(strata_components_engine_dir)"
+  dest_dir="${comp_eng_dir}/${pkg_folder_name}"
+
+  stop_strata_update_poller
+  if [[ -d "$dest_dir" ]]; then
+    _stop_strata_if_running || { start_strata_update_poller; return 1; }
+    run_as_user_exec rm -rf "$dest_dir"
+  fi
+  run_as_user_exec mkdir -p "$comp_eng_dir"
+  run_as_user_exec mv "$pkg_dir" "$dest_dir" || {
+    echo -e "${C_RED}Failed to install package into ${dest_dir}.${C_RESET}"
+    start_strata_update_poller
+    return 1
+  }
+  invalidate_local_hip_engine_cache
+
+  echo -e "\n${C_BGREEN}Installed local Strata HIP engine: ${dest_dir}${C_RESET}"
+  if [[ -n "$STRATA_BIN" ]]; then
+    if run_as_user_exec "$STRATA_BIN" components use "$pkg_folder_name"; then
+      echo -e "${C_GREEN}Activated ${pkg_folder_name} via 'strata components use'.${C_RESET}"
+    else
+      echo -e "${C_YELLOW}Note: could not auto-pin via 'strata components use ${pkg_folder_name}'.${C_RESET}"
+    fi
+  fi
+
+  if [[ "${_STRATA_WAS_ACTIVE:-false}" == true ]]; then
+    if confirm_yn "Restart strata.service with the newly built HIP engine? [Y/n]: " "Y"; then
+      service_ctl start strata.service && wait_for_strata_model_live 120 || true
+    fi
+  fi
+
+  _print_local_hip_post_install_notes "$data_archs" "$dest_dir" "$has_tuning"
+
+  echo ""
+  if confirm_yn "Clean up temporary build files at ${bdir} (installed engine is self-contained)? [Y/n]: " "Y"; then
+    run_as_user_exec rm -rf "$bdir"
+  fi
+  if (( ${#therock_cache_dirs[@]} > 0 )) && confirm_yn "Also remove cached TheRock ROCm SDK(s) at ${therock_cache_dirs[*]}? [y/N]: " "N"; then
+    run_as_user_exec rm -rf "${therock_cache_dirs[@]}"
+  fi
+
+  refresh_strata_bin
+  start_strata_update_poller
+  return 0
+}
+
 run_strata_option() {
   local target_opt="$1" auto_run="${2:-false}" s_idx=0 total="${#ACTIVE_STRATA_OPTIONS[@]}" i opt action action_label
   (( total > 0 )) || return 0
@@ -5243,6 +6685,7 @@ run_strata_option() {
       service)   action_label="Manage strata.service" ;;
       benchmark) action_label="Run Strata benchmark" ;;
       history)   action_label="View all benchmark results" ;;
+      build_hip) action_label="Build / manage local Strata HIP engine" ;;
       *)         action_label="Run action" ;;
     esac
 
@@ -5457,16 +6900,31 @@ print_live_stats() {
     fi
   fi
   if [[ "$HAS_AMD" == true ]]; then
-    local card_dir
-    for card_dir in /sys/class/drm/card*/device; do
+    local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}" card_node card_dir ven
+    for card_node in "$drm_dir"/card[0-9]*; do
+      [[ -e "$card_node" ]] || continue
+      [[ "$(basename "$card_node")" == *-* ]] && continue
+      card_dir="$card_node/device"
+      if [[ -r "$card_dir/vendor" ]]; then
+        ven="$(tr '[:upper:]' '[:lower:]' < "$card_dir/vendor" 2>/dev/null || true)"
+        [[ "$ven" == "0x1002" ]] || continue
+      fi
       [[ -r "$card_dir/gpu_busy_percent" ]] || continue
       local g_pct="" v_pct="" v_used="" v_tot="" pw="" plw="" ppct="" gtmp=""
       g_pct="$(cat "$card_dir/gpu_busy_percent" 2>/dev/null || true)"
       if [[ -r "$card_dir/mem_info_vram_used" && -r "$card_dir/mem_info_vram_total" ]]; then
-        local vu vt
+        local vu vt gu gt
         vu="$(cat "$card_dir/mem_info_vram_used" 2>/dev/null || echo 0)"
         vt="$(cat "$card_dir/mem_info_vram_total" 2>/dev/null || echo 0)"
-        if (( vt > 0 )); then
+        if _is_drm_card_amd_apu "$card_dir" && [[ -r "$card_dir/mem_info_gtt_used" && -r "$card_dir/mem_info_gtt_total" ]]; then
+          gu="$(cat "$card_dir/mem_info_gtt_used" 2>/dev/null || echo 0)"
+          gt="$(cat "$card_dir/mem_info_gtt_total" 2>/dev/null || echo 0)"
+          if [[ "$vt" =~ ^[0-9]+$ && "$gt" =~ ^[0-9]+$ && "$vu" =~ ^[0-9]+$ && "$gu" =~ ^[0-9]+$ ]]; then
+            vu=$((vu + gu))
+            vt=$((vt + gt))
+          fi
+        fi
+        if [[ "$vt" =~ ^[0-9]+$ && "$vu" =~ ^[0-9]+$ ]] && (( vt > 0 )); then
           read -r v_pct v_used v_tot <<< "$(awk "BEGIN {printf \"%.0f %.1f %.1f\", ($vu/$vt)*100, $vu/1073741824, $vt/1073741824}")"
         fi
       fi
@@ -5705,10 +7163,39 @@ build_sys_info_lines() {
   SYS_INFO_LINES+=("$(printf "CPU:    %b%s%b" "${C_DIM}" "$CPU_SUMMARY" "${C_RESET}")")
   SYS_INFO_LINES+=("$(printf "RAM:    %b%s GiB%s%b" "${C_DIM}" "$RAM_GB" "$RAM_DETAILS" "${C_RESET}")")
   SYS_INFO_LINES+=("$(printf "GPU(s): %b%s%b" "${C_DIM}" "$GPU_SUMMARY" "${C_RESET}")")
-  if (( TOTAL_VRAM_MB > 0 )); then
-    local total_vram_gb
-    total_vram_gb="$(awk "BEGIN {g=$TOTAL_VRAM_MB/1024; if (g == int(g)) printf \"%d\", g; else printf \"%.1f\", g}")"
-    SYS_INFO_LINES+=("$(printf "VRAM:   %b%s GiB%b" "${C_DIM}" "$total_vram_gb" "${C_RESET}")")
+  if (( TOTAL_VRAM_MB > 0 )) || [[ "$HAS_AMD_APU" == true && "$AMD_GTT_TOTAL_MB" -gt 0 ]]; then
+    local total_vram_gb="" gtt_gb=""
+    if (( TOTAL_VRAM_MB > 0 )); then
+      total_vram_gb="$(awk "BEGIN {g=$TOTAL_VRAM_MB/1024; if (g == int(g)) printf \"%d\", g; else printf \"%.1f\", g}")"
+    fi
+    if [[ "$HAS_AMD_APU" == true && "$AMD_GTT_TOTAL_MB" -gt 0 ]]; then
+      gtt_gb="$(awk "BEGIN {g=$AMD_GTT_TOTAL_MB/1024; if (g == int(g)) printf \"%d\", g; else printf \"%.1f\", g}")"
+      if [[ -n "$total_vram_gb" ]]; then
+        SYS_INFO_LINES+=("$(printf "VRAM:   %b%s GiB dedicated + %s GiB GTT unified%b" "${C_DIM}" "$total_vram_gb" "$gtt_gb" "${C_RESET}")")
+      else
+        SYS_INFO_LINES+=("$(printf "VRAM:   %b%s GiB GTT unified%b" "${C_DIM}" "$gtt_gb" "${C_RESET}")")
+      fi
+    elif [[ -n "$total_vram_gb" ]]; then
+      SYS_INFO_LINES+=("$(printf "VRAM:   %b%s GiB%b" "${C_DIM}" "$total_vram_gb" "${C_RESET}")")
+    fi
+  fi
+  if [[ "$HAS_AMD" == true && -n "$AMD_GFX_SUMMARY" ]] && { [[ "$HAS_AMD_PREBUILT_GFX" == true ]] || (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )) || [[ "$HAS_NVIDIA" == false && "$HAS_INTEL_ARC" == false ]]; }; then
+    local hip_st="display / non-target iGPU" hip_col="${C_DIM}"
+    if (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )); then
+      if status_strata_build_hip; then
+        hip_st="local Strata HIP engine built"
+        hip_col="${C_GREEN}"
+      elif [[ "$HAS_NVIDIA" == true || "$HAS_AMD_PREBUILT_GFX" == true || "$HAS_INTEL_ARC" == true ]]; then
+        hip_st="no prebuilt engine; optional build in [STRATA]"
+        hip_col="${C_DIM}"
+      else
+        hip_st="[!] no prebuilt Strata engine — build in [STRATA]"
+        hip_col="${C_YELLOW}"
+      fi
+    elif [[ "$HAS_AMD_PREBUILT_GFX" == true ]]; then
+      hip_st="official Strata engine"
+    fi
+    SYS_INFO_LINES+=("$(printf "AMD HIP: %b%s (%s)%b" "${hip_col}" "$AMD_GFX_SUMMARY" "$hip_st" "${C_RESET}")")
   fi
   if [[ "$HAS_NVIDIA" == true && -n "$NVIDIA_CURRENT_PL" ]]; then
     SYS_INFO_LINES+=("$(printf "NVIDIA Power Limit: %b%sW (Default: %sW, Max: %sW)%b" "${C_DIM}" "$NVIDIA_CURRENT_PL" "$NVIDIA_DEFAULT_PL" "$NVIDIA_MAX_PL" "${C_RESET}")")
@@ -6877,6 +8364,7 @@ INDEX_SELECTED=0
 declare -A STEP_GAIN_PTS=(
   [gpu_unlock]=5
   [amd_apu_memory]=5
+  [amd_cwsr_disable]=4
   [gpu_groups]=4
   [intel_compute_stack]=4
   [lact_overclock]=4
@@ -7508,6 +8996,27 @@ print_check_summary() {
         pl_info="PL ${NVIDIA_GPU_CUR_PL[$i]}W (default ${NVIDIA_GPU_DEF_PL[$i]}W, max ${NVIDIA_GPU_MAX_PL[$i]}W)"
       fi
       echo "    NVIDIA[${NVIDIA_GPU_INDICES[$i]}]: ${NVIDIA_GPU_NAMES[$i]} (${NVIDIA_GPU_VRAM[$i]} MiB, ${pl_info}, compute=${NVIDIA_GPU_COMPUTE_MODE[$i]})"
+    done
+  fi
+  if [[ "$HAS_AMD" == true && ${#AMD_GFX_ARCHS[@]} -gt 0 ]]; then
+    local _ag _ast _agtt=""
+    if [[ "$HAS_AMD_APU" == true && "$AMD_GTT_TOTAL_MB" -gt 0 ]]; then
+      _agtt="$(awk "BEGIN {g=$AMD_GTT_TOTAL_MB/1024; if (g == int(g)) printf \", %d GiB GTT unified\", g; else printf \", %.1f GiB GTT unified\", g}")"
+    fi
+    for _ag in "${AMD_GFX_ARCHS[@]}"; do
+      if amd_gfx_has_prebuilt "$_ag"; then
+        _ast="official prebuilt Strata engine"
+      elif amd_gfx_is_missing_target "$_ag"; then
+        if _amd_gfx_covered_by_local_hip "$_ag"; then
+          _ast="local Strata HIP engine installed"
+        else
+          _ast="no prebuilt Strata Linux engine — build locally via [STRATA]"
+        fi
+      else
+        _ast="display / non-target iGPU"
+      fi
+      echo "    AMD[${_ag}]: $(amd_gfx_label "$_ag") (${_ast}${_agtt})"
+      _agtt=""
     done
   fi
   local _hl

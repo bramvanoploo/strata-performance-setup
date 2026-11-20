@@ -4,7 +4,7 @@
 
 An interactive TUI wizard (`strata-performance-setup.sh`) to inspect, apply, and revert host-level Linux performance optimizations for running **Strata** LLM inference—and to install, update, launch, and manage `strata.service` (or run in host-tuning mode when Strata is deployed in Docker on hosts like Unraid, TrueNAS SCALE, or Synology DSM).
 
-The script automatically detects your distribution, CPU, RAM, GPU(s), laptop/chassis vendor, and bootloader, then presents only the optimizations applicable to your machine. Every optimization can be applied or reverted cleanly from the wizard.
+The script automatically detects your distribution, CPU, RAM, GPU(s), laptop/chassis vendor, and bootloader, then presents only the optimizations applicable to your machine. Every optimization can be applied or reverted cleanly from the wizard. On systems with AMD GPUs or unified-memory APUs lacking an official prebuilt Strata Linux engine (such as Strix Point `gfx1150`, Phoenix/Hawk Point `gfx1103`, Krackan `gfx1152`, RDNA 1/2, or `gfx906`), it also detects the exact `gfx` architecture, wires required experimental opt-ins and kernel workarounds (`amd_apu_memory`, `amd_cwsr_disable`), and can build, package, and register a self-contained local HIP engine directly from `[STRATA]`.
 
 > **Note:** Host-level tuning complements—but does not replace—Strata's own serving configuration. On VRAM-constrained GPUs, check your serving/prefill chunk settings (e.g. `auto` vs. pinned) before chasing marginal OS-level gains.
 
@@ -57,7 +57,7 @@ Inspect detected OS/init, hardware, Strata installation or Docker container, and
 ## Documentation
 
 - [Supported Distributions](documentation/supported-distributions.md) — Supported Linux families, package managers, and bootloaders
-- [Supported Hardware](documentation/supported-hardware.md) — GPU, laptop/OEM, and system-wide optimizations
+- [Supported Hardware](documentation/supported-hardware.md) — GPU (including AMD `gfx` / local HIP builds), laptop/OEM, and system-wide optimizations
 - [Live Dashboard & Strata Monitoring](documentation/live-dashboard-and-strata-monitoring.md) — Real-time system metrics, Strata status, and update polling
 - [Using the Wizard](documentation/using-the-wizard.md) — Navigation, shortcuts, and benchmark configuration restore
 - [Credits & Third-Party Projects](documentation/credits-and-third-party-projects.md) — Open-source projects integrated with the wizard
