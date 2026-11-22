@@ -119,7 +119,7 @@ HAS_NVIDIA_KEPLER=false HAS_NVIDIA_MAXWELL=false HAS_NVIDIA_PASCAL=false HAS_NVI
 HAS_NVIDIA_NVSWITCH=false IS_DGX_SPARK=false HAS_NVIDIA_UNIFIED_MEM=false
 NVIDIA_DRIVER_VER="" NVIDIA_DRIVER_MAJOR=0 NVIDIA_LIVE_EXTRA_FIELDS=""
 NVIDIA_MIG_ANY_ENABLED=false NVIDIA_MIG_ANY_PEND_ENABLED=false
-GPU_SUMMARY="" GPU_RAW="" AMD_GFX_SUMMARY="" AMD_MISSING_GFX_SUMMARY="" CPU_SUMMARY="" RAM_GB=0 RAM_DETAILS="" NVIDIA_VRAM_MB=0 TOTAL_VRAM_MB=0
+GPU_SUMMARY="" GPU_RAW="" AMD_GFX_SUMMARY="" AMD_MISSING_GFX_SUMMARY="" CPU_SUMMARY="" RAM_GB=0 RAM_MB=0 RAM_DETAILS="" NVIDIA_VRAM_MB=0 TOTAL_VRAM_MB=0
 HAS_MSI_EC=false SYS_VENDOR="" PRODUCT_NAME="" IS_LAPTOP=false HAS_ASPM=false
 IS_JETSON=false IS_JETSON_TX2=false IS_JETSON_XAVIER=false IS_JETSON_ORIN=false IS_JETSON_THOR=false
 JETSON_MODEL="" JETSON_L4T_REL="" JETSON_SOC=""
@@ -186,12 +186,14 @@ run_root() {
 }
 
 run_as_user() {
-  local env_prefix="" _kv=""
+  local env_prefix="" _kv="" _k="" _qv=""
   local -a _rt_env=()
   [[ -n "${STRATA_API_KEY:-}" ]] && printf -v env_prefix 'export STRATA_API_KEY=%q; ' "$STRATA_API_KEY"
   _fill_strata_runtime_env_array _rt_env
   for _kv in ${_rt_env[@]+"${_rt_env[@]}"}; do
-    env_prefix+="export ${_kv}; "
+    _k="${_kv%%=*}"
+    printf -v _qv '%q' "${_kv#*=}"
+    env_prefix+="export ${_k}=${_qv}; "
   done
   if [[ $EUID -eq 0 && "$TARGET_USER" != "root" ]]; then
     if [[ "$IS_MACOS" == true ]]; then
@@ -262,9 +264,9 @@ _launchd_user_uid() {
 }
 
 resolve_rc_script() {
-  local name="${1%.service}"
-  if [[ -x "/etc/rc.d/rc.strata.${name}" ]]; then
-    echo "/etc/rc.d/rc.strata.${name}"
+  local name="${1%.service}" rc_dir="${STRATA_RC_DIR:-/etc/rc.d}"
+  if [[ -x "${rc_dir}/rc.strata.${name}" ]]; then
+    echo "${rc_dir}/rc.strata.${name}"
   elif [[ "$IS_UNRAID" == true && -f "/boot/config/strata/rc.strata.${name}" ]]; then
     echo "/boot/config/strata/rc.strata.${name}"
   elif [[ "$IS_SYNOLOGY" == true && -x "/usr/local/etc/rc.d/strata-${name}.sh" ]]; then
@@ -420,7 +422,7 @@ install_service() {
   fi
 
   local name="${unit%.service}"
-  local content env_cmds="" start_cmds="" stop_cmds="" work_dir="" line cmd ignore_err ev ek evv
+  local content env_cmds="" start_cmds="" stop_cmds="" work_dir="" svc_user="" limit_memlock="" line cmd ignore_err ev ek evv
   content="$(cat)"
   while IFS= read -r line; do
     if [[ "$line" =~ ^Environment=(.*)$ ]]; then
@@ -438,6 +440,10 @@ install_service() {
       fi
     elif [[ "$line" =~ ^WorkingDirectory=(.*)$ ]]; then
       work_dir="${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ ^User=(.*)$ ]]; then
+      svc_user="${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ ^LimitMEMLOCK=(.*)$ ]]; then
+      limit_memlock="${BASH_REMATCH[1]}"
     elif [[ "$line" =~ ^ExecStart=(.*)$ ]]; then
       cmd="${BASH_REMATCH[1]}"
       ignore_err=""
@@ -548,16 +554,42 @@ ${extra_plist}</dict>
     return 0
   fi
 
-  local rc_script="/etc/rc.d/rc.strata.${name}"
+  local rc_dir="${STRATA_RC_DIR:-/etc/rc.d}"
+  local rc_script="${rc_dir}/rc.strata.${name}"
+  local rc_work_line="" rc_memlock_line="" rc_start_body="${start_cmds:-    :}" rc_stop_body="${stop_cmds:-    :}"
+  if [[ -n "$work_dir" ]]; then
+    local rc_wd_sq
+    rc_wd_sq="$(printf "%s" "$work_dir" | sed "s/'/'\\\\''/g")"
+    rc_work_line="cd '${rc_wd_sq}' || true"$'\n'
+  fi
+  if [[ "$limit_memlock" == "infinity" ]]; then
+    rc_memlock_line="ulimit -l unlimited 2>/dev/null || true"$'\n'
+  fi
+  if [[ -n "$svc_user" && "$svc_user" != "root" ]]; then
+    local rc_u_sq rc_home_sq rc_start_sq rc_stop_sq
+    rc_u_sq="$(printf "%s" "$svc_user" | sed "s/'/'\\\\''/g")"
+    rc_home_sq="$(printf "%s" "${work_dir:-$TARGET_HOME}" | sed "s/'/'\\\\''/g")"
+    _rc_wrap_user() {
+      local body_txt="$1" body_sq=""
+      body_sq="$(printf "%s" "${env_cmds}${rc_work_line}${body_txt}" | sed "s/'/'\\\\''/g")"
+      printf '    if [ "$(id -un)" = '\''%s'\'' ]; then\n      sh -c '\''%s'\''\n    elif command -v runuser >/dev/null 2>&1; then\n      HOME='\''%s'\'' runuser -u '\''%s'\'' -- sh -c '\''%s'\''\n    else\n      HOME='\''%s'\'' su -s /bin/sh '\''%s'\'' -c '\''%s'\''\n    fi\n' \
+        "$rc_u_sq" "$body_sq" "$rc_home_sq" "$rc_u_sq" "$body_sq" "$rc_home_sq" "$rc_u_sq" "$body_sq"
+    }
+    rc_start_body="$(_rc_wrap_user "$rc_start_body")"
+    rc_stop_body="$(_rc_wrap_user "$rc_stop_body")"
+    unset -f _rc_wrap_user
+    env_cmds=""
+    rc_work_line=""
+  fi
   run_root tee "$rc_script" >/dev/null <<EOF
 #!/bin/sh
 # Managed by strata-performance-setup (${unit})
-${env_cmds}case "\$1" in
+${env_cmds}${rc_work_line}${rc_memlock_line}case "\$1" in
   start)
-${start_cmds:-    :}
+${rc_start_body}
     ;;
   stop)
-${stop_cmds:-    :}
+${rc_stop_body}
     ;;
   restart)
     "\$0" stop
@@ -582,8 +614,8 @@ EOF
     run_root cp "$rc_script" "$syno_script"
     run_root chmod +x "$syno_script"
   else
-    add_boot_hook "/etc/rc.d/rc.local" "# strata:${name}" "[ -x ${rc_script} ] && ${rc_script} start # strata:${name}" "#!/bin/sh"
-    run_root chmod +x /etc/rc.d/rc.local
+    add_boot_hook "${rc_dir}/rc.local" "# strata:${name}" "[ -x ${rc_script} ] && ${rc_script} start # strata:${name}" "#!/bin/sh"
+    run_root chmod +x "${rc_dir}/rc.local"
   fi
   run_root "$rc_script" start
 }
@@ -613,7 +645,7 @@ remove_service() {
   if rc_script="$(resolve_rc_script "$unit")"; then
     run_root sh "$rc_script" stop >/dev/null 2>&1 || true
   fi
-  run_root rm -f "/etc/rc.d/rc.strata.${name}"
+  run_root rm -f "${STRATA_RC_DIR:-/etc/rc.d}/rc.strata.${name}"
   if [[ "$IS_UNRAID" == true ]]; then
     run_root rm -f "/boot/config/strata/rc.strata.${name}"
     remove_boot_hook "/boot/config/go" "# strata:${name}"
@@ -621,7 +653,7 @@ remove_service() {
   if [[ "$IS_SYNOLOGY" == true ]]; then
     run_root rm -f "/usr/local/etc/rc.d/strata-${name}.sh"
   fi
-  remove_boot_hook "/etc/rc.d/rc.local" "# strata:${name}"
+  remove_boot_hook "${STRATA_RC_DIR:-/etc/rc.d}/rc.local" "# strata:${name}"
 }
 
 pkg_installed() {
@@ -746,7 +778,11 @@ prompt_install_deps() {
     echo -e "${C_DIM}Skipped dependency installation.${C_RESET}"
     return 1
   fi
-  [[ "$mode" == "aur" ]] && aur_install "${missing[@]}" || pkg_install "${missing[@]}"
+  if [[ "$mode" == "aur" ]]; then
+    aur_install "${missing[@]}"
+  else
+    pkg_install "${missing[@]}"
+  fi
 }
 
 prompt_install_repo_or_aur() {
@@ -761,11 +797,26 @@ prompt_install_repo_or_aur() {
 }
 
 bls_entries_dir() {
-  local d
-  for d in /boot/loader/entries /efi/loader/entries /boot/efi/loader/entries; do
+  local br="${STRATA_BOOT_ROOT:-}" d
+  for d in "${br}/boot/loader/entries" "${br}/efi/loader/entries" "${br}/boot/efi/loader/entries"; do
     compgen -G "$d/*.conf" >/dev/null 2>&1 && { echo "$d"; return 0; }
   done
   return 1
+}
+
+_kernel_param_files() {
+  local br="${STRATA_BOOT_ROOT:-}"
+  printf '%s\n' \
+    "${br}/etc/default/limine" \
+    "${br}/etc/default/grub" \
+    "${br}/etc/kernel/cmdline" \
+    "${br}/boot/refind_linux.conf" \
+    "${br}"/boot/loader/entries/*.conf \
+    "${br}"/efi/loader/entries/*.conf \
+    "${br}"/boot/efi/loader/entries/*.conf \
+    "${br}/boot/efi/EFI/Slackware/elilo.conf" \
+    "${br}/etc/elilo.conf" \
+    "${br}/etc/lilo.conf"
 }
 
 _escape_ere() {
@@ -812,161 +863,286 @@ PYEOF
   fi
 }
 
-has_kernel_param() {
-  local param="$1" f
-  _file_has_kparam "$param" /proc/cmdline && return 0
-  for f in /etc/default/limine /etc/default/grub /etc/kernel/cmdline /boot/refind_linux.conf /boot/loader/entries/*.conf /efi/loader/entries/*.conf /boot/efi/loader/entries/*.conf /boot/efi/EFI/Slackware/elilo.conf /etc/elilo.conf /etc/lilo.conf; do
-    _file_has_kparam "$param" "$f" && return 0
+_append_kparam_to_cmdline_file() {
+  local file="$1"; shift
+  local -a pending=()
+  local p
+  for p in "$@"; do
+    _file_has_kparam "$p" "$file" || pending+=("$p")
   done
+  (( ${#pending[@]} > 0 )) || return 1
+  local joined="${pending[*]}"
+  if [[ ! -s "$file" ]] || ! grep -qv '^[[:space:]]*$' "$file" 2>/dev/null; then
+    printf '%s\n' "$joined" | run_root tee "$file" >/dev/null
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    run_root python3 - "$file" "$joined" <<'PYEOF'
+import sys
+p, add = sys.argv[1], sys.argv[2]
+with open(p) as f:
+    lines = f.read().splitlines(True)
+out = []
+done = False
+for ln in lines:
+    if not done and ln.strip() and not ln.lstrip().startswith('#'):
+        nl = "\n" if ln.endswith("\n") else ""
+        out.append(ln.rstrip("\r\n") + " " + add + nl)
+        done = True
+    else:
+        out.append(ln)
+if not done:
+    out.append(add + "\n")
+with open(p, 'w') as f:
+    f.writelines(out)
+PYEOF
+  else
+    local esc_j
+    esc_j="$(printf '%s' "$joined" | sed 's/[&/\\]/\\&/g')"
+    run_root sed -i "0,/^[[:space:]]*[^#[:space:]]/{s/[[:space:]]*$/ ${esc_j}/; s/^[[:space:]]*//}" "$file"
+  fi
+  return 0
+}
+
+_append_kparam_to_refind_file() {
+  local file="$1"; shift
+  local -a pending=()
+  local p
+  for p in "$@"; do
+    _file_has_kparam "$p" "$file" || pending+=("$p")
+  done
+  (( ${#pending[@]} > 0 )) || return 1
+  local joined="${pending[*]}"
+  if command -v python3 >/dev/null 2>&1; then
+    run_root python3 - "$file" "$joined" <<'PYEOF'
+import re, sys
+p, add = sys.argv[1], sys.argv[2]
+with open(p) as f:
+    lines = f.read().splitlines(True)
+out = []
+done = False
+for ln in lines:
+    if not done and not ln.lstrip().startswith('#') and re.search(r'"\s*$', ln):
+        out.append(re.sub(r'"(\s*)$', f' {add}"\\1', ln, count=1))
+        done = True
+    else:
+        out.append(ln)
+with open(p, 'w') as f:
+    f.writelines(out)
+PYEOF
+  else
+    local esc_j
+    esc_j="$(printf '%s' "$joined" | sed 's/[&/\\]/\\&/g')"
+    run_root sed -i -E "0,/^[[:space:]]*[^#[:space:]].*\"[[:space:]]*$/{s/\"[[:space:]]*$/ ${esc_j}\"/}" "$file"
+  fi
+  return 0
+}
+
+has_kernel_param() {
+  local param="$1" f br="${STRATA_BOOT_ROOT:-}"
+  _file_has_kparam "$param" "${br}/proc/cmdline" && return 0
+  while IFS= read -r f; do
+    _file_has_kparam "$param" "$f" && return 0
+  done < <(_kernel_param_files)
   return 1
 }
 
 add_kernel_param() {
-  local param="$1" bls_dir
-  _file_has_kparam "$param" /proc/cmdline && return 0
+  local br="${STRATA_BOOT_ROOT:-}"
+  local -a params=() missing=()
+  local param bls_dir=""
+  for param in "$@"; do
+    [[ -n "$param" ]] || continue
+    _file_has_kparam "$param" "${br}/proc/cmdline" || params+=("$param")
+  done
+  (( ${#params[@]} > 0 )) || return 0
 
-  if [[ "$DISTRO_FAMILY" == "fedora" || "$DISTRO_FAMILY" == "suse" ]] && command -v grubby >/dev/null 2>&1 && [[ ! -f /etc/default/limine ]]; then
-    run_root grubby --update-kernel=ALL --args="$param" || true
+  if [[ "$DISTRO_FAMILY" == "fedora" || "$DISTRO_FAMILY" == "suse" ]] && command -v grubby >/dev/null 2>&1 && [[ ! -f "${br}/etc/default/limine" ]]; then
+    run_root grubby --update-kernel=ALL --args="${params[*]}" || true
     REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
-    echo -e "${C_GREEN}Added '${param}' via grubby (reboot required).${C_RESET}"
+    echo -e "${C_GREEN}Added '${params[*]}' via grubby (reboot required).${C_RESET}"
     return 0
   fi
 
-  if [[ -f /etc/default/limine ]]; then
-    if ! _file_has_kparam "$param" /etc/default/limine; then
-      if grep -qE '^KERNEL_CMDLINE\[default\]\+?="' /etc/default/limine; then
-        run_root sed -i "s/\(KERNEL_CMDLINE\[default\]+\{0,1\}=\"[^\"]*\)\"/\1 ${param}\"/" /etc/default/limine
-        run_root sed -i 's/KERNEL_CMDLINE\[default\]\(+\{0,1\}\)=\" /KERNEL_CMDLINE[default]\1=\"/' /etc/default/limine
+  if [[ -f "${br}/etc/default/limine" ]]; then
+    missing=()
+    for param in "${params[@]}"; do
+      _file_has_kparam "$param" "${br}/etc/default/limine" || missing+=("$param")
+    done
+    if (( ${#missing[@]} > 0 )); then
+      local joined="${missing[*]}" esc_j
+      esc_j="$(printf '%s' "$joined" | sed 's/[&/\\]/\\&/g')"
+      if grep -qE '^KERNEL_CMDLINE\[default\]\+?="' "${br}/etc/default/limine"; then
+        run_root sed -i "s/\(KERNEL_CMDLINE\[default\]+\{0,1\}=\"[^\"]*\)\"/\1 ${esc_j}\"/" "${br}/etc/default/limine"
+        run_root sed -i 's/KERNEL_CMDLINE\[default\]\(+\{0,1\}\)=\" /KERNEL_CMDLINE[default]\1=\"/' "${br}/etc/default/limine"
       else
-        echo "KERNEL_CMDLINE[default]+=\"${param}\"" | run_root tee -a /etc/default/limine >/dev/null
+        echo "KERNEL_CMDLINE[default]+=\"${joined}\"" | run_root tee -a "${br}/etc/default/limine" >/dev/null
       fi
       command -v limine-mkinitcpio >/dev/null 2>&1 && run_root limine-mkinitcpio || true
     fi
     REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
-    echo -e "${C_GREEN}Added '${param}' to /etc/default/limine (reboot required).${C_RESET}"
-  elif [[ -f /etc/default/grub ]]; then
-    if ! _file_has_kparam "$param" /etc/default/grub; then
-      if grep -qE '^GRUB_CMDLINE_LINUX_DEFAULT="' /etc/default/grub; then
-        run_root sed -i "s/\(^GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*\)\"/\1 ${param}\"/" /etc/default/grub
-        run_root sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=\" /GRUB_CMDLINE_LINUX_DEFAULT=\"/' /etc/default/grub
-      elif grep -qE "^GRUB_CMDLINE_LINUX_DEFAULT='" /etc/default/grub; then
-        run_root sed -i "s/\(^GRUB_CMDLINE_LINUX_DEFAULT='[^']*\)'/\1 ${param}'/" /etc/default/grub
-        run_root sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=' /GRUB_CMDLINE_LINUX_DEFAULT='/" /etc/default/grub
-      elif grep -qE '^GRUB_CMDLINE_LINUX="' /etc/default/grub; then
-        run_root sed -i "s/\(^GRUB_CMDLINE_LINUX=\"[^\"]*\)\"/\1 ${param}\"/" /etc/default/grub
-        run_root sed -i 's/^GRUB_CMDLINE_LINUX=\" /GRUB_CMDLINE_LINUX=\"/' /etc/default/grub
+    echo -e "${C_GREEN}Added '${params[*]}' to ${br}/etc/default/limine (reboot required).${C_RESET}"
+  elif [[ -f "${br}/etc/default/grub" ]]; then
+    missing=()
+    for param in "${params[@]}"; do
+      _file_has_kparam "$param" "${br}/etc/default/grub" || missing+=("$param")
+    done
+    if (( ${#missing[@]} > 0 )); then
+      local joined="${missing[*]}" esc_j
+      esc_j="$(printf '%s' "$joined" | sed 's/[&/\\]/\\&/g')"
+      if grep -qE '^GRUB_CMDLINE_LINUX_DEFAULT="' "${br}/etc/default/grub"; then
+        run_root sed -i "s/\(^GRUB_CMDLINE_LINUX_DEFAULT=\"[^\"]*\)\"/\1 ${esc_j}\"/" "${br}/etc/default/grub"
+        run_root sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=\" /GRUB_CMDLINE_LINUX_DEFAULT=\"/' "${br}/etc/default/grub"
+      elif grep -qE "^GRUB_CMDLINE_LINUX_DEFAULT='" "${br}/etc/default/grub"; then
+        run_root sed -i "s/\(^GRUB_CMDLINE_LINUX_DEFAULT='[^']*\)'/\1 ${esc_j}'/" "${br}/etc/default/grub"
+        run_root sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=' /GRUB_CMDLINE_LINUX_DEFAULT='/" "${br}/etc/default/grub"
+      elif grep -qE '^GRUB_CMDLINE_LINUX="' "${br}/etc/default/grub"; then
+        run_root sed -i "s/\(^GRUB_CMDLINE_LINUX=\"[^\"]*\)\"/\1 ${esc_j}\"/" "${br}/etc/default/grub"
+        run_root sed -i 's/^GRUB_CMDLINE_LINUX=\" /GRUB_CMDLINE_LINUX=\"/' "${br}/etc/default/grub"
       else
-        echo "GRUB_CMDLINE_LINUX_DEFAULT=\"${param}\"" | run_root tee -a /etc/default/grub >/dev/null
+        echo "GRUB_CMDLINE_LINUX_DEFAULT=\"${joined}\"" | run_root tee -a "${br}/etc/default/grub" >/dev/null
       fi
       if command -v grub-mkconfig >/dev/null 2>&1; then
-        run_root grub-mkconfig -o /boot/grub/grub.cfg || true
+        run_root grub-mkconfig -o "${br}/boot/grub/grub.cfg" || true
       elif command -v grub2-mkconfig >/dev/null 2>&1; then
-        run_root grub2-mkconfig -o /boot/grub2/grub.cfg || true
+        run_root grub2-mkconfig -o "${br}/boot/grub2/grub.cfg" || true
       fi
     fi
     REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
-    echo -e "${C_GREEN}Added '${param}' to /etc/default/grub (reboot required).${C_RESET}"
-  elif [[ -f /etc/kernel/cmdline ]]; then
-    if ! _file_has_kparam "$param" /etc/kernel/cmdline; then
-      run_root sed -i "s/[[:space:]]*$/ ${param}/; s/^[[:space:]]*//" /etc/kernel/cmdline
-      command -v bootctl >/dev/null 2>&1 && run_root bootctl update >/dev/null 2>&1 || true
-    fi
-    REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
-    echo -e "${C_GREEN}Added '${param}' to /etc/kernel/cmdline (reboot required).${C_RESET}"
-  elif bls_dir="$(bls_entries_dir)"; then
-    local f
-    for f in "$bls_dir"/*.conf; do
-      [[ -f "$f" ]] || continue
-      if ! _file_has_kparam "$param" "$f"; then
-        if grep -qE '^options[[:space:]]' "$f"; then
-          run_root sed -i "s/^options .*/& ${param}/" "$f"
-        else
-          echo "options ${param}" | run_root tee -a "$f" >/dev/null
+    echo -e "${C_GREEN}Added '${params[*]}' to ${br}/etc/default/grub (reboot required).${C_RESET}"
+  elif [[ -f "${br}/etc/kernel/cmdline" ]] || bls_dir="$(bls_entries_dir)"; then
+    local updated_sd=false
+    if [[ -f "${br}/etc/kernel/cmdline" ]]; then
+      if _append_kparam_to_cmdline_file "${br}/etc/kernel/cmdline" "${params[@]}"; then
+        updated_sd=true
+        if compgen -G "${br}/efi/EFI/Linux/*.efi" >/dev/null 2>&1 || compgen -G "${br}/boot/EFI/Linux/*.efi" >/dev/null 2>&1 || compgen -G "${br}/boot/efi/EFI/Linux/*.efi" >/dev/null 2>&1; then
+          if command -v mkinitcpio >/dev/null 2>&1; then
+            run_root mkinitcpio -P || true
+          else
+            echo -e "${C_YELLOW}Note: UKI image detected; rebuild your UKI (dracut/ukify/kernel-install) for /etc/kernel/cmdline changes to apply.${C_RESET}"
+          fi
         fi
       fi
+      echo -e "${C_GREEN}Added '${params[*]}' to ${br}/etc/kernel/cmdline (reboot required).${C_RESET}"
+    fi
+    if [[ -n "$bls_dir" ]] || bls_dir="$(bls_entries_dir)"; then
+      local f
+      for f in "$bls_dir"/*.conf; do
+        [[ -f "$f" ]] || continue
+        missing=()
+        for param in "${params[@]}"; do
+          _file_has_kparam "$param" "$f" || missing+=("$param")
+        done
+        if (( ${#missing[@]} > 0 )); then
+          local joined="${missing[*]}" esc_j
+          esc_j="$(printf '%s' "$joined" | sed 's/[&/\\]/\\&/g')"
+          if grep -qE '^options[[:space:]]' "$f"; then
+            run_root sed -i "s/^options .*/& ${esc_j}/" "$f"
+          else
+            echo "options ${joined}" | run_root tee -a "$f" >/dev/null
+          fi
+        fi
+      done
+      echo -e "${C_GREEN}Added '${params[*]}' to systemd-boot entries in ${bls_dir} (reboot required).${C_RESET}"
+    fi
+    [[ "$updated_sd" == true ]] && command -v bootctl >/dev/null 2>&1 && run_root bootctl update >/dev/null 2>&1 || true
+    REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
+  elif [[ -f "${br}/boot/refind_linux.conf" ]]; then
+    _append_kparam_to_refind_file "${br}/boot/refind_linux.conf" "${params[@]}" || true
+    REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
+    echo -e "${C_GREEN}Added '${params[*]}' to ${br}/boot/refind_linux.conf (reboot required).${C_RESET}"
+  elif [[ -f "${br}/boot/efi/EFI/Slackware/elilo.conf" || -f "${br}/etc/elilo.conf" ]]; then
+    local elilo_f="${br}/boot/efi/EFI/Slackware/elilo.conf"
+    [[ -f "$elilo_f" ]] || elilo_f="${br}/etc/elilo.conf"
+    missing=()
+    for param in "${params[@]}"; do
+      _file_has_kparam "$param" "$elilo_f" || missing+=("$param")
     done
-    REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
-    echo -e "${C_GREEN}Added '${param}' to systemd-boot entries in ${bls_dir} (reboot required).${C_RESET}"
-  elif [[ -f /boot/refind_linux.conf ]]; then
-    _file_has_kparam "$param" /boot/refind_linux.conf || run_root sed -i -E "s/\"[[:space:]]*$/ ${param}\"/" /boot/refind_linux.conf
-    REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
-    echo -e "${C_GREEN}Added '${param}' to /boot/refind_linux.conf (reboot required).${C_RESET}"
-  elif [[ -f /boot/efi/EFI/Slackware/elilo.conf || -f /etc/elilo.conf ]]; then
-    local elilo_f="/boot/efi/EFI/Slackware/elilo.conf"
-    [[ -f "$elilo_f" ]] || elilo_f="/etc/elilo.conf"
-    if ! _file_has_kparam "$param" "$elilo_f"; then
+    if (( ${#missing[@]} > 0 )); then
+      local joined="${missing[*]}" esc_j
+      esc_j="$(printf '%s' "$joined" | sed 's/[&/\\]/\\&/g')"
       if grep -qE '^[[:space:]]*append="' "$elilo_f"; then
-        run_root sed -i -E "s/^([[:space:]]*append=\"[^\"]*)\"/\1 ${param}\"/" "$elilo_f"
+        run_root sed -i -E "s/^([[:space:]]*append=\"[^\"]*)\"/\1 ${esc_j}\"/" "$elilo_f"
         run_root sed -i -E 's/^([[:space:]]*append=") /\1/' "$elilo_f"
       else
-        echo "append=\"${param}\"" | run_root tee -a "$elilo_f" >/dev/null
+        echo "append=\"${joined}\"" | run_root tee -a "$elilo_f" >/dev/null
       fi
     fi
     REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
-    echo -e "${C_GREEN}Added '${param}' to ${elilo_f} (reboot required).${C_RESET}"
-  elif [[ -f /etc/lilo.conf ]]; then
-    if ! _file_has_kparam "$param" /etc/lilo.conf; then
-      if grep -qE '^[[:space:]]*append="' /etc/lilo.conf; then
-        run_root sed -i -E "s/^([[:space:]]*append=\"[^\"]*)\"/\1 ${param}\"/" /etc/lilo.conf
-        run_root sed -i -E 's/^([[:space:]]*append=") /\1/' /etc/lilo.conf
+    echo -e "${C_GREEN}Added '${params[*]}' to ${elilo_f} (reboot required).${C_RESET}"
+  elif [[ -f "${br}/etc/lilo.conf" ]]; then
+    missing=()
+    for param in "${params[@]}"; do
+      _file_has_kparam "$param" "${br}/etc/lilo.conf" || missing+=("$param")
+    done
+    if (( ${#missing[@]} > 0 )); then
+      local joined="${missing[*]}" esc_j
+      esc_j="$(printf '%s' "$joined" | sed 's/[&/\\]/\\&/g')"
+      if grep -qE '^[[:space:]]*append="' "${br}/etc/lilo.conf"; then
+        run_root sed -i -E "s/^([[:space:]]*append=\"[^\"]*)\"/\1 ${esc_j}\"/" "${br}/etc/lilo.conf"
+        run_root sed -i -E 's/^([[:space:]]*append=") /\1/' "${br}/etc/lilo.conf"
       else
-        echo "append=\"${param}\"" | run_root tee -a /etc/lilo.conf >/dev/null
+        echo "append=\"${joined}\"" | run_root tee -a "${br}/etc/lilo.conf" >/dev/null
       fi
       command -v lilo >/dev/null 2>&1 && run_root lilo || true
     fi
     REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
-    echo -e "${C_GREEN}Added '${param}' to /etc/lilo.conf (reboot required).${C_RESET}"
+    echo -e "${C_GREEN}Added '${params[*]}' to ${br}/etc/lilo.conf (reboot required).${C_RESET}"
   else
     REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
-    echo -e "${C_YELLOW}Please add '${param}' to your bootloader kernel command line manually.${C_RESET}"
+    echo -e "${C_YELLOW}Please add '${params[*]}' to your bootloader kernel command line manually.${C_RESET}"
   fi
 }
 
 remove_kernel_param() {
-  local param="$1" changed=false
-  if _file_has_kparam "$param" /etc/default/limine; then
-    _remove_kparam_from_file "$param" /etc/default/limine
+  local br="${STRATA_BOOT_ROOT:-}" changed=false
+  local param ef limine_changed=false grub_changed=false cmdline_changed=false lilo_changed=false
+  for param in "$@"; do
+    [[ -n "$param" ]] || continue
+    if _file_has_kparam "$param" "${br}/etc/default/limine"; then
+      _remove_kparam_from_file "$param" "${br}/etc/default/limine"
+      limine_changed=true changed=true
+    fi
+    if _file_has_kparam "$param" "${br}/etc/default/grub"; then
+      _remove_kparam_from_file "$param" "${br}/etc/default/grub"
+      grub_changed=true changed=true
+    fi
+    if _file_has_kparam "$param" "${br}/etc/kernel/cmdline"; then
+      _remove_kparam_from_file "$param" "${br}/etc/kernel/cmdline"
+      cmdline_changed=true changed=true
+    fi
+    if [[ "$DISTRO_FAMILY" == "fedora" || "$DISTRO_FAMILY" == "suse" ]] && command -v grubby >/dev/null 2>&1; then
+      run_root grubby --update-kernel=ALL --remove-args="$param" >/dev/null 2>&1 && changed=true || true
+    fi
+    for ef in "${br}"/boot/loader/entries/*.conf "${br}"/efi/loader/entries/*.conf "${br}"/boot/efi/loader/entries/*.conf "${br}/boot/refind_linux.conf" "${br}/boot/efi/EFI/Slackware/elilo.conf" "${br}/etc/elilo.conf"; do
+      if [[ -f "$ef" ]] && _file_has_kparam "$param" "$ef"; then
+        _remove_kparam_from_file "$param" "$ef"
+        changed=true
+      fi
+    done
+    if _file_has_kparam "$param" "${br}/etc/lilo.conf"; then
+      _remove_kparam_from_file "$param" "${br}/etc/lilo.conf"
+      lilo_changed=true changed=true
+    fi
+  done
+  if [[ "$limine_changed" == true ]]; then
     command -v limine-mkinitcpio >/dev/null 2>&1 && run_root limine-mkinitcpio || true
-    changed=true
   fi
-  if _file_has_kparam "$param" /etc/default/grub; then
-    _remove_kparam_from_file "$param" /etc/default/grub
+  if [[ "$grub_changed" == true ]]; then
     if command -v grub-mkconfig >/dev/null 2>&1; then
-      run_root grub-mkconfig -o /boot/grub/grub.cfg || true
+      run_root grub-mkconfig -o "${br}/boot/grub/grub.cfg" || true
     elif command -v grub2-mkconfig >/dev/null 2>&1; then
-      run_root grub2-mkconfig -o /boot/grub2/grub.cfg || true
+      run_root grub2-mkconfig -o "${br}/boot/grub2/grub.cfg" || true
     fi
-    changed=true
   fi
-  if _file_has_kparam "$param" /etc/kernel/cmdline; then
-    _remove_kparam_from_file "$param" /etc/kernel/cmdline
+  if [[ "$cmdline_changed" == true ]]; then
+    if compgen -G "${br}/efi/EFI/Linux/*.efi" >/dev/null 2>&1 || compgen -G "${br}/boot/EFI/Linux/*.efi" >/dev/null 2>&1 || compgen -G "${br}/boot/efi/EFI/Linux/*.efi" >/dev/null 2>&1; then
+      command -v mkinitcpio >/dev/null 2>&1 && run_root mkinitcpio -P || true
+    fi
     command -v bootctl >/dev/null 2>&1 && run_root bootctl update >/dev/null 2>&1 || true
-    changed=true
   fi
-  if [[ "$DISTRO_FAMILY" == "fedora" || "$DISTRO_FAMILY" == "suse" ]] && command -v grubby >/dev/null 2>&1; then
-    run_root grubby --update-kernel=ALL --remove-args="$param" >/dev/null 2>&1 && changed=true || true
-  fi
-  local ef
-  for ef in /boot/loader/entries/*.conf /efi/loader/entries/*.conf /boot/efi/loader/entries/*.conf; do
-    if [[ -f "$ef" ]] && _file_has_kparam "$param" "$ef"; then
-      _remove_kparam_from_file "$param" "$ef"
-      changed=true
-    fi
-  done
-  if _file_has_kparam "$param" /boot/refind_linux.conf; then
-    _remove_kparam_from_file "$param" /boot/refind_linux.conf
-    changed=true
-  fi
-  for ef in /boot/efi/EFI/Slackware/elilo.conf /etc/elilo.conf; do
-    if [[ -f "$ef" ]] && _file_has_kparam "$param" "$ef"; then
-      _remove_kparam_from_file "$param" "$ef"
-      changed=true
-    fi
-  done
-  if _file_has_kparam "$param" /etc/lilo.conf; then
-    _remove_kparam_from_file "$param" /etc/lilo.conf
+  if [[ "$lilo_changed" == true ]]; then
     command -v lilo >/dev/null 2>&1 && run_root lilo || true
-    changed=true
   fi
   if [[ "$changed" == true ]]; then
     REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
@@ -1196,13 +1372,6 @@ amd_gfx_is_missing_target() {
   esac
 }
 
-amd_gfx_is_uma_apu() {
-  case "$1" in
-    gfx115[0-9a-f]|gfx1103|gfx1033|gfx1035|gfx1036|gfx1037|gfx90c|gfx902|gfx909) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
 _is_amd_compute_apu_gfx() {
   case "$1" in
     gfx115[0-9a-f]|gfx1103|gfx1033|gfx1035|gfx1037|gfx90c|gfx902|gfx909) return 0 ;;
@@ -1216,12 +1385,6 @@ amd_has_gfx() {
 
 amd_missing_has_gfx() {
   (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )) && _array_contains_val "$1" "${AMD_MISSING_GFX_ARCHS[@]}"
-}
-
-strata_amd_opt_in_env_list() {
-  amd_missing_has_gfx "gfx1150" && echo "STRATA_EXPERIMENTAL_GFX1150=1"
-  amd_missing_has_gfx "gfx1103" && echo "STRATA_EXPERIMENTAL_GFX1103=1"
-  return 0
 }
 
 _fill_strata_runtime_env_array() {
@@ -2126,7 +2289,11 @@ detect_environment() {
     elif sudo -n true >/dev/null 2>&1; then DMI_MEM_CACHE="$(sudo -n dmidecode -t 17 2>/dev/null || true)"; fi
   fi
 
-  RAM_GB="$(awk '/MemTotal/ {printf "%.0f", $2/1048576}' /proc/meminfo 2>/dev/null || echo 0)"
+  local ram_kb=0
+  ram_kb="$(awk '/MemTotal/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo 0)"
+  [[ "$ram_kb" =~ ^[0-9]+$ ]] || ram_kb=0
+  RAM_MB=$(( ram_kb / 1024 ))
+  RAM_GB=$(( (ram_kb + 524288) / 1048576 ))
   detect_ram_details
   detect_ram_health
   detect_gpu_topology
@@ -2179,15 +2346,15 @@ detect_environment() {
 # Extra Helpers (kernel param values, sysctl snapshots, NVIDIA caches, PCIe diag)
 # ------------------------------------------------------------------------------
 kernel_param_value() {
-  local name="$1" esc f v
+  local name="$1" esc f v br="${STRATA_BOOT_ROOT:-}"
   esc="$(_escape_ere "$name")"
-  v="$(tr ' ' '\n' </proc/cmdline 2>/dev/null | grep -m1 -E "^${esc}=" | cut -d= -f2- || true)"
+  v="$(tr ' ' '\n' <"${br}/proc/cmdline" 2>/dev/null | grep -m1 -E "^${esc}=" | cut -d= -f2- || true)"
   [[ -n "$v" ]] && { echo "$v"; return 0; }
-  for f in /etc/default/limine /etc/default/grub /etc/kernel/cmdline /boot/refind_linux.conf /boot/loader/entries/*.conf /efi/loader/entries/*.conf /boot/efi/loader/entries/*.conf; do
+  while IFS= read -r f; do
     [[ -r "$f" ]] || continue
     v="$(grep -v '^[[:space:]]*#' "$f" 2>/dev/null | grep -oE "(^|[[:space:]\"'])${esc}=[^ \"']+" | head -n1 | sed -E 's/^[[:space:]"'\'']+//' | cut -d= -f2- || true)"
     [[ -n "$v" ]] && { echo "$v"; return 0; }
-  done
+  done < <(_kernel_param_files)
   return 1
 }
 
@@ -3667,9 +3834,8 @@ apply_nvidia_power_limit() {
     idx="${NVIDIA_GPU_INDICES[$i]}"
     def="${NVIDIA_GPU_DEF_PL[$i]}"
     mx="${NVIDIA_GPU_MAX_PL[$i]}"
-    out="$(run_root "$smi_bin" -i "$idx" -pl "$mx" 2>&1 || true)"
-    if grep -qi "not supported" <<< "$out"; then
-      echo -e "${C_YELLOW}nvidia-smi -i ${idx} -pl is not supported on ${NVIDIA_GPU_NAMES[$i]}.${C_RESET}"
+    if ! out="$(run_root "$smi_bin" -i "$idx" -pl "$mx" 2>&1)" || grep -qiE "not supported|failed|error|invalid|insufficient|unable" <<< "$out"; then
+      echo -e "${C_YELLOW}nvidia-smi -i ${idx} -pl ${mx} failed on ${NVIDIA_GPU_NAMES[$i]}: ${out}${C_RESET}"
       continue
     fi
     exec_start+="ExecStart=${smi_bin} -i ${idx} -pl ${mx}"$'\n'
@@ -3823,7 +3989,23 @@ applicable_lact_overclock() {
   command -v lact >/dev/null 2>&1 || pkg_available repo lact || pkg_available aur lact
 }
 title_lact_overclock() { echo "LACT GPU Clock & Memory Offsets (lactd)"; }
-status_lact_overclock() { unit_enabled lactd.service && [[ -f /etc/lact/config.yaml ]] && grep -qE "gpu_clock_offsets:|mem_clock_offsets:" /etc/lact/config.yaml 2>/dev/null; }
+status_lact_overclock() {
+  local cfg
+  cfg="$(lact_config_file)"
+  unit_enabled lactd.service && [[ -f "$cfg" ]] && awk '
+    /^[[:space:]]*(gpu_clock_offsets|mem_clock_offsets):/ {
+      if ($0 ~ /\{[[:space:]]*\}/) { in_off=0; next }
+      if ($0 ~ /:[[:space:]]*\{.*[0-9]/) { found=1; exit }
+      match($0, /^[[:space:]]*/); base_ind=RLENGTH; in_off=1; next
+    }
+    in_off {
+      match($0, /^[[:space:]]*/)
+      if (RLENGTH <= base_ind && $0 ~ /[^[:space:]]/) { in_off=0 }
+      else if ($0 ~ /^[[:space:]]+[0-9]+:[[:space:]]*-?[0-9]+/) { found=1; exit }
+    }
+    END { exit !found }
+  ' "$cfg" 2>/dev/null
+}
 explain_lact_overclock() {
   cat <<'EOF'
 Impact:
@@ -4031,8 +4213,10 @@ PY
 }
 revert_lact_overclock() {
   [[ "$HAS_AMD" == true ]] && remove_kernel_param "amdgpu.ppfeaturemask=0xffffffff"
-  if [[ -f /etc/lact/config.yaml.bak.strata-setup ]]; then
-    run_root mv -f /etc/lact/config.yaml.bak.strata-setup /etc/lact/config.yaml
+  local cfg
+  cfg="$(lact_config_file)"
+  if [[ -f "${cfg}.bak.strata-setup" ]]; then
+    run_root mv -f "${cfg}.bak.strata-setup" "$cfg"
     run_root systemctl restart lactd.service 2>/dev/null || true
   else
     run_root systemctl disable --now lactd.service 2>/dev/null || true
@@ -5212,15 +5396,16 @@ EOF
 apply_amd_apu_memory() {
   local pages
   pages="$(amd_apu_gtt_pages)"
-  add_kernel_param "ttm.pages_limit=${pages}"
-  add_kernel_param "ttm.page_pool_size=${pages}"
+  add_kernel_param "ttm.pages_limit=${pages}" "ttm.page_pool_size=${pages}"
 }
 revert_amd_apu_memory() {
   local n v
+  local -a rem=()
   for n in ttm.pages_limit ttm.page_pool_size; do
     v="$(kernel_param_value "$n" || true)"
-    [[ -n "$v" ]] && remove_kernel_param "${n}=${v}"
+    [[ -n "$v" ]] && rem+=("${n}=${v}")
   done
+  (( ${#rem[@]} > 0 )) && remove_kernel_param "${rem[@]}"
 }
 
 # 12j2. AMD Radeon 780M/760M MES Reset Workaround (gfx1103)
@@ -5521,7 +5706,7 @@ title_iommu_pt() { echo "IOMMU Passthrough Mode (iommu=pt, lower multi-GPU DMA o
 status_iommu_pt() { has_kernel_param "iommu=pt" || has_kernel_param "iommu.passthrough=1"; }
 explain_iommu_pt() { echo -e "Impact:\n  Adds 'iommu=pt' to the kernel command line so host devices skip IOMMU address\n  translation (lower DMA overhead for multi-GPU transfers and fast NICs). VFIO\n  device passthrough keeps working. Requires a reboot."; }
 apply_iommu_pt() { add_kernel_param "iommu=pt"; }
-revert_iommu_pt() { remove_kernel_param "iommu=pt"; remove_kernel_param "iommu.passthrough=1"; }
+revert_iommu_pt() { remove_kernel_param "iommu=pt" "iommu.passthrough=1"; }
 
 # 12q2. Multi-GPU PCIe ACS Disable
 applicable_pcie_acs_disable() {
@@ -5846,16 +6031,16 @@ EOF
   echo -e "${C_YELLOW}          and only helps workloads that explicitly use hugetlbfs.${C_RESET}"
 }
 apply_hugepages_1g() {
-  add_kernel_param "default_hugepagesz=1G"
-  add_kernel_param "hugepagesz=1G"
-  add_kernel_param "hugepages=$(( RAM_GB / 4 ))"
+  add_kernel_param "default_hugepagesz=1G" "hugepagesz=1G" "hugepages=$(( RAM_GB / 4 ))"
 }
 revert_hugepages_1g() {
   local n v
+  local -a rem=()
   for n in default_hugepagesz hugepagesz hugepages; do
     v="$(kernel_param_value "$n" || true)"
-    [[ -n "$v" ]] && remove_kernel_param "${n}=${v}"
+    [[ -n "$v" ]] && rem+=("${n}=${v}")
   done
+  (( ${#rem[@]} > 0 )) && remove_kernel_param "${rem[@]}"
 }
 
 # 12v. sched_ext scheduler
@@ -6593,10 +6778,6 @@ start_strata_update_poller() {
   STRATA_POLLER_PID=$!
 }
 
-strata_update_available() {
-  check_strata_update_sync
-}
-
 wait_for_strata_model_live() {
   local max_wait="${1:-120}" elapsed=0 json_out ready_profile="" svc_lbl log_hint=""
   svc_lbl="$(strata_service_label)"
@@ -6772,8 +6953,8 @@ format_strata_hw_warnings() {
     return 0
   fi
 
-  if (( RAM_GB > 0 && RAM_GB < 32 )); then
-    echo -e "${C_YELLOW}[WARNING] System RAM is ${RAM_GB} GiB (< 32 GiB). Larger Strata models may not fit or may swap.${C_RESET}"
+  if (( RAM_MB > 0 && RAM_MB <= 31744 )) || (( RAM_MB == 0 && RAM_GB > 0 && RAM_GB <= 31 )); then
+    echo -e "${C_YELLOW}[WARNING] System RAM is ${RAM_GB} GiB (<= 31 GiB). Larger Strata models may not fit or may swap.${C_RESET}"
   fi
   if [[ "$IS_JETSON" == true ]]; then
     return 0
@@ -6782,8 +6963,8 @@ format_strata_hw_warnings() {
     return 0
   elif [[ "$HAS_NVIDIA" == false && "$HAS_AMD" == false && "$HAS_INTEL_ARC" == false ]]; then
     echo -e "${C_YELLOW}[WARNING] No dedicated NVIDIA, AMD Radeon, or Intel Arc GPU detected (${GPU_SUMMARY}). Strata models may not run.${C_RESET}"
-  elif [[ "$HAS_NVIDIA" == true && "$HAS_NVIDIA_UNIFIED_MEM" == false && "$NVIDIA_VRAM_MB" -gt 0 && "$NVIDIA_VRAM_MB" -lt 6144 ]]; then
-    echo -e "${C_YELLOW}[WARNING] NVIDIA GPU VRAM is $((NVIDIA_VRAM_MB / 1024)) GiB (< 6 GiB). Larger Strata models may not fit in VRAM.${C_RESET}"
+  elif [[ "$HAS_NVIDIA" == true && "$HAS_NVIDIA_UNIFIED_MEM" == false && "$NVIDIA_VRAM_MB" -gt 0 && "$NVIDIA_VRAM_MB" -le 5120 ]]; then
+    echo -e "${C_YELLOW}[WARNING] NVIDIA GPU VRAM is $((NVIDIA_VRAM_MB / 1024)) GiB (<= 5 GiB). Larger Strata models may not fit in VRAM.${C_RESET}"
   fi
   if (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )) && [[ "$HAS_NVIDIA" == false && "$HAS_AMD_PREBUILT_GFX" == false && "$HAS_INTEL_ARC" == false ]]; then
     if ! status_strata_build_hip; then
@@ -6958,6 +7139,60 @@ read_jetson_ina3221_watts() {
   printf "%s|%s|%s" "$sw" "$gw" "$cw"
 }
 
+_parse_macos_powermetrics() {
+  local fmt="${1:-%.2f}" pm_out="$2"
+  awk -v fmt="$fmt" '
+    /GPU (HW )?active residency:/ { if (match($0, /[0-9]+(\.[0-9]+)?%/)) { gres = sprintf("%.0f", substr($0, RSTART, RLENGTH-1)+0) } }
+    /GPU Power:/ { if (match($0, /[0-9]+(\.[0-9]+)?[[:space:]]*m?W/)) { s=substr($0,RSTART,RLENGTH); v=s+0; gp=(s~/mW/)?v/1000.0:v } }
+    /CPU Power:/ { if (match($0, /[0-9]+(\.[0-9]+)?[[:space:]]*m?W/)) { s=substr($0,RSTART,RLENGTH); v=s+0; cp=(s~/mW/)?v/1000.0:v } }
+    /ANE Power:/ { if (match($0, /[0-9]+(\.[0-9]+)?[[:space:]]*m?W/)) { s=substr($0,RSTART,RLENGTH); v=s+0; anep=(s~/mW/)?v/1000.0:v } }
+    /Combined Power/ { if (match($0, /[0-9]+(\.[0-9]+)?[[:space:]]*m?W/)) { s=substr($0,RSTART,RLENGTH); v=s+0; sp=(s~/mW/)?v/1000.0:v } }
+    /Current pressure level:/ { thr=$NF }
+    END {
+      if (sp == "" && gp != "" && cp != "") sp = gp + cp + anep
+      printf "%s|%s|%s|%s|%s", gres, (gp!=""?sprintf(fmt,gp):""), (cp!=""?sprintf(fmt,cp):""), (sp!=""?sprintf(fmt,sp):""), thr
+    }' <<< "$pm_out"
+}
+
+_read_sysfs_bat_watts() {
+  local fmt="${1:-%.2f}" bat_d bat_st cur_ua volt_uv uw
+  for bat_d in /sys/class/power_supply/BAT*; do
+    [[ -d "$bat_d" ]] || continue
+    if [[ -r "$bat_d/power_now" ]]; then
+      uw="$(cat "$bat_d/power_now" 2>/dev/null || echo 0)"
+      [[ "$uw" =~ ^[0-9]+$ ]] && (( uw > 0 )) && { awk -v fmt="$fmt" -v u="$uw" 'BEGIN{printf fmt, u/1000000.0}'; return 0; }
+    elif [[ -r "$bat_d/current_now" && -r "$bat_d/voltage_now" ]]; then
+      bat_st="$(cat "$bat_d/status" 2>/dev/null || true)"
+      cur_ua="$(cat "$bat_d/current_now" 2>/dev/null || echo 0)"
+      volt_uv="$(cat "$bat_d/voltage_now" 2>/dev/null || echo 0)"
+      if [[ "$bat_st" == "Discharging" && "$cur_ua" =~ ^[0-9]+$ && "$volt_uv" =~ ^[0-9]+$ ]] && (( cur_ua > 0 && volt_uv > 0 )); then
+        awk -v fmt="$fmt" -v c="$cur_ua" -v v="$volt_uv" 'BEGIN{printf fmt, (c/1000000.0)*(v/1000000.0)}'
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
+_read_sysfs_psu_watts() {
+  local fmt="${1:-%.2f}" hm_dir hm_name pf uw
+  for hm_dir in "${STRATA_HWMON_DIR:-/sys/class/hwmon}"/hwmon*; do
+    [[ -r "$hm_dir/name" ]] || continue
+    hm_name="$(cat "$hm_dir/name" 2>/dev/null || true)"
+    case "$hm_name" in
+      corsair-psu|acpi_power_meter|power_meter)
+        for pf in "$hm_dir"/power1_input "$hm_dir"/power1_average; do
+          if [[ -r "$pf" ]]; then
+            uw="$(cat "$pf" 2>/dev/null || echo 0)"
+            [[ "$uw" =~ ^[0-9]+$ ]] && (( uw > 0 )) && { awk -v fmt="$fmt" -v u="$uw" 'BEGIN{printf fmt, u/1000000.0}'; return 0; }
+          fi
+        done
+        ;;
+    esac
+  done
+  _read_sysfs_bat_watts "$fmt"
+}
+
 start_bench_power_sampler() {
   local out_file="$1"
   (
@@ -6979,17 +7214,8 @@ start_bench_power_sampler() {
           local pm_out pm_parsed pg pc ps
           pm_out="$("${pm_prefix[@]}" powermetrics -n 1 -i 250 --samplers cpu_power,gpu_power 2>/dev/null || true)"
           if [[ -n "$pm_out" ]]; then
-            pm_parsed="$(awk '
-              /GPU Power:/ { if (match($0, /[0-9]+(\.[0-9]+)?[[:space:]]*m?W/)) { s=substr($0, RSTART, RLENGTH); v=s+0; gp=(s ~ /mW/) ? v/1000.0 : v } }
-              /CPU Power:/ { if (match($0, /[0-9]+(\.[0-9]+)?[[:space:]]*m?W/)) { s=substr($0, RSTART, RLENGTH); v=s+0; cp=(s ~ /mW/) ? v/1000.0 : v } }
-              /ANE Power:/ { if (match($0, /[0-9]+(\.[0-9]+)?[[:space:]]*m?W/)) { s=substr($0, RSTART, RLENGTH); v=s+0; anep=(s ~ /mW/) ? v/1000.0 : v } }
-              /Combined Power/ { if (match($0, /[0-9]+(\.[0-9]+)?[[:space:]]*m?W/)) { s=substr($0, RSTART, RLENGTH); v=s+0; sp=(s ~ /mW/) ? v/1000.0 : v } }
-              END {
-                if (sp == "" && gp != "" && cp != "") sp = gp + cp + anep
-                printf "%s|%s|%s", (gp!=""?sprintf("%.2f",gp):""), (cp!=""?sprintf("%.2f",cp):""), (sp!=""?sprintf("%.2f",sp):"")
-              }
-            ' <<< "$pm_out")"
-            IFS='|' read -r pg pc ps <<< "$pm_parsed"
+            pm_parsed="$(_parse_macos_powermetrics "%.2f" "$pm_out")"
+            IFS='|' read -r _ pg pc ps _ <<< "$pm_parsed"
             if [[ -n "$pg" ]]; then
               gpu_sum="$(awk -v a="$gpu_sum" -v b="$pg" 'BEGIN{printf "%.2f", a + b}')"
               ((gpu_n++))
@@ -7028,8 +7254,13 @@ start_bench_power_sampler() {
           if [[ -n "$nv_p" ]]; then gw="$nv_p"; has_g=true; fi
         fi
         if [[ "$HAS_AMD" == true ]]; then
-          local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}" card_dir hwmon_dir pa
+          local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}" card_dir hwmon_dir pa ven
           for card_dir in "${drm_dir}"/card[0-9]*/device; do
+            [[ -d "$card_dir" ]] || continue
+            if [[ -r "$card_dir/vendor" ]]; then
+              ven="$(tr '[:upper:]' '[:lower:]' < "$card_dir/vendor" 2>/dev/null || true)"
+              [[ "$ven" == "0x1002" ]] || continue
+            fi
             for hwmon_dir in "$card_dir"/hwmon/hwmon*; do
               if [[ -r "$hwmon_dir/power1_average" ]]; then
                 pa="$(cat "$hwmon_dir/power1_average" 2>/dev/null || echo 0)"
@@ -7119,39 +7350,8 @@ start_bench_power_sampler() {
           fi
         fi
 
-        local sw="" hm_dir hm_name pf uw
-        for hm_dir in /sys/class/hwmon/hwmon*; do
-          [[ -r "$hm_dir/name" ]] || continue
-          hm_name="$(cat "$hm_dir/name" 2>/dev/null || true)"
-          case "$hm_name" in
-            corsair-psu|acpi_power_meter|power_meter)
-              for pf in "$hm_dir"/power1_input "$hm_dir"/power1_average; do
-                if [[ -r "$pf" ]]; then
-                  uw="$(cat "$pf" 2>/dev/null || echo 0)"
-                  [[ "$uw" =~ ^[0-9]+$ ]] && (( uw > 0 )) && { sw="$(awk -v u="$uw" 'BEGIN{printf "%.2f", u/1000000.0}')"; break 2; }
-                fi
-              done
-              ;;
-          esac
-        done
-        if [[ -z "$sw" ]]; then
-          local bat_d bat_st cur_ua volt_uv
-          for bat_d in /sys/class/power_supply/BAT*; do
-            [[ -d "$bat_d" ]] || continue
-            if [[ -r "$bat_d/power_now" ]]; then
-              uw="$(cat "$bat_d/power_now" 2>/dev/null || echo 0)"
-              [[ "$uw" =~ ^[0-9]+$ ]] && (( uw > 0 )) && { sw="$(awk -v u="$uw" 'BEGIN{printf "%.2f", u/1000000.0}')"; break; }
-            elif [[ -r "$bat_d/current_now" && -r "$bat_d/voltage_now" ]]; then
-              bat_st="$(cat "$bat_d/status" 2>/dev/null || true)"
-              cur_ua="$(cat "$bat_d/current_now" 2>/dev/null || echo 0)"
-              volt_uv="$(cat "$bat_d/voltage_now" 2>/dev/null || echo 0)"
-              if [[ "$bat_st" == "Discharging" && "$cur_ua" =~ ^[0-9]+$ && "$volt_uv" =~ ^[0-9]+$ ]] && (( cur_ua > 0 && volt_uv > 0 )); then
-                sw="$(awk -v c="$cur_ua" -v v="$volt_uv" 'BEGIN{printf "%.2f", (c/1000000.0)*(v/1000000.0)}')"
-                break
-              fi
-            fi
-          done
-        fi
+        local sw=""
+        sw="$(_read_sysfs_psu_watts "%.2f" || true)"
         if [[ -n "$sw" ]]; then
           sys_sum="$(awk -v a="$sys_sum" -v b="$sw" 'BEGIN{printf "%.2f", a + b}')"
           ((sys_n++))
@@ -7184,6 +7384,344 @@ stop_bench_power_sampler() {
   fi
 }
 
+_strata_bench_search_dirs() {
+  printf '%s\n' \
+    "$PWD/bench/results" \
+    "$PWD/bench-results" \
+    "$TARGET_HOME/bench/results" \
+    "$TARGET_HOME/bench-results" \
+    "$TARGET_HOME/.local/share/strata/bench-results" \
+    "$TARGET_HOME/.config/strata/bench-results"
+}
+
+_strata_bench_py() {
+  local action="$1"; shift
+  python3 - "$action" "$STRATA_BENCH_HISTORY_FILE" "$@" <<'PY'
+import datetime, glob, json, os, statistics, sys
+
+action = sys.argv[1]
+hist_path = sys.argv[2]
+rest = sys.argv[3:]
+
+def fmt_ts(ts):
+    ts = (ts or "").replace("T", " ")
+    if ts.endswith("Z"):
+        ts = ts[:-1] + " UTC"
+    if len(ts) > 20 and " UTC" in ts:
+        ts = ts[:16] + " UTC"
+    return ts
+
+def load_hist(path):
+    hist_list, hist_by_file = [], {}
+    if path and os.path.exists(path):
+        try:
+            with open(path) as f:
+                loaded = json.load(f)
+            if isinstance(loaded, list):
+                hist_list = [e for e in loaded if isinstance(e, dict)]
+                for e in hist_list:
+                    rf = e.get("results_file")
+                    if rf:
+                        hist_by_file[rf] = e
+                        hist_by_file[os.path.realpath(rf)] = e
+        except Exception:
+            pass
+    return hist_list, hist_by_file
+
+def extract_metrics(d, path=None, he=None, default_tag="", preset=""):
+    run = d.get("run") if isinstance(d.get("run"), dict) else {}
+    raw_ts = run.get("started_at") or run.get("timestamp") or d.get("timestamp") or ""
+    ts = fmt_ts(raw_ts)
+    if not ts and path:
+        try:
+            ts = datetime.datetime.fromtimestamp(os.path.getmtime(path), tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        except Exception:
+            ts = "Unknown"
+    cfg = d.get("configuration") if isinstance(d.get("configuration"), dict) else {}
+    proto_d = d.get("protocol") if isinstance(d.get("protocol"), dict) else {}
+    prof = proto_d.get("profile") or cfg.get("profile") or preset or ""
+    proto = proto_d.get("id") or d.get("protocol_id") or d.get("format") or ""
+    tag = prof or ("standard-v1" if "standard" in proto else proto) or (he.get("tag") if he else "") or default_tag
+    mdl = d.get("model")
+    if isinstance(mdl, dict):
+        m_name = mdl.get("name") or mdl.get("id") or ""
+        m_quant = mdl.get("quantization") or ""
+        if m_name and m_quant and m_quant.lower() not in m_name.lower():
+            model_s = f"{m_name} ({m_quant})"
+        else:
+            model_s = m_name or m_quant or "Unknown"
+    elif isinstance(mdl, str) and mdl:
+        model_s = mdl
+    else:
+        model_s = (he.get("model") if he else None) or "Unknown"
+
+    sums_raw = d.get("summaries") if "summaries" in d else d.get("summary")
+    reqs = d.get("requests") if isinstance(d.get("requests"), list) else []
+    dec = pre = tot_r = None
+    fail_r = 0
+    if isinstance(sums_raw, list):
+        perf_dec = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("phase") == "performance" and s.get("metric") == "decode_tps" and isinstance(s.get("median"), (int, float))]
+        all_dec = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("metric") == "decode_tps" and isinstance(s.get("median"), (int, float))]
+        perf_pre = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("phase") == "performance" and s.get("metric") == "prompt_tps" and isinstance(s.get("median"), (int, float))]
+        all_pre = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("metric") == "prompt_tps" and isinstance(s.get("median"), (int, float))]
+        dec = statistics.median(perf_dec) if perf_dec else (statistics.median(all_dec) if all_dec else None)
+        pre = statistics.median(perf_pre) if perf_pre else (statistics.median(all_pre) if all_pre else None)
+    elif isinstance(sums_raw, dict):
+        dec = sums_raw.get("median_decode_tok_s") or sums_raw.get("decode_tps") or sums_raw.get("decode_tok_s")
+        pre = sums_raw.get("median_prefill_tok_s") or sums_raw.get("prompt_tps") or sums_raw.get("prefill_tok_s")
+        tot_r = sums_raw.get("total_requests")
+        fail_r = sums_raw.get("failed_requests") if isinstance(sums_raw.get("failed_requests"), int) else 0
+    if dec is None:
+        vals = [r.get("decode_tok_s") for r in reqs if isinstance(r, dict) and isinstance(r.get("decode_tok_s"), (int, float))]
+        if vals:
+            dec = statistics.median(vals)
+    if pre is None:
+        vals = [r.get("prefill_tok_s") for r in reqs if isinstance(r, dict) and isinstance(r.get("prefill_tok_s"), (int, float))]
+        if vals:
+            pre = statistics.median(vals)
+
+    perf_reqs = [r for r in reqs if isinstance(r, dict) and r.get("phase") == "performance"]
+    req_pool = perf_reqs if perf_reqs else [r for r in reqs if isinstance(r, dict) and r.get("phase") != "warmup"]
+    avg_dec_vals, avg_pre_vals = [], []
+    for r in req_pool:
+        m = r.get("metrics") if isinstance(r.get("metrics"), dict) else {}
+        dv = m.get("decode_tps") if isinstance(m.get("decode_tps"), (int, float)) else r.get("decode_tok_s")
+        pv = m.get("prompt_tps") if isinstance(m.get("prompt_tps"), (int, float)) else r.get("prefill_tok_s")
+        if dv is None:
+            tk = r.get("tokens") if isinstance(r.get("tokens"), dict) else {}
+            tm = r.get("timings") if isinstance(r.get("timings"), dict) else {}
+            if isinstance(tk.get("decode_tokens"), (int, float)) and isinstance(tm.get("decode_s"), (int, float)) and tm["decode_s"] > 0:
+                dv = tk["decode_tokens"] / tm["decode_s"]
+        if pv is None:
+            tk = r.get("tokens") if isinstance(r.get("tokens"), dict) else {}
+            tm = r.get("timings") if isinstance(r.get("timings"), dict) else {}
+            rtok = tk.get("read_tokens") if isinstance(tk.get("read_tokens"), (int, float)) else tk.get("input_tokens")
+            if isinstance(rtok, (int, float)) and isinstance(tm.get("prompt_s"), (int, float)) and tm["prompt_s"] > 0:
+                pv = rtok / tm["prompt_s"]
+        if isinstance(dv, (int, float)):
+            avg_dec_vals.append(dv)
+        if isinstance(pv, (int, float)):
+            avg_pre_vals.append(pv)
+    avg_dec = statistics.mean(avg_dec_vals) if avg_dec_vals else (he.get("avg_decode_tok_s") if he else None)
+    avg_pre = statistics.mean(avg_pre_vals) if avg_pre_vals else (he.get("avg_prefill_tok_s") if he else None)
+
+    req_d, opt_d = run.get("required_duration_s"), run.get("optional_duration_s")
+    dur_s = f"{req_d + (opt_d if isinstance(opt_d, (int, float)) else 0.0):.1f}s" if isinstance(req_d, (int, float)) else ""
+
+    rcounts = d.get("request_counts") if isinstance(d.get("request_counts"), dict) else {}
+    if not isinstance(tot_r, int) and rcounts:
+        tot_r = sum(v.get("attempted", 0) for v in rcounts.values() if isinstance(v, dict) and isinstance(v.get("attempted"), int))
+        fail_r = sum(v.get("failed", 0) for v in rcounts.values() if isinstance(v, dict) and isinstance(v.get("failed"), int))
+    if not isinstance(tot_r, int) and reqs:
+        tot_r = len(reqs)
+        fail_r = sum(1 for r in reqs if isinstance(r, dict) and r.get("status") not in (None, "ok", "completed"))
+
+    qual = d.get("quality") if isinstance(d.get("quality"), dict) else {}
+    qp = qual.get("sanity_checks_passed") if qual.get("sanity_checks_passed") is not None else qual.get("passed")
+    qt = qual.get("sanity_checks_total") if qual.get("sanity_checks_total") is not None else qual.get("total")
+    pwr = he.get("avg_power") if isinstance((he or {}).get("avg_power"), dict) else {}
+    has_opts = "1" if (he is not None and "active_steps" in he) else "0"
+    act_list = he.get("active_steps") if isinstance((he or {}).get("active_steps"), list) else []
+
+    return {
+        "run_id": run.get("id"), "raw_ts": raw_ts, "ts": ts, "tag": tag, "model": model_s,
+        "dec": float(dec) if isinstance(dec, (int, float)) else None,
+        "pre": float(pre) if isinstance(pre, (int, float)) else None,
+        "avg_dec": float(avg_dec) if isinstance(avg_dec, (int, float)) else None,
+        "avg_pre": float(avg_pre) if isinstance(avg_pre, (int, float)) else None,
+        "tot_r": tot_r if isinstance(tot_r, int) else None,
+        "fail_r": fail_r if isinstance(fail_r, int) else 0,
+        "qp": qp, "qt": qt, "dur_s": dur_s,
+        "sw": str(pwr.get("sys_w") or ""), "gw": str(pwr.get("gpu_w") or ""), "cw": str(pwr.get("cpu_w") or ""),
+        "has_opts": has_opts, "act_list": act_list,
+        "key": os.path.realpath(path) if path else "",
+    }
+
+def from_results_file(path, he, default_tag=""):
+    try:
+        with open(path) as f:
+            d = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    return extract_metrics(d, path=path, he=he, default_tag=default_tag)
+
+def from_hist_entry(e, idx_fallback):
+    pwr = e.get("avg_power") if isinstance(e.get("avg_power"), dict) else {}
+    rf = e.get("results_file") or ""
+    act_list = e.get("active_steps") if isinstance(e.get("active_steps"), list) else []
+    dec, pre = e.get("decode_tok_s"), e.get("prefill_tok_s")
+    avg_dec, avg_pre = e.get("avg_decode_tok_s"), e.get("avg_prefill_tok_s")
+    tot_r = e.get("total_requests")
+    fail_r = e.get("failed_requests") if isinstance(e.get("failed_requests"), int) else 0
+    return {
+        "ts": fmt_ts(e.get("timestamp")),
+        "tag": e.get("tag") or e.get("mode") or "",
+        "model": e.get("model") or "Unknown",
+        "dec": float(dec) if isinstance(dec, (int, float)) else None,
+        "pre": float(pre) if isinstance(pre, (int, float)) else None,
+        "avg_dec": float(avg_dec) if isinstance(avg_dec, (int, float)) else None,
+        "avg_pre": float(avg_pre) if isinstance(avg_pre, (int, float)) else None,
+        "tot_r": tot_r if isinstance(tot_r, int) else None,
+        "fail_r": fail_r,
+        "qp": e.get("sanity_checks_passed"), "qt": e.get("sanity_checks_total"),
+        "dur_s": "",
+        "sw": str(pwr.get("sys_w") or ""), "gw": str(pwr.get("gpu_w") or ""), "cw": str(pwr.get("cpu_w") or ""),
+        "has_opts": "1", "act_list": act_list,
+        "key": os.path.realpath(rf) if rf else f"hist:{e.get('id') or e.get('timestamp') or idx_fallback}",
+    }
+
+def collect_items(search_dirs, default_tag=""):
+    hist_list, hist_by_file = load_hist(hist_path)
+    items, seen = [], set()
+    for e in reversed(hist_list):
+        rf = e.get("results_file") or ""
+        rec = from_results_file(rf, e, default_tag) if (rf and os.path.exists(rf)) else from_hist_entry(e, len(items))
+        if rec and rec["key"] not in seen:
+            seen.add(rec["key"])
+            items.append(rec)
+    found_files = []
+    for d in search_dirs:
+        if not os.path.isdir(d):
+            continue
+        for pat in (os.path.join(d, "*", "results.json"), os.path.join(d, "results.json")):
+            for p in glob.glob(pat):
+                try:
+                    found_files.append((os.path.getmtime(p), os.path.realpath(p), p))
+                except Exception:
+                    pass
+    found_files.sort(reverse=True)
+    for _, rp, p in found_files:
+        if rp in seen:
+            continue
+        rec = from_results_file(p, hist_by_file.get(rp) or hist_by_file.get(p), default_tag)
+        if rec:
+            seen.add(rp)
+            items.append(rec)
+    return items
+
+def score_key(rec):
+    d = rec.get("avg_dec") if rec.get("avg_dec") is not None else rec.get("dec")
+    p = rec.get("avg_pre") if rec.get("avg_pre") is not None else rec.get("pre")
+    return (d if isinstance(d, (int, float)) else -1.0, p if isinstance(p, (int, float)) else -1.0)
+
+def pct_vs_ref(rec, ref_rec):
+    rec_d = rec.get("avg_dec") if rec.get("avg_dec") is not None else rec.get("dec")
+    ref_d = ref_rec.get("avg_dec") if ref_rec.get("avg_dec") is not None else ref_rec.get("dec")
+    rec_p = rec.get("avg_pre") if rec.get("avg_pre") is not None else rec.get("pre")
+    ref_p = ref_rec.get("avg_pre") if ref_rec.get("avg_pre") is not None else ref_rec.get("pre")
+    dp = f"{((rec_d - ref_d) / ref_d) * 100.0:.1f}" if (isinstance(rec_d, (int, float)) and isinstance(ref_d, (int, float)) and ref_d > 0) else ""
+    pp = f"{((rec_p - ref_p) / ref_p) * 100.0:.1f}" if (isinstance(rec_p, (int, float)) and isinstance(ref_p, (int, float)) and ref_p > 0) else ""
+    return dp, pp
+
+if action == "save":
+    tmp_path, res_path, mode, preset, url, avg_sys, avg_gpu, avg_cpu, samples_s, active_csv, applicable_csv = rest[:11]
+    history, _ = load_hist(hist_path)
+    res_data = {}
+    if res_path and os.path.exists(res_path):
+        try:
+            with open(res_path) as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    res_data = loaded
+        except Exception:
+            pass
+    m = extract_metrics(res_data, default_tag=mode, preset=preset)
+    ts = m["raw_ts"] or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    entry = {
+        "id": m["run_id"] or ts,
+        "timestamp": ts,
+        "mode": mode,
+        "tag": m["tag"],
+        "preset": preset,
+        "url": url,
+        "results_file": res_path,
+        "model": m["model"],
+        "decode_tok_s": round(m["dec"], 2) if m["dec"] is not None else None,
+        "prefill_tok_s": round(m["pre"], 2) if m["pre"] is not None else None,
+        "avg_decode_tok_s": round(m["avg_dec"], 2) if m["avg_dec"] is not None else None,
+        "avg_prefill_tok_s": round(m["avg_pre"], 2) if m["avg_pre"] is not None else None,
+        "total_requests": m["tot_r"],
+        "failed_requests": m["fail_r"],
+        "sanity_checks_passed": m["qp"],
+        "sanity_checks_total": m["qt"],
+        "avg_power": {
+            "sys_w": avg_sys, "gpu_w": avg_gpu, "cpu_w": avg_cpu,
+            "samples": int(samples_s) if samples_s.isdigit() else 0,
+        },
+        "active_steps": [s for s in active_csv.split(",") if s],
+        "applicable_steps": [s for s in applicable_csv.split(",") if s],
+    }
+    history.append(entry)
+    with open(tmp_path, "w") as f:
+        json.dump(history, f, indent=2)
+    os.replace(tmp_path, hist_path)
+elif action == "count":
+    hist_list, _ = load_hist(hist_path)
+    seen, count = set(), 0
+    for e in hist_list:
+        rf = e.get("results_file") or ""
+        key = os.path.realpath(rf) if rf else f"hist:{e.get('id') or e.get('timestamp') or count}"
+        if key not in seen:
+            seen.add(key)
+            count += 1
+    for sd in rest:
+        if not os.path.isdir(sd):
+            continue
+        for pat in (os.path.join(sd, "*", "results.json"), os.path.join(sd, "results.json")):
+            for p in glob.glob(pat):
+                rp = os.path.realpath(p)
+                if rp not in seen:
+                    seen.add(rp)
+                    count += 1
+    print(count)
+elif action == "history":
+    items = collect_items(rest, default_tag="cli")
+    best_idx = max(range(len(items)), key=lambda i: score_key(items[i])) if any(
+        (items[i].get("avg_dec") is not None or items[i].get("dec") is not None) for i in range(len(items))
+    ) else None
+    for idx, rec in enumerate(items):
+        d_pct, p_pct = pct_vs_ref(rec, items[best_idx]) if (best_idx is not None and idx != best_idx) else ("", "")
+        is_best = "1" if (best_idx is not None and idx == best_idx) else "0"
+        dec_s = f"{rec['dec']:.1f}" if rec["dec"] is not None else "—"
+        pre_s = f"{rec['pre']:.1f}" if rec["pre"] is not None else "—"
+        avg_dec_s = f"{rec['avg_dec']:.1f}" if rec["avg_dec"] is not None else ""
+        avg_pre_s = f"{rec['avg_pre']:.1f}" if rec["avg_pre"] is not None else ""
+        req_s = f"{rec['tot_r'] - rec['fail_r']}/{rec['tot_r']} ok" if isinstance(rec["tot_r"], int) and rec["tot_r"] > 0 else ""
+        qual_s = f"Sanity {rec['qp']}/{rec['qt']}" if isinstance(rec["qp"], int) and isinstance(rec["qt"], int) and rec["qt"] > 0 else ""
+        act = ",".join(rec["act_list"])
+        act_n = str(len(rec["act_list"])) if rec["has_opts"] == "1" else "untracked"
+        cols = [idx, rec["ts"], rec["tag"], rec["model"], dec_s, pre_s, rec["sw"], rec["gw"], rec["cw"],
+                act_n, act, req_s, qual_s, rec["has_opts"], avg_dec_s, avg_pre_s, rec["dur_s"], d_pct, p_pct, is_best]
+        print("|".join(str(c).replace("|", "/").replace("\n", " ").replace("\r", "") for c in cols))
+elif action == "summary":
+    items = collect_items(rest, default_tag="")
+    if not items:
+        sys.exit(0)
+    def fmt_rec(kind, rec, d_pct="", p_pct="", prev_d_pct="", prev_p_pct=""):
+        dec_s = f"{rec['dec']:.1f} tok/s" if rec["dec"] is not None else "—"
+        pre_s = f"{rec['pre']:.1f} tok/s" if rec["pre"] is not None else "—"
+        avg_dec_s = f"{rec['avg_dec']:.1f} tok/s" if rec.get("avg_dec") is not None else ""
+        avg_pre_s = f"{rec['avg_pre']:.1f} tok/s" if rec.get("avg_pre") is not None else ""
+        req_s = f"{rec['tot_r'] - rec['fail_r']}/{rec['tot_r']} ok" if isinstance(rec["tot_r"], int) and rec["tot_r"] > 0 else ""
+        qual_s = f"Sanity: {rec['qp']}/{rec['qt']}" if isinstance(rec["qp"], int) and isinstance(rec["qt"], int) and rec["qt"] > 0 else ""
+        cols = [kind, rec["ts"], rec["tag"], rec["model"], dec_s, pre_s, req_s, qual_s,
+                rec["sw"], rec["gw"], rec["cw"], d_pct, p_pct, avg_dec_s, avg_pre_s, prev_d_pct, prev_p_pct]
+        return "|".join(str(c).replace("|", "/").replace("\n", " ").replace("\r", "") for c in cols)
+    best = max(items, key=score_key)
+    if len(items) >= 2:
+        cur_dp, cur_pp = pct_vs_ref(items[0], best)
+        cur_prev_dp, cur_prev_pp = pct_vs_ref(items[0], items[1])
+        print(fmt_rec("CUR", items[0], cur_dp, cur_pp, cur_prev_dp, cur_prev_pp))
+        prev_dp, prev_pp = pct_vs_ref(items[1], best)
+        print(fmt_rec("PREV", items[1], prev_dp, prev_pp))
+        print(fmt_rec("BEST", best))
+    else:
+        print(fmt_rec("CUR", items[0]))
+PY
+}
+
 save_bench_history_entry() {
   local results_file="$1" mode="$2" avg_sys="$3" avg_gpu="$4" avg_cpu="$5" samples="$6" active_csv="$7" applicable_csv="$8"
   has_working_python3 || return 0
@@ -7194,160 +7732,7 @@ save_bench_history_entry() {
   tmp_file="$(mktemp "${STRATA_BENCH_HISTORY_FILE}.tmp.XXXXXX" 2>/dev/null || echo "")"
   [[ -n "$tmp_file" ]] || return 1
 
-  python3 - "$STRATA_BENCH_HISTORY_FILE" "$tmp_file" "$results_file" "$mode" "${STRATA_RUNNING_PRESET:-}" "${STRATA_RUNNING_URL:-}" "$avg_sys" "$avg_gpu" "$avg_cpu" "${samples:-0}" "$active_csv" "$applicable_csv" <<'PY'
-import datetime, json, os, statistics, sys
-
-(
-    hist_path, tmp_path, res_path, mode, preset, url,
-    avg_sys, avg_gpu, avg_cpu, samples_s, active_csv, applicable_csv
-) = sys.argv[1:13]
-
-history = []
-if os.path.exists(hist_path):
-    try:
-        with open(hist_path) as f:
-            loaded = json.load(f)
-            if isinstance(loaded, list):
-                history = loaded
-    except Exception:
-        history = []
-
-res_data = {}
-if res_path and os.path.exists(res_path):
-    try:
-        with open(res_path) as f:
-            res_data = json.load(f)
-    except Exception:
-        res_data = {}
-
-if not isinstance(res_data, dict):
-    res_data = {}
-
-run = res_data.get("run") if isinstance(res_data.get("run"), dict) else {}
-ts = run.get("started_at") or run.get("timestamp") or res_data.get("timestamp") or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-cfg = res_data.get("configuration") if isinstance(res_data.get("configuration"), dict) else {}
-proto_d = res_data.get("protocol") if isinstance(res_data.get("protocol"), dict) else {}
-prof = proto_d.get("profile") or cfg.get("profile") or preset or ""
-proto = proto_d.get("id") or res_data.get("protocol_id") or res_data.get("format") or ""
-tag = prof or ("standard-v1" if "standard" in proto else proto) or mode
-
-mdl = res_data.get("model")
-if isinstance(mdl, dict):
-    m_name = mdl.get("name") or mdl.get("id") or ""
-    m_quant = mdl.get("quantization") or ""
-    if m_name and m_quant and m_quant.lower() not in m_name.lower():
-        model_s = f"{m_name} ({m_quant})"
-    else:
-        model_s = m_name or m_quant or "Unknown"
-elif isinstance(mdl, str) and mdl:
-    model_s = mdl
-else:
-    model_s = "Unknown"
-
-sums_raw = res_data.get("summaries") if "summaries" in res_data else res_data.get("summary")
-reqs = res_data.get("requests") if isinstance(res_data.get("requests"), list) else []
-
-dec = None
-pre = None
-tot_r = None
-fail_r = 0
-
-if isinstance(sums_raw, list):
-    perf_dec = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("phase") == "performance" and s.get("metric") == "decode_tps" and isinstance(s.get("median"), (int, float))]
-    all_dec = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("metric") == "decode_tps" and isinstance(s.get("median"), (int, float))]
-    perf_pre = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("phase") == "performance" and s.get("metric") == "prompt_tps" and isinstance(s.get("median"), (int, float))]
-    all_pre = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("metric") == "prompt_tps" and isinstance(s.get("median"), (int, float))]
-    if perf_dec:
-        dec = statistics.median(perf_dec)
-    elif all_dec:
-        dec = statistics.median(all_dec)
-    if perf_pre:
-        pre = statistics.median(perf_pre)
-    elif all_pre:
-        pre = statistics.median(all_pre)
-elif isinstance(sums_raw, dict):
-    dec = sums_raw.get("median_decode_tok_s") or sums_raw.get("decode_tps") or sums_raw.get("decode_tok_s")
-    pre = sums_raw.get("median_prefill_tok_s") or sums_raw.get("prompt_tps") or sums_raw.get("prefill_tok_s")
-    tot_r = sums_raw.get("total_requests")
-    fail_r = sums_raw.get("failed_requests") if isinstance(sums_raw.get("failed_requests"), int) else 0
-
-if dec is None:
-    vals = [r.get("decode_tok_s") for r in reqs if isinstance(r, dict) and isinstance(r.get("decode_tok_s"), (int, float))]
-    if vals:
-        dec = statistics.median(vals)
-if pre is None:
-    vals = [r.get("prefill_tok_s") for r in reqs if isinstance(r, dict) and isinstance(r.get("prefill_tok_s"), (int, float))]
-    if vals:
-        pre = statistics.median(vals)
-
-perf_reqs = [r for r in reqs if isinstance(r, dict) and r.get("phase") == "performance"]
-req_pool = perf_reqs if perf_reqs else [r for r in reqs if isinstance(r, dict) and r.get("phase") != "warmup"]
-avg_dec_vals = []
-avg_pre_vals = []
-for r in req_pool:
-    m = r.get("metrics") if isinstance(r.get("metrics"), dict) else {}
-    dv = m.get("decode_tps") if isinstance(m.get("decode_tps"), (int, float)) else r.get("decode_tok_s")
-    pv = m.get("prompt_tps") if isinstance(m.get("prompt_tps"), (int, float)) else r.get("prefill_tok_s")
-    if dv is None:
-        tk = r.get("tokens") if isinstance(r.get("tokens"), dict) else {}
-        tm = r.get("timings") if isinstance(r.get("timings"), dict) else {}
-        if isinstance(tk.get("decode_tokens"), (int, float)) and isinstance(tm.get("decode_s"), (int, float)) and tm["decode_s"] > 0:
-            dv = tk["decode_tokens"] / tm["decode_s"]
-    if pv is None:
-        tk = r.get("tokens") if isinstance(r.get("tokens"), dict) else {}
-        tm = r.get("timings") if isinstance(r.get("timings"), dict) else {}
-        rtok = tk.get("read_tokens") if isinstance(tk.get("read_tokens"), (int, float)) else tk.get("input_tokens")
-        if isinstance(rtok, (int, float)) and isinstance(tm.get("prompt_s"), (int, float)) and tm["prompt_s"] > 0:
-            pv = rtok / tm["prompt_s"]
-    if isinstance(dv, (int, float)):
-        avg_dec_vals.append(dv)
-    if isinstance(pv, (int, float)):
-        avg_pre_vals.append(pv)
-avg_dec = statistics.mean(avg_dec_vals) if avg_dec_vals else None
-avg_pre = statistics.mean(avg_pre_vals) if avg_pre_vals else None
-
-rcounts = res_data.get("request_counts") if isinstance(res_data.get("request_counts"), dict) else {}
-if not isinstance(tot_r, int) and rcounts:
-    tot_r = sum(v.get("attempted", 0) for v in rcounts.values() if isinstance(v, dict) and isinstance(v.get("attempted"), int))
-    fail_r = sum(v.get("failed", 0) for v in rcounts.values() if isinstance(v, dict) and isinstance(v.get("failed"), int))
-if not isinstance(tot_r, int) and reqs:
-    tot_r = len(reqs)
-    fail_r = sum(1 for r in reqs if isinstance(r, dict) and r.get("status") not in (None, "ok", "completed"))
-
-qual = res_data.get("quality") if isinstance(res_data.get("quality"), dict) else {}
-qp = qual.get("sanity_checks_passed") if qual.get("sanity_checks_passed") is not None else qual.get("passed")
-qt = qual.get("sanity_checks_total") if qual.get("sanity_checks_total") is not None else qual.get("total")
-entry = {
-    "id": run.get("id") or ts,
-    "timestamp": ts,
-    "mode": mode,
-    "tag": tag,
-    "preset": preset,
-    "url": url,
-    "results_file": res_path,
-    "model": model_s,
-    "decode_tok_s": round(dec, 2) if isinstance(dec, (int, float)) else None,
-    "prefill_tok_s": round(pre, 2) if isinstance(pre, (int, float)) else None,
-    "avg_decode_tok_s": round(avg_dec, 2) if isinstance(avg_dec, (int, float)) else None,
-    "avg_prefill_tok_s": round(avg_pre, 2) if isinstance(avg_pre, (int, float)) else None,
-    "total_requests": tot_r if isinstance(tot_r, int) else None,
-    "failed_requests": fail_r if isinstance(fail_r, int) else 0,
-    "sanity_checks_passed": qp,
-    "sanity_checks_total": qt,
-    "avg_power": {
-        "sys_w": avg_sys,
-        "gpu_w": avg_gpu,
-        "cpu_w": avg_cpu,
-        "samples": int(samples_s) if samples_s.isdigit() else 0,
-    },
-    "active_steps": [s for s in active_csv.split(",") if s],
-    "applicable_steps": [s for s in applicable_csv.split(",") if s],
-}
-history.append(entry)
-with open(tmp_path, "w") as f:
-    json.dump(history, f, indent=2)
-os.replace(tmp_path, hist_path)
-PY
+  _strata_bench_py save "$tmp_file" "$results_file" "$mode" "${STRATA_RUNNING_PRESET:-}" "${STRATA_RUNNING_URL:-}" "$avg_sys" "$avg_gpu" "$avg_cpu" "${samples:-0}" "$active_csv" "$applicable_csv"
   if [[ $EUID -eq 0 && "$TARGET_USER" != "root" ]]; then
     chown -R "$TARGET_USER:$(id -gn "$TARGET_USER")" "$hist_dir" 2>/dev/null || true
   fi
@@ -7364,40 +7749,10 @@ count_bench_history() {
     echo "$BENCH_HISTORY_COUNT_CACHE"
     return 0
   fi
+  local -a _sdirs=()
+  mapfile -t _sdirs < <(_strata_bench_search_dirs)
   local cnt
-  cnt="$(python3 - "$STRATA_BENCH_HISTORY_FILE" "$PWD/bench/results" "$PWD/bench-results" "$TARGET_HOME/bench/results" "$TARGET_HOME/bench-results" "$TARGET_HOME/.local/share/strata/bench-results" "$TARGET_HOME/.config/strata/bench-results" <<'PY' 2>/dev/null || echo 0
-import glob, json, os, sys
-hist_path = sys.argv[1]
-search_dirs = sys.argv[2:]
-seen = set()
-count = 0
-if hist_path and os.path.exists(hist_path):
-    try:
-        with open(hist_path) as f:
-            d = json.load(f)
-        if isinstance(d, list):
-            for e in d:
-                if not isinstance(e, dict):
-                    continue
-                rf = e.get("results_file") or ""
-                key = os.path.realpath(rf) if rf else f"hist:{e.get('id') or e.get('timestamp') or count}"
-                if key not in seen:
-                    seen.add(key)
-                    count += 1
-    except Exception:
-        pass
-for sd in search_dirs:
-    if not os.path.isdir(sd):
-        continue
-    for pat in (os.path.join(sd, "*", "results.json"), os.path.join(sd, "results.json")):
-        for p in glob.glob(pat):
-            rp = os.path.realpath(p)
-            if rp not in seen:
-                seen.add(rp)
-                count += 1
-print(count)
-PY
-)"
+  cnt="$(_strata_bench_py count "${_sdirs[@]}" 2>/dev/null || echo 0)"
   [[ "$cnt" =~ ^[0-9]+$ ]] || cnt=0
   BENCH_HISTORY_COUNT_KEY="$ckey"
   BENCH_HISTORY_COUNT_CACHE="$cnt"
@@ -7505,254 +7860,11 @@ show_benchmark_history() {
       return 0
     fi
 
-    local rows=()
+    local -a rows=() _sdirs=()
+    mapfile -t _sdirs < <(_strata_bench_search_dirs)
     while IFS= read -r line; do
       [[ -n "$line" ]] && rows+=("$line")
-    done < <(python3 - "$STRATA_BENCH_HISTORY_FILE" "$PWD/bench/results" "$PWD/bench-results" "$TARGET_HOME/bench/results" "$TARGET_HOME/bench-results" "$TARGET_HOME/.local/share/strata/bench-results" "$TARGET_HOME/.config/strata/bench-results" <<'PY' 2>/dev/null || true
-import datetime, glob, json, os, statistics, sys
-
-hist_path = sys.argv[1]
-search_dirs = sys.argv[2:]
-
-def fmt_ts(ts):
-    ts = (ts or "").replace("T", " ")
-    if ts.endswith("Z"):
-        ts = ts[:-1] + " UTC"
-    if len(ts) > 20 and " UTC" in ts:
-        ts = ts[:16] + " UTC"
-    return ts
-
-def parse_results(path, he):
-    try:
-        with open(path) as f:
-            d = json.load(f)
-    except Exception:
-        return None
-    if not isinstance(d, dict):
-        return None
-    run = d.get("run") if isinstance(d.get("run"), dict) else {}
-    ts = fmt_ts(run.get("started_at") or run.get("timestamp") or d.get("timestamp") or "")
-    if not ts:
-        try:
-            ts = datetime.datetime.fromtimestamp(os.path.getmtime(path), tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        except Exception:
-            ts = "Unknown"
-    cfg = d.get("configuration") if isinstance(d.get("configuration"), dict) else {}
-    proto_d = d.get("protocol") if isinstance(d.get("protocol"), dict) else {}
-    prof = proto_d.get("profile") or cfg.get("profile") or ""
-    proto = proto_d.get("id") or d.get("protocol_id") or d.get("format") or ""
-    tag = prof or ("standard-v1" if "standard" in proto else proto) or (he.get("tag") if he else "") or "cli"
-    mdl = d.get("model")
-    if isinstance(mdl, dict):
-        m_name = mdl.get("name") or mdl.get("id") or ""
-        m_quant = mdl.get("quantization") or ""
-        if m_name and m_quant and m_quant.lower() not in m_name.lower():
-            model = f"{m_name} ({m_quant})"
-        else:
-            model = m_name or m_quant or "Unknown"
-    elif isinstance(mdl, str) and mdl:
-        model = mdl
-    else:
-        model = (he.get("model") if he else None) or "Unknown"
-    sums_raw = d.get("summaries") if "summaries" in d else d.get("summary")
-    reqs = d.get("requests") if isinstance(d.get("requests"), list) else []
-    dec = None
-    pre = None
-    tot_r = None
-    fail_r = 0
-    if isinstance(sums_raw, list):
-        perf_dec = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("phase") == "performance" and s.get("metric") == "decode_tps" and isinstance(s.get("median"), (int, float))]
-        all_dec = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("metric") == "decode_tps" and isinstance(s.get("median"), (int, float))]
-        perf_pre = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("phase") == "performance" and s.get("metric") == "prompt_tps" and isinstance(s.get("median"), (int, float))]
-        all_pre = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("metric") == "prompt_tps" and isinstance(s.get("median"), (int, float))]
-        if perf_dec:
-            dec = statistics.median(perf_dec)
-        elif all_dec:
-            dec = statistics.median(all_dec)
-        if perf_pre:
-            pre = statistics.median(perf_pre)
-        elif all_pre:
-            pre = statistics.median(all_pre)
-    elif isinstance(sums_raw, dict):
-        dec = sums_raw.get("median_decode_tok_s") or sums_raw.get("decode_tps") or sums_raw.get("decode_tok_s")
-        pre = sums_raw.get("median_prefill_tok_s") or sums_raw.get("prompt_tps") or sums_raw.get("prefill_tok_s")
-        tot_r = sums_raw.get("total_requests")
-        fail_r = sums_raw.get("failed_requests") if isinstance(sums_raw.get("failed_requests"), int) else 0
-    if dec is None:
-        vals = [r.get("decode_tok_s") for r in reqs if isinstance(r, dict) and isinstance(r.get("decode_tok_s"), (int, float))]
-        if vals:
-            dec = statistics.median(vals)
-    if pre is None:
-        vals = [r.get("prefill_tok_s") for r in reqs if isinstance(r, dict) and isinstance(r.get("prefill_tok_s"), (int, float))]
-        if vals:
-            pre = statistics.median(vals)
-    perf_reqs = [r for r in reqs if isinstance(r, dict) and r.get("phase") == "performance"]
-    req_pool = perf_reqs if perf_reqs else [r for r in reqs if isinstance(r, dict) and r.get("phase") != "warmup"]
-    avg_dec_vals = []
-    avg_pre_vals = []
-    for r in req_pool:
-        m = r.get("metrics") if isinstance(r.get("metrics"), dict) else {}
-        dv = m.get("decode_tps") if isinstance(m.get("decode_tps"), (int, float)) else r.get("decode_tok_s")
-        pv = m.get("prompt_tps") if isinstance(m.get("prompt_tps"), (int, float)) else r.get("prefill_tok_s")
-        if dv is None:
-            tk = r.get("tokens") if isinstance(r.get("tokens"), dict) else {}
-            tm = r.get("timings") if isinstance(r.get("timings"), dict) else {}
-            if isinstance(tk.get("decode_tokens"), (int, float)) and isinstance(tm.get("decode_s"), (int, float)) and tm["decode_s"] > 0:
-                dv = tk["decode_tokens"] / tm["decode_s"]
-        if pv is None:
-            tk = r.get("tokens") if isinstance(r.get("tokens"), dict) else {}
-            tm = r.get("timings") if isinstance(r.get("timings"), dict) else {}
-            rtok = tk.get("read_tokens") if isinstance(tk.get("read_tokens"), (int, float)) else tk.get("input_tokens")
-            if isinstance(rtok, (int, float)) and isinstance(tm.get("prompt_s"), (int, float)) and tm["prompt_s"] > 0:
-                pv = rtok / tm["prompt_s"]
-        if isinstance(dv, (int, float)):
-            avg_dec_vals.append(dv)
-        if isinstance(pv, (int, float)):
-            avg_pre_vals.append(pv)
-    avg_dec = statistics.mean(avg_dec_vals) if avg_dec_vals else (he.get("avg_decode_tok_s") if he else None)
-    avg_pre = statistics.mean(avg_pre_vals) if avg_pre_vals else (he.get("avg_prefill_tok_s") if he else None)
-    dec_s = f"{dec:.1f}" if isinstance(dec, (int, float)) else "—"
-    pre_s = f"{pre:.1f}" if isinstance(pre, (int, float)) else "—"
-    avg_dec_s = f"{avg_dec:.1f}" if isinstance(avg_dec, (int, float)) else ""
-    avg_pre_s = f"{avg_pre:.1f}" if isinstance(avg_pre, (int, float)) else ""
-    req_d = run.get("required_duration_s")
-    opt_d = run.get("optional_duration_s")
-    dur_s = ""
-    if isinstance(req_d, (int, float)):
-        tot_d = req_d + (opt_d if isinstance(opt_d, (int, float)) else 0.0)
-        dur_s = f"{tot_d:.1f}s"
-    rcounts = d.get("request_counts") if isinstance(d.get("request_counts"), dict) else {}
-    if not isinstance(tot_r, int) and rcounts:
-        tot_r = sum(v.get("attempted", 0) for v in rcounts.values() if isinstance(v, dict) and isinstance(v.get("attempted"), int))
-        fail_r = sum(v.get("failed", 0) for v in rcounts.values() if isinstance(v, dict) and isinstance(v.get("failed"), int))
-    if not isinstance(tot_r, int) and reqs:
-        tot_r = len(reqs)
-        fail_r = sum(1 for r in reqs if isinstance(r, dict) and r.get("status") not in (None, "ok", "completed"))
-    req_s = f"{tot_r - fail_r}/{tot_r} ok" if isinstance(tot_r, int) and tot_r > 0 else ""
-    qual = d.get("quality") if isinstance(d.get("quality"), dict) else {}
-    qp = qual.get("sanity_checks_passed") if qual.get("sanity_checks_passed") is not None else qual.get("passed")
-    qt = qual.get("sanity_checks_total") if qual.get("sanity_checks_total") is not None else qual.get("total")
-    qual_s = f"Sanity {qp}/{qt}" if isinstance(qp, int) and isinstance(qt, int) and qt > 0 else ""
-    pwr = (he.get("avg_power") if isinstance((he or {}).get("avg_power"), dict) else {})
-    sw, gw, cw = str(pwr.get("sys_w") or ""), str(pwr.get("gpu_w") or ""), str(pwr.get("cpu_w") or "")
-    has_opts = "1" if (he is not None and "active_steps" in he) else "0"
-    act_list = (he.get("active_steps") if isinstance((he or {}).get("active_steps"), list) else [])
-    act = ",".join(act_list)
-    act_n = str(len(act_list)) if has_opts == "1" else "untracked"
-    return [ts, tag, model, dec_s, pre_s, sw, gw, cw, act_n, act, req_s, qual_s, has_opts, avg_dec_s, avg_pre_s, dur_s]
-
-hist_list = []
-hist_by_file = {}
-if hist_path and os.path.exists(hist_path):
-    try:
-        with open(hist_path) as f:
-            loaded = json.load(f)
-        if isinstance(loaded, list):
-            hist_list = [e for e in loaded if isinstance(e, dict)]
-            for e in hist_list:
-                rf = e.get("results_file")
-                if rf:
-                    hist_by_file[rf] = e
-                    hist_by_file[os.path.realpath(rf)] = e
-    except Exception:
-        pass
-
-out_rows = []
-seen = set()
-for e in reversed(hist_list):
-    rf = e.get("results_file") or ""
-    rp = os.path.realpath(rf) if rf else f"hist:{e.get('id') or e.get('timestamp') or len(out_rows)}"
-    if rp in seen:
-        continue
-    seen.add(rp)
-    if rf and os.path.exists(rf):
-        row = parse_results(rf, e)
-        if row:
-            out_rows.append(row)
-            continue
-    ts = fmt_ts(e.get("timestamp"))
-    tag = e.get("tag") or e.get("mode") or ""
-    model = e.get("model") or "Unknown"
-    dec, pre = e.get("decode_tok_s"), e.get("prefill_tok_s")
-    dec_s = f"{dec:.1f}" if isinstance(dec, (int, float)) else "—"
-    pre_s = f"{pre:.1f}" if isinstance(pre, (int, float)) else "—"
-    pwr = e.get("avg_power") if isinstance(e.get("avg_power"), dict) else {}
-    sw, gw, cw = str(pwr.get("sys_w") or ""), str(pwr.get("gpu_w") or ""), str(pwr.get("cpu_w") or "")
-    act_list = e.get("active_steps") if isinstance(e.get("active_steps"), list) else []
-    act = ",".join(act_list)
-    tot_r = e.get("total_requests")
-    fail_r = e.get("failed_requests") if isinstance(e.get("failed_requests"), int) else 0
-    req_s = f"{tot_r - fail_r}/{tot_r} ok" if isinstance(tot_r, int) and tot_r > 0 else ""
-    qp, qt = e.get("sanity_checks_passed"), e.get("sanity_checks_total")
-    qual_s = f"Sanity {qp}/{qt}" if isinstance(qp, int) and isinstance(qt, int) and qt > 0 else ""
-    avg_dec_h = e.get("avg_decode_tok_s")
-    avg_dec_hs = f"{avg_dec_h:.1f}" if isinstance(avg_dec_h, (int, float)) else ""
-    avg_pre_h = e.get("avg_prefill_tok_s")
-    avg_pre_hs = f"{avg_pre_h:.1f}" if isinstance(avg_pre_h, (int, float)) else ""
-    out_rows.append([ts, tag, model, dec_s, pre_s, sw, gw, cw, str(len(act_list)), act, req_s, qual_s, "1", avg_dec_hs, avg_pre_hs, ""])
-
-found_files = []
-for sd in search_dirs:
-    if not os.path.isdir(sd):
-        continue
-    for pat in (os.path.join(sd, "*", "results.json"), os.path.join(sd, "results.json")):
-        for p in glob.glob(pat):
-            try:
-                found_files.append((os.path.getmtime(p), os.path.realpath(p), p))
-            except Exception:
-                pass
-found_files.sort(reverse=True)
-for _, rp, p in found_files:
-    if rp in seen:
-        continue
-    seen.add(rp)
-    row = parse_results(p, hist_by_file.get(rp) or hist_by_file.get(p))
-    if row:
-        out_rows.append(row)
-
-def _num(s):
-    try:
-        return float(s) if s not in ("", "—", None) else None
-    except Exception:
-        return None
-
-best_idx = None
-best_score = None
-for idx, cols in enumerate(out_rows):
-    dv = _num(cols[13])
-    if dv is None:
-        dv = _num(cols[3])
-    pv = _num(cols[14])
-    if pv is None:
-        pv = _num(cols[4])
-    if dv is not None:
-        sc = (dv, pv if pv is not None else -1.0)
-        if best_score is None or sc > best_score:
-            best_score = sc
-            best_idx = idx
-
-best_dec = best_score[0] if best_score is not None else None
-best_pre = (_num(out_rows[best_idx][14]) if _num(out_rows[best_idx][14]) is not None else _num(out_rows[best_idx][4])) if best_idx is not None else None
-
-for idx, cols in enumerate(out_rows):
-    d_pct = ""
-    p_pct = ""
-    is_best = "1" if (best_idx is not None and idx == best_idx) else "0"
-    if best_idx is not None and idx != best_idx:
-        dv = _num(cols[13])
-        if dv is None:
-            dv = _num(cols[3])
-        pv = _num(cols[14])
-        if pv is None:
-            pv = _num(cols[4])
-        if dv is not None and best_dec is not None and best_dec > 0:
-            d_pct = f"{((dv - best_dec) / best_dec) * 100.0:.1f}"
-        if pv is not None and best_pre is not None and best_pre > 0:
-            p_pct = f"{((pv - best_pre) / best_pre) * 100.0:.1f}"
-    safe_cols = [str(c).replace("|", "/").replace("\n", " ").replace("\r", "") for c in cols + [d_pct, p_pct, is_best]]
-    print("|".join([str(idx)] + safe_cols))
-PY
-)
+    done < <(_strata_bench_py history "${_sdirs[@]}" 2>/dev/null || true)
     if (( ${#rows[@]} == 0 )); then
       echo -e "${C_DIM}No benchmark results found yet.${C_RESET}"
       echo -e "${C_DIM}Run a benchmark from Strata Options (Run Strata Benchmark) to record results, power, and active options.${C_RESET}"
@@ -8052,7 +8164,7 @@ run_strata_benchmark() {
   local pwr_disp
   pwr_disp="$(format_avg_power_str "$avg_sys" "$avg_gpu" "$avg_cpu")"
   echo -e "\n${C_GREEN}Benchmark saved to coupled host history.${C_RESET}"
-  [[ -n "$pwr_disp" ]] && echo -e "  Average Power: ${C_YELLOW}${pwr_disp}${C_RESET} (${samples}s)"
+  [[ -n "$pwr_disp" ]] && echo -e "  Average Power: ${C_YELLOW}${pwr_disp}${C_RESET} (${samples} samples)"
   return "$rc"
 }
 
@@ -8163,7 +8275,7 @@ strata_action_install() {
   fi
   if confirm_yn "Install Strata now? [Y/n]: " "Y"; then
     command -v curl >/dev/null 2>&1 || prompt_install_deps repo curl || return 0
-    run_as_user "curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh | sh"
+    run_as_user_exec sh -c 'curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh | sh'
     refresh_strata_bin
     [[ -n "$STRATA_BIN" && -z "$STRATA_POLLER_PID" ]] && start_strata_update_poller
     if [[ -n "$STRATA_BIN" ]] && (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )) && ! status_strata_build_hip; then
@@ -8857,7 +8969,7 @@ strata_action_build_hip() {
     echo -e "${C_YELLOW}Strata CLI is not installed yet.${C_RESET}"
     if confirm_yn "Install Strata Terminal first before building the local HIP engine? [Y/n]: " "Y"; then
       command -v curl >/dev/null 2>&1 || prompt_install_deps repo curl || return 1
-      run_as_user "curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh | sh"
+      run_as_user_exec sh -c 'curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh | sh'
       refresh_strata_bin
       [[ -n "$STRATA_BIN" && -z "$STRATA_POLLER_PID" ]] && start_strata_update_poller
     fi
@@ -9528,17 +9640,7 @@ if libc.host_statistics(libc.mach_host_self(), 3, ctypes.byref(i), ctypes.byref(
         pm_out="$("${pm_cmd[@]}" -n 1 -i 200 --samplers cpu_power,gpu_power,thermal 2>/dev/null || true)"
         if [[ -n "$pm_out" ]]; then
           local pm_res pm_gp pm_cp pm_sp pm_thr
-          pm_res="$(awk '
-            /GPU (HW )?active residency:/ { if (match($0, /[0-9]+(\.[0-9]+)?%/)) { gres = sprintf("%.0f", substr($0, RSTART, RLENGTH-1)+0) } }
-            /GPU Power:/ { if (match($0, /[0-9]+(\.[0-9]+)?[[:space:]]*m?W/)) { s=substr($0,RSTART,RLENGTH); v=s+0; gp=(s~/mW/)?v/1000.0:v } }
-            /CPU Power:/ { if (match($0, /[0-9]+(\.[0-9]+)?[[:space:]]*m?W/)) { s=substr($0,RSTART,RLENGTH); v=s+0; cp=(s~/mW/)?v/1000.0:v } }
-            /ANE Power:/ { if (match($0, /[0-9]+(\.[0-9]+)?[[:space:]]*m?W/)) { s=substr($0,RSTART,RLENGTH); v=s+0; anep=(s~/mW/)?v/1000.0:v } }
-            /Combined Power/ { if (match($0, /[0-9]+(\.[0-9]+)?[[:space:]]*m?W/)) { s=substr($0,RSTART,RLENGTH); v=s+0; sp=(s~/mW/)?v/1000.0:v } }
-            /Current pressure level:/ { thr=$NF }
-            END {
-              if (sp == "" && gp != "" && cp != "") sp = gp + cp + anep
-              printf "%s|%s|%s|%s|%s", gres, (gp!=""?sprintf("%.0f",gp):""), (cp!=""?sprintf("%.0f",cp):""), (sp!=""?sprintf("%.0f",sp):""), thr
-            }' <<< "$pm_out")"
+          pm_res="$(_parse_macos_powermetrics "%.0f" "$pm_out")"
           IFS='|' read -r pm_res pm_gp pm_cp pm_sp pm_thr <<< "$pm_res"
           [[ -n "$pm_res" ]] && g_pct="$pm_res"
           [[ -n "$pm_gp" ]] && { pw="$pm_gp"; total_gpu_pwr_w="$pm_gp"; }
@@ -9763,13 +9865,15 @@ if libc.host_statistics(libc.mach_host_self(), 3, ctypes.byref(i), ctypes.byref(
           if [[ -z "$pw" && -r "$hwmon_dir/power1_average" ]]; then
             local pa pc
             pa="$(cat "$hwmon_dir/power1_average" 2>/dev/null || echo 0)"
-            pw=$((pa / 1000000))
-            total_gpu_pwr_w=$(( ${total_gpu_pwr_w:-0} + pw ))
-            if [[ -r "$hwmon_dir/power1_cap" ]]; then
-              pc="$(cat "$hwmon_dir/power1_cap" 2>/dev/null || echo 0)"
-              if (( pc > 0 )); then
-                plw=$((pc / 1000000))
-                ppct=$((pa * 100 / pc))
+            if [[ "$pa" =~ ^[0-9]+$ ]] && (( pa > 0 )); then
+              pw=$((pa / 1000000))
+              total_gpu_pwr_w=$(( ${total_gpu_pwr_w:-0} + pw ))
+              if [[ -r "$hwmon_dir/power1_cap" ]]; then
+                pc="$(cat "$hwmon_dir/power1_cap" 2>/dev/null || echo 0)"
+                if [[ "$pc" =~ ^[0-9]+$ ]] && (( pc > 0 )); then
+                  plw=$((pc / 1000000))
+                  ppct=$((pa * 100 / pc))
+                fi
               fi
             fi
           fi
@@ -9912,7 +10016,7 @@ if libc.host_statistics(libc.mach_host_self(), 3, ctypes.byref(i), ctypes.byref(
             for pf in "$hm_dir"/power1_input "$hm_dir"/power1_average; do
               if [[ -r "$pf" ]]; then
                 uw="$(cat "$pf" 2>/dev/null || echo 0)"
-                (( uw > 0 )) && { sys_pwr_w=$((uw / 1000000)); break; }
+                [[ "$uw" =~ ^[0-9]+$ ]] && (( uw > 0 )) && { sys_pwr_w=$((uw / 1000000)); break; }
               fi
             done
           fi
@@ -9932,22 +10036,7 @@ if libc.host_statistics(libc.mach_host_self(), 3, ctypes.byref(i), ctypes.byref(
       done
     fi
     if [[ -z "$sys_pwr_w" ]]; then
-      local bat_d bat_st cur_ua volt_uv uw
-      for bat_d in /sys/class/power_supply/BAT*; do
-        [[ -d "$bat_d" ]] || continue
-        if [[ -r "$bat_d/power_now" ]]; then
-          uw="$(cat "$bat_d/power_now" 2>/dev/null || echo 0)"
-          [[ "$uw" =~ ^[0-9]+$ ]] && (( uw > 0 )) && { sys_pwr_w=$((uw / 1000000)); break; }
-        elif [[ -r "$bat_d/current_now" && -r "$bat_d/voltage_now" ]]; then
-          bat_st="$(cat "$bat_d/status" 2>/dev/null || true)"
-          cur_ua="$(cat "$bat_d/current_now" 2>/dev/null || echo 0)"
-          volt_uv="$(cat "$bat_d/voltage_now" 2>/dev/null || echo 0)"
-          if [[ "$bat_st" == "Discharging" && "$cur_ua" =~ ^[0-9]+$ && "$volt_uv" =~ ^[0-9]+$ ]] && (( cur_ua > 0 && volt_uv > 0 )); then
-            sys_pwr_w="$(awk -v c="$cur_ua" -v v="$volt_uv" 'BEGIN{printf "%.0f", (c/1000000.0)*(v/1000000.0)}')"
-            break
-          fi
-        fi
-      done
+      sys_pwr_w="$(_read_sysfs_bat_watts "%.0f" || true)"
     fi
 
     if [[ "$IS_JETSON" == true ]]; then
@@ -10303,243 +10392,9 @@ collect_strata_bench_lines() {
 
   local parsed=""
   if has_working_python3; then
-    parsed="$(python3 - "$STRATA_BENCH_HISTORY_FILE" "$PWD/bench/results" "$PWD/bench-results" "$TARGET_HOME/bench/results" "$TARGET_HOME/bench-results" "$TARGET_HOME/.local/share/strata/bench-results" "$TARGET_HOME/.config/strata/bench-results" <<'PY' 2>/dev/null || true
-import datetime, glob, json, os, statistics, sys
-
-hist_path = sys.argv[1]
-search_dirs = sys.argv[2:]
-
-def fmt_ts(ts):
-    ts = (ts or "").replace("T", " ")
-    if ts.endswith("Z"):
-        ts = ts[:-1] + " UTC"
-    if len(ts) > 20 and " UTC" in ts:
-        ts = ts[:16] + " UTC"
-    return ts
-
-def from_results_file(path, hist_by_file):
-    try:
-        with open(path) as f:
-            d = json.load(f)
-    except Exception:
-        return None
-    if not isinstance(d, dict):
-        return None
-    he = hist_by_file.get(os.path.realpath(path)) or hist_by_file.get(path)
-    run = d.get("run") if isinstance(d.get("run"), dict) else {}
-    ts = fmt_ts(run.get("started_at") or run.get("timestamp") or d.get("timestamp") or "")
-    if not ts:
-        try:
-            ts = datetime.datetime.fromtimestamp(os.path.getmtime(path), tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        except Exception:
-            ts = "Unknown"
-    cfg = d.get("configuration") if isinstance(d.get("configuration"), dict) else {}
-    proto_d = d.get("protocol") if isinstance(d.get("protocol"), dict) else {}
-    prof = proto_d.get("profile") or cfg.get("profile") or ""
-    proto = proto_d.get("id") or d.get("protocol_id") or d.get("format") or ""
-    tag = prof or ("standard-v1" if "standard" in proto else proto) or (he.get("tag") if he else "")
-    mdl = d.get("model")
-    if isinstance(mdl, dict):
-        m_name = mdl.get("name") or mdl.get("id") or ""
-        m_quant = mdl.get("quantization") or ""
-        if m_name and m_quant and m_quant.lower() not in m_name.lower():
-            model_s = f"{m_name} ({m_quant})"
-        else:
-            model_s = m_name or m_quant or "Unknown"
-    elif isinstance(mdl, str) and mdl:
-        model_s = mdl
-    else:
-        model_s = (he.get("model") if he else None) or "Unknown"
-    sums_raw = d.get("summaries") if "summaries" in d else d.get("summary")
-    reqs = d.get("requests") if isinstance(d.get("requests"), list) else []
-    dec = None
-    pre = None
-    tot_r = None
-    fail_r = 0
-    if isinstance(sums_raw, list):
-        perf_dec = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("phase") == "performance" and s.get("metric") == "decode_tps" and isinstance(s.get("median"), (int, float))]
-        all_dec = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("metric") == "decode_tps" and isinstance(s.get("median"), (int, float))]
-        perf_pre = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("phase") == "performance" and s.get("metric") == "prompt_tps" and isinstance(s.get("median"), (int, float))]
-        all_pre = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("metric") == "prompt_tps" and isinstance(s.get("median"), (int, float))]
-        if perf_dec:
-            dec = statistics.median(perf_dec)
-        elif all_dec:
-            dec = statistics.median(all_dec)
-        if perf_pre:
-            pre = statistics.median(perf_pre)
-        elif all_pre:
-            pre = statistics.median(all_pre)
-    elif isinstance(sums_raw, dict):
-        dec = sums_raw.get("median_decode_tok_s") or sums_raw.get("decode_tps") or sums_raw.get("decode_tok_s")
-        pre = sums_raw.get("median_prefill_tok_s") or sums_raw.get("prompt_tps") or sums_raw.get("prefill_tok_s")
-        tot_r = sums_raw.get("total_requests")
-        fail_r = sums_raw.get("failed_requests") if isinstance(sums_raw.get("failed_requests"), int) else 0
-    if dec is None:
-        vals = [r.get("decode_tok_s") for r in reqs if isinstance(r, dict) and isinstance(r.get("decode_tok_s"), (int, float))]
-        if vals:
-            dec = statistics.median(vals)
-    if pre is None:
-        vals = [r.get("prefill_tok_s") for r in reqs if isinstance(r, dict) and isinstance(r.get("prefill_tok_s"), (int, float))]
-        if vals:
-            pre = statistics.median(vals)
-    perf_reqs = [r for r in reqs if isinstance(r, dict) and r.get("phase") == "performance"]
-    req_pool = perf_reqs if perf_reqs else [r for r in reqs if isinstance(r, dict) and r.get("phase") != "warmup"]
-    avg_dec_vals = []
-    avg_pre_vals = []
-    for r in req_pool:
-        m = r.get("metrics") if isinstance(r.get("metrics"), dict) else {}
-        dv = m.get("decode_tps") if isinstance(m.get("decode_tps"), (int, float)) else r.get("decode_tok_s")
-        pv = m.get("prompt_tps") if isinstance(m.get("prompt_tps"), (int, float)) else r.get("prefill_tok_s")
-        if dv is None:
-            tk = r.get("tokens") if isinstance(r.get("tokens"), dict) else {}
-            tm = r.get("timings") if isinstance(r.get("timings"), dict) else {}
-            if isinstance(tk.get("decode_tokens"), (int, float)) and isinstance(tm.get("decode_s"), (int, float)) and tm["decode_s"] > 0:
-                dv = tk["decode_tokens"] / tm["decode_s"]
-        if pv is None:
-            tk = r.get("tokens") if isinstance(r.get("tokens"), dict) else {}
-            tm = r.get("timings") if isinstance(r.get("timings"), dict) else {}
-            rtok = tk.get("read_tokens") if isinstance(tk.get("read_tokens"), (int, float)) else tk.get("input_tokens")
-            if isinstance(rtok, (int, float)) and isinstance(tm.get("prompt_s"), (int, float)) and tm["prompt_s"] > 0:
-                pv = rtok / tm["prompt_s"]
-        if isinstance(dv, (int, float)):
-            avg_dec_vals.append(dv)
-        if isinstance(pv, (int, float)):
-            avg_pre_vals.append(pv)
-    avg_dec = statistics.mean(avg_dec_vals) if avg_dec_vals else (he.get("avg_decode_tok_s") if he else None)
-    avg_pre = statistics.mean(avg_pre_vals) if avg_pre_vals else (he.get("avg_prefill_tok_s") if he else None)
-    rcounts = d.get("request_counts") if isinstance(d.get("request_counts"), dict) else {}
-    if not isinstance(tot_r, int) and rcounts:
-        tot_r = sum(v.get("attempted", 0) for v in rcounts.values() if isinstance(v, dict) and isinstance(v.get("attempted"), int))
-        fail_r = sum(v.get("failed", 0) for v in rcounts.values() if isinstance(v, dict) and isinstance(v.get("failed"), int))
-    if not isinstance(tot_r, int) and reqs:
-        tot_r = len(reqs)
-        fail_r = sum(1 for r in reqs if isinstance(r, dict) and r.get("status") not in (None, "ok", "completed"))
-    req_s = f"{tot_r - fail_r}/{tot_r} ok" if isinstance(tot_r, int) and tot_r > 0 else ""
-    qual = d.get("quality") if isinstance(d.get("quality"), dict) else {}
-    qp = qual.get("sanity_checks_passed") if qual.get("sanity_checks_passed") is not None else qual.get("passed")
-    qt = qual.get("sanity_checks_total") if qual.get("sanity_checks_total") is not None else qual.get("total")
-    qual_s = f"Sanity: {qp}/{qt}" if isinstance(qp, int) and isinstance(qt, int) and qt > 0 else ""
-    pwr = (he.get("avg_power") if isinstance((he or {}).get("avg_power"), dict) else {})
-    return {
-        "ts": ts, "tag": tag, "model": model_s,
-        "dec": float(dec) if isinstance(dec, (int, float)) else None,
-        "pre": float(pre) if isinstance(pre, (int, float)) else None,
-        "avg_dec": float(avg_dec) if isinstance(avg_dec, (int, float)) else None,
-        "avg_pre": float(avg_pre) if isinstance(avg_pre, (int, float)) else None,
-        "req_s": req_s, "qual_s": qual_s,
-        "sw": str(pwr.get("sys_w") or ""), "gw": str(pwr.get("gpu_w") or ""), "cw": str(pwr.get("cpu_w") or ""),
-        "key": os.path.realpath(path),
-    }
-
-def from_hist_entry(e):
-    ts = fmt_ts(e.get("timestamp"))
-    tag = e.get("tag") or e.get("mode") or ""
-    model_s = e.get("model") or "Unknown"
-    dec = e.get("decode_tok_s")
-    pre = e.get("prefill_tok_s")
-    avg_dec = e.get("avg_decode_tok_s")
-    avg_pre = e.get("avg_prefill_tok_s")
-    tot_r = e.get("total_requests")
-    fail_r = e.get("failed_requests") if isinstance(e.get("failed_requests"), int) else 0
-    req_s = f"{tot_r - fail_r}/{tot_r} ok" if isinstance(tot_r, int) and tot_r > 0 else ""
-    qp, qt = e.get("sanity_checks_passed"), e.get("sanity_checks_total")
-    qual_s = f"Sanity: {qp}/{qt}" if isinstance(qp, int) and isinstance(qt, int) and qt > 0 else ""
-    pwr = e.get("avg_power") if isinstance(e.get("avg_power"), dict) else {}
-    rf = e.get("results_file") or ""
-    return {
-        "ts": ts, "tag": tag, "model": model_s,
-        "dec": float(dec) if isinstance(dec, (int, float)) else None,
-        "pre": float(pre) if isinstance(pre, (int, float)) else None,
-        "avg_dec": float(avg_dec) if isinstance(avg_dec, (int, float)) else None,
-        "avg_pre": float(avg_pre) if isinstance(avg_pre, (int, float)) else None,
-        "req_s": req_s, "qual_s": qual_s,
-        "sw": str(pwr.get("sys_w") or ""), "gw": str(pwr.get("gpu_w") or ""), "cw": str(pwr.get("cpu_w") or ""),
-        "key": os.path.realpath(rf) if rf else f"hist:{e.get('id') or ts}",
-    }
-
-hist_list = []
-hist_by_file = {}
-if hist_path and os.path.exists(hist_path):
-    try:
-        with open(hist_path) as f:
-            loaded = json.load(f)
-        if isinstance(loaded, list):
-            hist_list = [e for e in loaded if isinstance(e, dict)]
-            for e in hist_list:
-                rf = e.get("results_file")
-                if rf:
-                    hist_by_file[rf] = e
-                    hist_by_file[os.path.realpath(rf)] = e
-    except Exception:
-        pass
-
-items = []
-seen = set()
-# Prefer coupled host history (newest first)
-for e in reversed(hist_list):
-    rf = e.get("results_file") or ""
-    rec = from_results_file(rf, hist_by_file) if (rf and os.path.exists(rf)) else from_hist_entry(e)
-    if rec and rec["key"] not in seen:
-        seen.add(rec["key"])
-        items.append(rec)
-
-# Include raw results.json files on disk (newest mtime first)
-found_files = []
-for d in search_dirs:
-    if not os.path.isdir(d):
-        continue
-    for pat in (os.path.join(d, "*", "results.json"), os.path.join(d, "results.json")):
-        for p in glob.glob(pat):
-            try:
-                found_files.append((os.path.getmtime(p), os.path.realpath(p), p))
-            except Exception:
-                pass
-found_files.sort(reverse=True)
-for _, rp, p in found_files:
-    if rp in seen:
-        continue
-    rec = from_results_file(p, hist_by_file)
-    if rec:
-        seen.add(rp)
-        items.append(rec)
-
-if not items:
-    sys.exit(0)
-
-def fmt_rec(kind, rec, d_pct="", p_pct="", prev_d_pct="", prev_p_pct=""):
-    dec_s = f"{rec['dec']:.1f} tok/s" if rec["dec"] is not None else "—"
-    pre_s = f"{rec['pre']:.1f} tok/s" if rec["pre"] is not None else "—"
-    avg_dec_s = f"{rec['avg_dec']:.1f} tok/s" if rec.get("avg_dec") is not None else ""
-    avg_pre_s = f"{rec['avg_pre']:.1f} tok/s" if rec.get("avg_pre") is not None else ""
-    cols = [kind, rec["ts"], rec["tag"], rec["model"], dec_s, pre_s, rec["req_s"], rec["qual_s"], rec["sw"], rec["gw"], rec["cw"], d_pct, p_pct, avg_dec_s, avg_pre_s, prev_d_pct, prev_p_pct]
-    return "|".join(str(c).replace("|", "/").replace("\n", " ").replace("\r", "") for c in cols)
-
-def score_key(rec):
-    d = rec.get("avg_dec") if rec.get("avg_dec") is not None else rec.get("dec")
-    p = rec.get("avg_pre") if rec.get("avg_pre") is not None else rec.get("pre")
-    return (d if isinstance(d, (int, float)) else -1.0, p if isinstance(p, (int, float)) else -1.0)
-
-def pct_vs_ref(rec, ref_rec):
-    rec_d = rec.get("avg_dec") if rec.get("avg_dec") is not None else rec.get("dec")
-    ref_d = ref_rec.get("avg_dec") if ref_rec.get("avg_dec") is not None else ref_rec.get("dec")
-    rec_p = rec.get("avg_pre") if rec.get("avg_pre") is not None else rec.get("pre")
-    ref_p = ref_rec.get("avg_pre") if ref_rec.get("avg_pre") is not None else ref_rec.get("pre")
-    dp = f"{((rec_d - ref_d) / ref_d) * 100.0:.1f}" if (isinstance(rec_d, (int, float)) and isinstance(ref_d, (int, float)) and ref_d > 0) else ""
-    pp = f"{((rec_p - ref_p) / ref_p) * 100.0:.1f}" if (isinstance(rec_p, (int, float)) and isinstance(ref_p, (int, float)) and ref_p > 0) else ""
-    return dp, pp
-
-best = max(items, key=score_key)
-if len(items) >= 2:
-    cur_dp, cur_pp = pct_vs_ref(items[0], best)
-    cur_prev_dp, cur_prev_pp = pct_vs_ref(items[0], items[1])
-    print(fmt_rec("CUR", items[0], cur_dp, cur_pp, cur_prev_dp, cur_prev_pp))
-    prev_dp, prev_pp = pct_vs_ref(items[1], best)
-    print(fmt_rec("PREV", items[1], prev_dp, prev_pp))
-    print(fmt_rec("BEST", best))
-else:
-    print(fmt_rec("CUR", items[0]))
-PY
-)"
+    local -a _sdirs=()
+    mapfile -t _sdirs < <(_strata_bench_search_dirs)
+    parsed="$(_strata_bench_py summary "${_sdirs[@]}" 2>/dev/null || true)"
   fi
 
   STRATA_BENCH_CACHE_KEY="$cache_key"
@@ -10804,6 +10659,100 @@ _render_live_stats_inplace() {
   printf "\033[?2026h\033[?25l\033[s\033[%dA\r%s\033[u\033[?25h\033[?2026l" "$up" "$block"
 }
 
+_tui_start_live_stats_sampler() {
+  local -n _tmp_ref="$1" _pid_ref="$2"
+  _tmp_ref="" _pid_ref=""
+  (( LIVE_STATS_COUNT > 0 )) || return 0
+  _tmp_ref="$(mktemp /tmp/strata-stats.XXXXXX 2>/dev/null || echo "")"
+  [[ -n "$_tmp_ref" ]] || return 0
+  (
+    trap 'exit 0' TERM INT
+    while true; do
+      sleep 1 &
+      wait $! 2>/dev/null || exit 0
+      refresh_strata_running
+      if print_stats_and_info_grid true > "${_tmp_ref}.tmp" 2>/dev/null; then
+        format_compact_live_bar > "${_tmp_ref}.bar.tmp" 2>/dev/null || true
+        mv -f "${_tmp_ref}.bar.tmp" "${_tmp_ref}.bar" 2>/dev/null || true
+        printf "%s\n" "$LIVE_STATS_COUNT" > "${_tmp_ref}.meta.tmp" 2>/dev/null || true
+        mv -f "${_tmp_ref}.meta.tmp" "${_tmp_ref}.meta" 2>/dev/null || true
+        mv -f "${_tmp_ref}.tmp" "$_tmp_ref" 2>/dev/null || true
+      fi
+    done
+  ) &
+  _pid_ref=$!
+  ACTIVE_SAMPLER_PID="$_pid_ref"
+  ACTIVE_SAMPLER_TMP="$_tmp_ref"
+}
+
+_tui_stop_live_stats_sampler() {
+  local pid="${1:-}" tmp="${2:-}"
+  [[ -n "$pid" ]] && { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
+  [[ -n "$tmp" ]] && rm -f "$tmp" "${tmp}.tmp" "${tmp}.bar" "${tmp}.bar.tmp" "${tmp}.meta" "${tmp}.meta.tmp" 2>/dev/null || true
+  ACTIVE_SAMPLER_PID="" ACTIVE_SAMPLER_TMP=""
+}
+
+_tui_restore_tty() {
+  local saved_tty="${1:-}"
+  if [[ -n "$saved_tty" ]]; then
+    stty "$saved_tty" 2>/dev/null || stty echo 2>/dev/null || true
+  else
+    stty echo 2>/dev/null || true
+  fi
+}
+
+_tui_read_esc_seq() {
+  local -n _esc_out="$1"
+  _esc_out=""
+  IFS= read -rsn2 -t 0.01 _esc_out || true
+  if [[ -n "$_esc_out" ]] && [[ "$_esc_out" == \[* || "$_esc_out" == O* ]] && [[ ! "$_esc_out" =~ [A-Za-z~]$ ]]; then
+    local _ec="" _en=0
+    while (( _en++ < 8 )) && IFS= read -rsn1 -t 0.01 _ec; do
+      [[ "$_ec" =~ [A-Za-z~] ]] && break
+    done
+  fi
+}
+
+_tui_prepare_compact_bar() {
+  local lines_up="$1" term_lines="$2"
+  if (( LIVE_STATS_COUNT > 0 )) && ! _can_live_stats "$lines_up" "$term_lines"; then
+    local _bar0
+    _bar0="$(format_compact_live_bar)"
+    if [[ -n "$_bar0" ]]; then
+      printf "%s\n" "$_bar0"
+      local _hi
+      for (( _hi = 0; _hi < ${#HIST_HDR_LINES[@]}; _hi++ )); do
+        HIST_HDR_LINES[$_hi]=$(( HIST_HDR_LINES[_hi] + 1 ))
+      done
+    fi
+    return 0
+  fi
+  return 1
+}
+
+_tui_poll_live_stats_tick() {
+  local lines_up="$1" term_lines="$2" compact_bar="$3" tmp_file="$4" buf="$5"
+  local prev_upd="$STRATA_UPDATE_AVAILABLE" new_lines stats_block
+  load_strata_update_state
+  if [[ "$prev_upd" == false && "$STRATA_UPDATE_AVAILABLE" == true ]]; then
+    local _b_up=$(( lines_up - LIVE_STATS_COUNT - UPDATE_BANNER_OFFSET ))
+    if ! _render_update_banner_inplace "$_b_up" "$term_lines" && [[ -z "$buf" ]]; then
+      return 1
+    fi
+  fi
+  new_lines="$LIVE_STATS_COUNT"
+  [[ -n "$tmp_file" && -s "${tmp_file}.meta" ]] && read -r new_lines < "${tmp_file}.meta" || true
+  if [[ "$compact_bar" == true ]]; then
+    [[ -n "$tmp_file" && -s "${tmp_file}.bar" ]] && _render_live_bar_inplace "$(<"${tmp_file}.bar")"
+  elif [[ "$new_lines" =~ ^[0-9]+$ ]] && (( new_lines != LIVE_STATS_COUNT )); then
+    [[ -z "$buf" ]] && return 1
+  elif [[ -n "$tmp_file" && -s "$tmp_file" ]]; then
+    stats_block="$(<"$tmp_file")"
+    _render_live_stats_inplace "$lines_up" "$term_lines" "$stats_block"
+  fi
+  return 0
+}
+
 read_line_with_live_stats() {
   local -n _line_out="$1"
   local prompt_str="${2:-Select action: }"
@@ -10814,62 +10763,21 @@ read_line_with_live_stats() {
     return 0
   fi
 
-  local term_lines=40 compact_bar=false
+  local term_lines=40 compact_bar=false tmp_file="" sampler_pid="" saved_tty=""
   term_lines="$(tput lines 2>/dev/null || echo 40)"
-  if (( LIVE_STATS_COUNT > 0 )) && ! _can_live_stats "$lines_up" "$term_lines"; then
-    compact_bar=true
-    local _bar0
-    _bar0="$(format_compact_live_bar)"
-    if [[ -n "$_bar0" ]]; then
-      printf "%s\n" "$_bar0"
-      local _hi
-      for (( _hi = 0; _hi < ${#HIST_HDR_LINES[@]}; _hi++ )); do
-        HIST_HDR_LINES[$_hi]=$(( HIST_HDR_LINES[_hi] + 1 ))
-      done
-    fi
-  fi
+  _tui_prepare_compact_bar "$lines_up" "$term_lines" && compact_bar=true
+  _tui_start_live_stats_sampler tmp_file sampler_pid
 
-  local tmp_file="" sampler_pid=""
-  if (( LIVE_STATS_COUNT > 0 )); then
-    tmp_file="$(mktemp /tmp/strata-stats.XXXXXX 2>/dev/null || echo "")"
-  fi
-  if [[ -n "$tmp_file" ]]; then
-    (
-      trap 'exit 0' TERM INT
-      while true; do
-        sleep 1 &
-        wait $! 2>/dev/null || exit 0
-        refresh_strata_running
-        if print_stats_and_info_grid true > "${tmp_file}.tmp" 2>/dev/null; then
-          format_compact_live_bar > "${tmp_file}.bar.tmp" 2>/dev/null || true
-          mv -f "${tmp_file}.bar.tmp" "${tmp_file}.bar" 2>/dev/null || true
-          printf "%s\n" "$LIVE_STATS_COUNT" > "${tmp_file}.meta.tmp" 2>/dev/null || true
-          mv -f "${tmp_file}.meta.tmp" "${tmp_file}.meta" 2>/dev/null || true
-          mv -f "${tmp_file}.tmp" "$tmp_file" 2>/dev/null || true
-        fi
-      done
-    ) &
-    sampler_pid=$!
-    ACTIVE_SAMPLER_PID="$sampler_pid"
-    ACTIVE_SAMPLER_TMP="$tmp_file"
-  fi
-
-  local saved_tty=""
   saved_tty="$(stty -g 2>/dev/null || true)"
   stty -echo 2>/dev/null || true
   _cleanup_line_live() {
-    [[ -n "$sampler_pid" ]] && { kill "$sampler_pid" 2>/dev/null || true; wait "$sampler_pid" 2>/dev/null || true; sampler_pid=""; }
-    [[ -n "$tmp_file" ]] && { rm -f "$tmp_file" "${tmp_file}.tmp" "${tmp_file}.bar" "${tmp_file}.bar.tmp" "${tmp_file}.meta" "${tmp_file}.meta.tmp" 2>/dev/null || true; tmp_file=""; }
-    ACTIVE_SAMPLER_PID="" ACTIVE_SAMPLER_TMP=""
-    if [[ -n "$saved_tty" ]]; then
-      stty "$saved_tty" 2>/dev/null || stty echo 2>/dev/null || true
-    else
-      stty echo 2>/dev/null || true
-    fi
+    _tui_stop_live_stats_sampler "$sampler_pid" "$tmp_file"
+    sampler_pid="" tmp_file=""
+    _tui_restore_tty "$saved_tty"
   }
   trap '_cleanup_line_live; exit 0' INT TERM
 
-  local buf="" ch="" rc=0 stats_block="" new_lines=""
+  local buf="" ch="" rc=0 _esc=""
   printf "%s" "$prompt_str"
   while true; do
     rc=0
@@ -10883,16 +10791,10 @@ read_line_with_live_stats() {
           buf="${buf%?}"; printf "\b \b"
         fi
       elif [[ "$ch" == $'\e' ]]; then
-        local _esc="" _ec="" _en=0
-        IFS= read -rsn2 -t 0.01 _esc || true
+        _tui_read_esc_seq _esc
         if [[ -z "$_esc" ]]; then
           _cleanup_line_live; trap - INT TERM; printf "\n"
           _line_out="__esc__"; return 0
-        fi
-        if [[ "$_esc" == \[* || "$_esc" == O* ]] && [[ ! "$_esc" =~ [A-Za-z~]$ ]]; then
-          while (( _en++ < 8 )) && IFS= read -rsn1 -t 0.01 _ec; do
-            [[ "$_ec" =~ [A-Za-z~] ]] && break
-          done
         fi
         if (( total_rows > 0 )) && [[ "$_esc" == "[A" || "$_esc" == "OA" || "$_esc" == "[B" || "$_esc" == "OB" ]]; then
           local old_idx="$HIST_SELECTED" new_idx="$HIST_SELECTED"
@@ -10923,36 +10825,16 @@ read_line_with_live_stats() {
           _accept=true
         elif [[ "$ch" =~ ^[0-9]$ ]] && [[ -z "$buf" || "$buf" =~ ^[0-9]+$ ]]; then
           local _cand="${buf}${ch}"
-          if (( total_rows == 0 || (10#_cand >= 1 && 10#_cand <= total_rows) )); then
-            _accept=true
-          fi
+          (( total_rows == 0 || (10#_cand >= 1 && 10#_cand <= total_rows) )) && _accept=true
         fi
         if [[ "$_accept" == true ]]; then
           buf+="$ch"; printf "%s" "$ch"
         fi
       fi
     elif (( rc > 128 )); then
-      local prev_upd="$STRATA_UPDATE_AVAILABLE"
-      load_strata_update_state
-      if [[ "$prev_upd" == false && "$STRATA_UPDATE_AVAILABLE" == true ]]; then
-        local _b_up=$(( lines_up - LIVE_STATS_COUNT - UPDATE_BANNER_OFFSET ))
-        if ! _render_update_banner_inplace "$_b_up" "$term_lines" && [[ -z "$buf" ]]; then
-          _cleanup_line_live; trap - INT TERM; printf "\n"
-          _line_out="__refresh__"; return 0
-        fi
-      fi
-      new_lines="$LIVE_STATS_COUNT"
-      [[ -n "$tmp_file" && -s "${tmp_file}.meta" ]] && read -r new_lines < "${tmp_file}.meta" || true
-      if [[ "$compact_bar" == true ]]; then
-        [[ -n "$tmp_file" && -s "${tmp_file}.bar" ]] && _render_live_bar_inplace "$(<"${tmp_file}.bar")"
-      elif [[ "$new_lines" =~ ^[0-9]+$ ]] && (( new_lines != LIVE_STATS_COUNT )); then
-        if [[ -z "$buf" ]]; then
-          _cleanup_line_live; trap - INT TERM; printf "\n"
-          _line_out="__refresh__"; return 0
-        fi
-      elif [[ -n "$tmp_file" && -s "$tmp_file" ]]; then
-        stats_block="$(<"$tmp_file")"
-        _render_live_stats_inplace "$lines_up" "$term_lines" "$stats_block"
+      if ! _tui_poll_live_stats_tick "$lines_up" "$term_lines" "$compact_bar" "$tmp_file" "$buf"; then
+        _cleanup_line_live; trap - INT TERM; printf "\n"
+        _line_out="__refresh__"; return 0
       fi
     else
       _cleanup_line_live; trap - INT TERM; printf "\n"; exit 0
@@ -10968,126 +10850,49 @@ read_step_action() {
     return 0
   fi
 
-  local term_lines=40 compact_bar=false
+  local term_lines=40 compact_bar=false tmp_file="" sampler_pid="" saved_tty=""
   term_lines="$(tput lines 2>/dev/null || echo 40)"
-  if (( LIVE_STATS_COUNT > 0 )) && ! _can_live_stats "$lines_up" "$term_lines"; then
-    compact_bar=true
-    local _bar0
-    _bar0="$(format_compact_live_bar)"
-    if [[ -n "$_bar0" ]]; then
-      printf "%s\n" "$_bar0"
-      local _hi
-      for (( _hi = 0; _hi < ${#HIST_HDR_LINES[@]}; _hi++ )); do
-        HIST_HDR_LINES[$_hi]=$(( HIST_HDR_LINES[_hi] + 1 ))
-      done
-    fi
-  fi
+  _tui_prepare_compact_bar "$lines_up" "$term_lines" && compact_bar=true
+  _tui_start_live_stats_sampler tmp_file sampler_pid
 
-  local tmp_file="" sampler_pid=""
-  if (( LIVE_STATS_COUNT > 0 )); then
-    tmp_file="$(mktemp /tmp/strata-stats.XXXXXX 2>/dev/null || echo "")"
-  fi
-  if [[ -n "$tmp_file" ]]; then
-    (
-      trap 'exit 0' TERM INT
-      while true; do
-        sleep 1 &
-        wait $! 2>/dev/null || exit 0
-        refresh_strata_running
-        if print_stats_and_info_grid true > "${tmp_file}.tmp" 2>/dev/null; then
-          format_compact_live_bar > "${tmp_file}.bar.tmp" 2>/dev/null || true
-          mv -f "${tmp_file}.bar.tmp" "${tmp_file}.bar" 2>/dev/null || true
-          printf "%s\n" "$LIVE_STATS_COUNT" > "${tmp_file}.meta.tmp" 2>/dev/null || true
-          mv -f "${tmp_file}.meta.tmp" "${tmp_file}.meta" 2>/dev/null || true
-          mv -f "${tmp_file}.tmp" "$tmp_file" 2>/dev/null || true
-        fi
-      done
-    ) &
-    sampler_pid=$!
-    ACTIVE_SAMPLER_PID="$sampler_pid"
-    ACTIVE_SAMPLER_TMP="$tmp_file"
-  fi
-
-  local saved_tty=""
   saved_tty="$(stty -g 2>/dev/null || true)"
   stty -echo 2>/dev/null || true
   _restore_step_tty() {
-    [[ -n "$sampler_pid" ]] && { kill "$sampler_pid" 2>/dev/null || true; wait "$sampler_pid" 2>/dev/null || true; sampler_pid=""; }
-    [[ -n "$tmp_file" ]] && { rm -f "$tmp_file" "${tmp_file}.tmp" "${tmp_file}.bar" "${tmp_file}.bar.tmp" "${tmp_file}.meta" "${tmp_file}.meta.tmp" 2>/dev/null || true; tmp_file=""; }
-    ACTIVE_SAMPLER_PID="" ACTIVE_SAMPLER_TMP=""
-    if [[ -n "$saved_tty" ]]; then
-      stty "$saved_tty" 2>/dev/null || stty echo 2>/dev/null || true
-    else
-      stty echo 2>/dev/null || true
-    fi
+    _tui_stop_live_stats_sampler "$sampler_pid" "$tmp_file"
+    sampler_pid="" tmp_file=""
+    _tui_restore_tty "$saved_tty"
   }
   trap '_restore_step_tty; exit 0' INT TERM
 
-  local buf="" ch="" esc_seq="" rc=0 stats_block="" new_lines=""
+  local buf="" ch="" esc_seq="" rc=0
   printf "Select action: "
   while true; do
     rc=0
     IFS= read -rsn1 -t 1 ch || rc=$?
     if (( rc == 0 )); then
       if [[ -z "$ch" ]]; then
-        _restore_step_tty
-        trap - INT TERM
-        printf "\n"
-        _act_out="$buf"
-        return 0
+        _restore_step_tty; trap - INT TERM; printf "\n"
+        _act_out="$buf"; return 0
       elif [[ "$ch" == $'\177' || "$ch" == $'\b' ]]; then
         if [[ -n "$buf" ]]; then
-          buf="${buf%?}"
-          printf "\b \b"
+          buf="${buf%?}"; printf "\b \b"
         fi
       elif [[ "$ch" == $'\e' ]]; then
-        esc_seq=""
-        IFS= read -rsn2 -t 0.01 esc_seq || true
+        _tui_read_esc_seq esc_seq
         if [[ -z "$esc_seq" ]]; then
-          _restore_step_tty
-          trap - INT TERM
-          printf "\n"
-          _act_out="__esc__"
-          return 0
-        fi
-        if [[ "$esc_seq" == \[* || "$esc_seq" == O* ]] && [[ ! "$esc_seq" =~ [A-Za-z~]$ ]]; then
-          local _esc_ch="" _esc_n=0
-          while (( _esc_n++ < 8 )) && IFS= read -rsn1 -t 0.01 _esc_ch; do
-            [[ "$_esc_ch" =~ [A-Za-z~] ]] && break
-          done
+          _restore_step_tty; trap - INT TERM; printf "\n"
+          _act_out="__esc__"; return 0
         fi
       elif [[ -z "$buf" && "$ch" =~ ^[aArRuUhHnNbBiIqQ]$ ]]; then
-        buf="$ch"
-        printf "%s" "$ch"
+        buf="$ch"; printf "%s" "$ch"
       fi
     elif (( rc > 128 )); then
-      local prev_upd="$STRATA_UPDATE_AVAILABLE"
-      load_strata_update_state
-      if [[ "$prev_upd" == false && "$STRATA_UPDATE_AVAILABLE" == true ]]; then
-        local _b_up=$(( lines_up - LIVE_STATS_COUNT - UPDATE_BANNER_OFFSET ))
-        if ! _render_update_banner_inplace "$_b_up" "$term_lines" && [[ -z "$buf" ]]; then
-          _restore_step_tty; trap - INT TERM; printf "\n"
-          _act_out="__refresh__"; return 0
-        fi
-      fi
-      new_lines="$LIVE_STATS_COUNT"
-      [[ -n "$tmp_file" && -s "${tmp_file}.meta" ]] && read -r new_lines < "${tmp_file}.meta" || true
-      if [[ "$compact_bar" == true ]]; then
-        [[ -n "$tmp_file" && -s "${tmp_file}.bar" ]] && _render_live_bar_inplace "$(<"${tmp_file}.bar")"
-      elif [[ "$new_lines" =~ ^[0-9]+$ ]] && (( new_lines != LIVE_STATS_COUNT )); then
-        if [[ -z "$buf" ]]; then
-          _restore_step_tty; trap - INT TERM; printf "\n"
-          _act_out="__refresh__"; return 0
-        fi
-      elif [[ -n "$tmp_file" && -s "$tmp_file" ]]; then
-        stats_block="$(<"$tmp_file")"
-        _render_live_stats_inplace "$lines_up" "$term_lines" "$stats_block"
+      if ! _tui_poll_live_stats_tick "$lines_up" "$term_lines" "$compact_bar" "$tmp_file" "$buf"; then
+        _restore_step_tty; trap - INT TERM; printf "\n"
+        _act_out="__refresh__"; return 0
       fi
     else
-      _restore_step_tty
-      trap - INT TERM
-      printf "\n"
-      exit 0
+      _restore_step_tty; trap - INT TERM; printf "\n"; exit 0
     fi
   done
 }
@@ -11181,13 +10986,7 @@ read_choice_with_live_stats() {
   saved_tty="$(stty -g 2>/dev/null || true)"
   stty -echo 2>/dev/null || true
 
-  _restore_index_tty() {
-    if [[ -n "$saved_tty" ]]; then
-      stty "$saved_tty" 2>/dev/null || stty echo 2>/dev/null || true
-    else
-      stty echo 2>/dev/null || true
-    fi
-  }
+  _restore_index_tty() { _tui_restore_tty "$saved_tty"; }
   trap '_restore_index_tty; exit 0' INT TERM
 
   local buf="" ch="" rc=0 init_upd="$STRATA_UPDATE_AVAILABLE"
@@ -11209,19 +11008,13 @@ read_choice_with_live_stats() {
         fi
       elif [[ "$ch" == $'\e' ]]; then
         local esc_seq=""
-        IFS= read -rsn2 -t 0.01 esc_seq || true
+        _tui_read_esc_seq esc_seq
         if [[ -z "$esc_seq" && -n "$buf" ]]; then
           while [[ -n "$buf" ]]; do
             buf="${buf%?}"
             printf "\b \b"
           done
           continue
-        fi
-        if [[ "$esc_seq" == \[* || "$esc_seq" == O* ]] && [[ ! "$esc_seq" =~ [A-Za-z~]$ ]]; then
-          local _esc_ch="" _esc_n=0
-          while (( _esc_n++ < 8 )) && IFS= read -rsn1 -t 0.01 _esc_ch; do
-            [[ "$_esc_ch" =~ [A-Za-z~] ]] && break
-          done
         fi
         local n_opt="${#ACTIVE_STEPS[@]}"
         local total_rows=$(( 2 + n_opt ))
@@ -11504,14 +11297,9 @@ read_strata_page_choice() {
   stty -echo 2>/dev/null || true
 
   _cleanup_strata_tty() {
-    [[ -n "$poller_pid" ]] && { kill "$poller_pid" 2>/dev/null || true; wait "$poller_pid" 2>/dev/null || true; poller_pid=""; }
-    [[ -n "$tmp_file" ]] && { rm -f "$tmp_file" "${tmp_file}.tmp" 2>/dev/null || true; tmp_file=""; }
-    ACTIVE_SAMPLER_PID="" ACTIVE_SAMPLER_TMP=""
-    if [[ -n "$saved_tty" ]]; then
-      stty "$saved_tty" 2>/dev/null || stty echo 2>/dev/null || true
-    else
-      stty echo 2>/dev/null || true
-    fi
+    _tui_stop_live_stats_sampler "$poller_pid" "$tmp_file"
+    poller_pid="" tmp_file=""
+    _tui_restore_tty "$saved_tty"
   }
   trap '_cleanup_strata_tty; exit 0' INT TERM
 
@@ -11534,7 +11322,7 @@ read_strata_page_choice() {
         fi
       elif [[ "$ch" == $'\e' ]]; then
         local esc_seq=""
-        IFS= read -rsn2 -t 0.01 esc_seq || true
+        _tui_read_esc_seq esc_seq
         if [[ -z "$esc_seq" ]]; then
           if [[ -n "$buf" ]]; then
             while [[ -n "$buf" ]]; do
@@ -11548,12 +11336,6 @@ read_strata_page_choice() {
           printf "\n"
           _out_var="__esc__"
           return 0
-        fi
-        if [[ "$esc_seq" == \[* || "$esc_seq" == O* ]] && [[ ! "$esc_seq" =~ [A-Za-z~]$ ]]; then
-          local _esc_ch="" _esc_n=0
-          while (( _esc_n++ < 8 )) && IFS= read -rsn1 -t 0.01 _esc_ch; do
-            [[ "$_esc_ch" =~ [A-Za-z~] ]] && break
-          done
         fi
         if (( footer_lines > 0 && n_str > 0 )); then
           local old_idx="$STRATA_PAGE_SELECTED" new_idx="$STRATA_PAGE_SELECTED"
@@ -11894,7 +11676,7 @@ cleanup_all_on_exit() {
     ACTIVE_SAMPLER_PID=""
   fi
   if [[ -n "$ACTIVE_SAMPLER_TMP" ]]; then
-    rm -f "$ACTIVE_SAMPLER_TMP" "${ACTIVE_SAMPLER_TMP}.tmp" "${ACTIVE_SAMPLER_TMP}.meta" "${ACTIVE_SAMPLER_TMP}.meta.tmp" 2>/dev/null || true
+    rm -f "$ACTIVE_SAMPLER_TMP" "${ACTIVE_SAMPLER_TMP}.tmp" "${ACTIVE_SAMPLER_TMP}.bar" "${ACTIVE_SAMPLER_TMP}.bar.tmp" "${ACTIVE_SAMPLER_TMP}.meta" "${ACTIVE_SAMPLER_TMP}.meta.tmp" 2>/dev/null || true
     ACTIVE_SAMPLER_TMP=""
   fi
   if [[ -t 1 ]]; then
@@ -11935,7 +11717,7 @@ is_step_managed_by_wizard() {
     intel_gpu_perf)      service_installed strata-intel-gpu-perf.service ;;
     nvidia_persistenced) unit_exists nvidia-persistenced.service || service_installed strata-nvidia-persistenced.service ;;
     cstate_limit)        service_installed strata-cstate-limit.service ;;
-    pcie_aspm)           [[ -f /etc/udev/rules.d/99-strata-pcie-aspm.rules ]] || grep -q "pcie_aspm=off" /proc/cmdline 2>/dev/null ;;
+    pcie_aspm)           service_installed strata-pcie-aspm.service || has_kernel_param "pcie_aspm.policy=performance" ;;
     macos_wired_limit)   service_installed strata-macos-wired-limit.service ;;
     *)                   return 0 ;;
   esac
@@ -12130,55 +11912,57 @@ show_check_page() {
   done
 }
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --check) CHECK_ONLY=true ;;
-    --strata-api-key)
-      if [[ $# -lt 2 || -z "${2:-}" ]]; then
-        echo "Error: --strata-api-key requires a non-empty value." >&2
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --check) CHECK_ONLY=true ;;
+      --strata-api-key)
+        if [[ $# -lt 2 || -z "${2:-}" ]]; then
+          echo "Error: --strata-api-key requires a non-empty value." >&2
+          usage >&2
+          exit 2
+        fi
+        STRATA_API_KEY="$2"
+        export STRATA_API_KEY
+        shift
+        ;;
+      --strata-api-key=*)
+        STRATA_API_KEY="${1#*=}"
+        if [[ -z "$STRATA_API_KEY" ]]; then
+          echo "Error: --strata-api-key requires a non-empty value." >&2
+          usage >&2
+          exit 2
+        fi
+        export STRATA_API_KEY
+        ;;
+      -h|--help) usage; exit 0 ;;
+      *)
+        echo "Unknown option: $1" >&2
         usage >&2
         exit 2
-      fi
-      STRATA_API_KEY="$2"
-      export STRATA_API_KEY
-      shift
-      ;;
-    --strata-api-key=*)
-      STRATA_API_KEY="${1#*=}"
-      if [[ -z "$STRATA_API_KEY" ]]; then
-        echo "Error: --strata-api-key requires a non-empty value." >&2
-        usage >&2
-        exit 2
-      fi
-      export STRATA_API_KEY
-      ;;
-    -h|--help) usage; exit 0 ;;
-    *)
-      echo "Unknown option: $1" >&2
-      usage >&2
-      exit 2
-      ;;
-  esac
-  shift
-done
+        ;;
+    esac
+    shift
+  done
 
-trap 'cleanup_all_on_exit' EXIT
-if [[ "$CHECK_ONLY" == true ]]; then
-  detect_environment
-  run_check_mode
-  exit 0
-fi
-
-if [[ $EUID -ne 0 && -t 0 ]] && command -v sudo >/dev/null 2>&1 && ! sudo -n true >/dev/null 2>&1; then
-  if [[ "$IS_MACOS" == true ]]; then
-    echo -e "${C_DIM}Sudo access is used for hardware sensors (powermetrics GPU/CPU power) and applying optimizations.${C_RESET}"
-  else
-    echo -e "${C_DIM}Sudo access is used for hardware sensors (RAPL CPU power, DMI RAM info) and applying optimizations.${C_RESET}"
+  trap 'cleanup_all_on_exit' EXIT
+  if [[ "$CHECK_ONLY" == true ]]; then
+    detect_environment
+    run_check_mode
+    exit 0
   fi
-  sudo -v || true
+
+  if [[ $EUID -ne 0 && -t 0 ]] && command -v sudo >/dev/null 2>&1 && ! sudo -n true >/dev/null 2>&1; then
+    if [[ "$IS_MACOS" == true ]]; then
+      echo -e "${C_DIM}Sudo access is used for hardware sensors (powermetrics GPU/CPU power) and applying optimizations.${C_RESET}"
+    else
+      echo -e "${C_DIM}Sudo access is used for hardware sensors (RAPL CPU power, DMI RAM info) and applying optimizations.${C_RESET}"
+    fi
+    sudo -v || true
+  fi
+  detect_platform_basics
+  ensure_script_tools
+  detect_environment
+  start_strata_update_poller
+  show_index
 fi
-detect_platform_basics
-ensure_script_tools
-detect_environment
-start_strata_update_poller
-show_index
