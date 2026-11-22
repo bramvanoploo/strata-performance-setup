@@ -154,6 +154,17 @@ ACTIVE_SAMPLER_PID="" ACTIVE_SAMPLER_TMP=""
 STRATA_UPDATE_AVAILABLE=false STRATA_UPDATE_SUMMARY="" STRATA_UPDATE_CACHE_FILE="" STRATA_POLLER_PID=""
 UNIT_FILES_CACHE=""
 declare -A PKG_AVAIL_CACHE PKG_INST_CACHE
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_VERSION="1.9.0"
+PLUGIN_BASE_URL="${STRATA_PLUGIN_BASE_URL:-https://raw.githubusercontent.com/bramvanoploo/strata-performance-setup/main}"
+PLUGIN_CACHE_DIR="${STRATA_PLUGIN_CACHE_DIR:-${XDG_CACHE_HOME:-$TARGET_HOME/.cache}/strata-performance-setup/plugins}"
+NO_PLUGINS=false
+REGISTRY_FETCHED=false
+declare -a REQUESTED_HOST_PLUGINS=() LOADED_HOST_PLUGINS=() LOADED_TWEAK_PACKS=() AVAILABLE_HOST_PLUGINS=("strata")
+declare -A HOST_PLUGIN_LOADED=() TWEAK_PACK_LOADED=()
+declare -A HOST_PLUGIN_NAMES=([strata]="Strata")
+declare -A HOST_PLUGIN_DESCS=([strata]="Install, update, launch, and benchmark Strata LLM server")
+declare -A TWEAK_REGISTERED=() STEP_TIER=() STEP_OS=() STEP_LAPTOP_REC=() STEP_VM_SUPPORTED=() STEP_EXP_NON_ARCH=()
 
 # ------------------------------------------------------------------------------
 # Core Helpers (Privileges, Packages, Services, Bootloader)
@@ -1232,67 +1243,6 @@ _docker_ro() {
   fi
 }
 
-refresh_strata_bin() {
-  if command -v strata >/dev/null 2>&1; then STRATA_BIN="$(command -v strata)"
-  elif [[ -x "$TARGET_HOME/.local/bin/strata" ]]; then STRATA_BIN="$TARGET_HOME/.local/bin/strata"
-  elif [[ -x "/opt/homebrew/bin/strata" ]]; then STRATA_BIN="/opt/homebrew/bin/strata"
-  elif [[ -x "/opt/homebrew/sbin/strata" ]]; then STRATA_BIN="/opt/homebrew/sbin/strata"
-  elif [[ -x "/usr/local/bin/strata" ]]; then STRATA_BIN="/usr/local/bin/strata"
-  else STRATA_BIN=""; fi
-
-  if [[ -n "$STRATA_BIN" ]]; then
-    local raw_ver
-    raw_ver="$(run_as_user_exec "$STRATA_BIN" --version 2>/dev/null | head -n1 || true)"
-    if [[ -n "$raw_ver" ]]; then
-      STRATA_VERSION="$(sed -E 's/^strata[[:space:]]+//; s/; python [^)]*//g' <<< "$raw_ver")"
-    else
-      STRATA_VERSION="installed (${STRATA_BIN})"
-    fi
-  else
-    STRATA_VERSION=""
-  fi
-  STRATA_DOCKER_CONTAINER=""
-  STRATA_DOCKER_IMAGE=""
-  if [[ -z "$STRATA_BIN" ]]; then
-    local _dc_line=""
-    _dc_line="$(_docker_ro ps --format '{{.Names}}|{{.Image}}' | awk -F'|' 'tolower($2) ~ /(^|[\/_-])strata(:|@|$)/ {print $1 "|" $2; exit}' || true)"
-    if [[ -n "$_dc_line" ]]; then
-      IFS='|' read -r STRATA_DOCKER_CONTAINER STRATA_DOCKER_IMAGE <<< "$_dc_line"
-    fi
-  fi
-}
-
-refresh_strata_running() {
-  STRATA_RUNNING_PRESET=""
-  STRATA_RUNNING_URL=""
-  [[ -n "$STRATA_BIN" ]] || return 0
-  local st_json parsed=""
-  st_json="$(run_as_user_exec "$STRATA_BIN" launch --status --output json 2>/dev/null || true)"
-  if [[ -n "$st_json" ]] && has_working_python3; then
-    parsed="$(python3 -c '
-import json, sys
-for line in sys.stdin:
-    line = line.strip()
-    if not line.startswith("{"):
-        continue
-    try:
-        d = json.loads(line)
-    except Exception:
-        continue
-    running = d.get("running") or []
-    if running and isinstance(running[0], dict):
-        r = running[0]
-        nm = str(r.get("name") or "").replace("|", "/").replace("\n", " ")
-        ur = str(r.get("url") or "").replace("|", "").replace("\n", "")
-        print(nm + "|" + ur)
-    break
-' <<< "$st_json" 2>/dev/null || true)"
-    if [[ -n "$parsed" ]]; then
-      IFS='|' read -r STRATA_RUNNING_PRESET STRATA_RUNNING_URL <<< "$parsed"
-    fi
-  fi
-}
-
 detect_jetson_platform() {
   IS_JETSON=false IS_JETSON_TX2=false IS_JETSON_XAVIER=false IS_JETSON_ORIN=false IS_JETSON_THOR=false
   JETSON_MODEL="" JETSON_L4T_REL="" JETSON_SOC=""
@@ -2032,7 +1982,9 @@ detect_environment() {
     if command -v pmset >/dev/null 2>&1 && pmset -g 2>/dev/null | grep -qiE '(^|[[:space:]])powermode[[:space:]]'; then
       MACOS_POWER_MODE_SUPPORTED=true
     fi
+  if declare -F refresh_strata_bin >/dev/null 2>&1; then
     refresh_strata_bin
+  fi
     return 0
   fi
 
@@ -2339,7 +2291,7 @@ detect_environment() {
     HAS_MSI_EC=true
   fi
   [[ -f /sys/module/pcie_aspm/parameters/policy ]] && HAS_ASPM=true
-  refresh_strata_bin
+  declare -F refresh_strata_bin >/dev/null 2>&1 && refresh_strata_bin
 }
 
 # ------------------------------------------------------------------------------
@@ -2845,32 +2797,269 @@ append_gpu_pcie_lines() {
 }
 
 # ------------------------------------------------------------------------------
-# Step Registry
+# Plugin Loader & Registration API
 # ------------------------------------------------------------------------------
-ALL_STEPS=(
-  nvidia_fabricmanager gpu_unlock amd_apu_memory amd_cwsr_disable macos_wired_limit
-  nvidia_mig_disable nvidia_sm70_table nvidia_pstate
-  gpu_groups intel_compute_stack lact_overclock jetson_perf jetson_fan
-  nvidia_power_limit amd_gpu_perf intel_gpu_perf ryzenadj_tdp nvidia_ecc nvidia_compute_mode
-  nvidia_power_cap pcie_acs_disable amd_instinct_partition
-  macos_power_mode macos_spotlight_exclude macos_metal_tuning
-  headless_target numactl_interleave amd_x3d_mode intel_rapl msi_cooling lenovo_legion
-  asus_perf dell_thermal system76_perf tuxedo_perf apple_smc_cooling acpi_platform_profile intel_pcore_pinning zram_swap numa_balancing
-  sysctl_tuning memlock_realtime nvme_tuning
-  nvidia_persistenced nvidia_powerd intel_thermald iommu_pt scx_scheduler
-  net_tuning irq_balance
-  prevent_sleep hugepages_1g
-  cpu_performance cstate_limit pcie_aspm nvidia_clock_lock tuned_profile
-)
-ACTIVE_STEPS=()
+_sha256_file() {
+  local f="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$f" 2>/dev/null | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$f" 2>/dev/null | awk '{print $1}'
+  elif has_working_python3; then
+    python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$f" 2>/dev/null
+  else
+    return 1
+  fi
+}
 
-VM_HIDDEN_STEPS=" nvidia_fabricmanager pcie_acs_disable amd_instinct_partition msi_cooling acpi_platform_profile asus_perf dell_thermal lenovo_legion system76_perf tuxedo_perf apple_smc_cooling cpu_performance cstate_limit pcie_aspm ryzenadj_tdp intel_rapl intel_thermald amd_x3d_mode intel_pcore_pinning tuned_profile jetson_perf jetson_fan macos_wired_limit macos_power_mode "
-MACOS_ALLOWED_STEPS=" macos_wired_limit macos_power_mode macos_spotlight_exclude macos_metal_tuning prevent_sleep "
+_fetch_url() {
+  local url="$1" dest="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" -o "$dest" 2>/dev/null
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$dest" "$url" 2>/dev/null
+  else
+    return 1
+  fi
+}
+
+_registry_file() {
+  local local_reg="${SCRIPT_DIR}/plugins/registry.tsv"
+  if [[ -f "$local_reg" ]]; then
+    echo "$local_reg"
+    return 0
+  fi
+  local cached_reg="${PLUGIN_CACHE_DIR}/registry.tsv"
+  if [[ "$REGISTRY_FETCHED" != true ]]; then
+    REGISTRY_FETCHED=true
+    mkdir -p "$PLUGIN_CACHE_DIR" 2>/dev/null || true
+    local tmp_reg="${cached_reg}.tmp.$$"
+    if _fetch_url "${PLUGIN_BASE_URL}/plugins/registry.tsv" "$tmp_reg"; then
+      mv -f "$tmp_reg" "$cached_reg" 2>/dev/null || rm -f "$tmp_reg"
+    else
+      rm -f "$tmp_reg"
+    fi
+  fi
+  [[ -f "$cached_reg" ]] && echo "$cached_reg"
+}
+
+_registry_sha256() {
+  local category="$1" id="$2" reg=""
+  reg="$(_registry_file || true)"
+  [[ -n "$reg" && -f "$reg" ]] || return 0
+  awk -F'\t' -v c="$category" -v i="$id" '$1==c && $2==i {print $6; exit}' "$reg" 2>/dev/null || true
+}
+
+discover_host_plugins() {
+  local f id name desc reg=""
+  if [[ -d "${SCRIPT_DIR}/plugins/hosts" ]]; then
+    for f in "${SCRIPT_DIR}/plugins/hosts/"*.sh; do
+      [[ -f "$f" ]] || continue
+      id="$(basename "$f" .sh)"
+      [[ "$id" == _* ]] && continue
+      if ! _array_contains_val "$id" "${AVAILABLE_HOST_PLUGINS[@]}"; then
+        AVAILABLE_HOST_PLUGINS+=("$id")
+      fi
+      if [[ -z "${HOST_PLUGIN_NAMES[$id]:-}" ]]; then
+        name="$(awk -F': ' '/^# PLUGIN_NAME:/ {print $2; exit}' "$f" 2>/dev/null || true)"
+        HOST_PLUGIN_NAMES[$id]="${name:-$id}"
+      fi
+      if [[ -z "${HOST_PLUGIN_DESCS[$id]:-}" ]]; then
+        desc="$(awk -F': ' '/^# PLUGIN_DESC:/ {print $2; exit}' "$f" 2>/dev/null || true)"
+        HOST_PLUGIN_DESCS[$id]="${desc:-LLM host plugin}"
+      fi
+    done
+  fi
+  reg="$(_registry_file || true)"
+  if [[ -n "$reg" && -f "$reg" ]]; then
+    while IFS=$'\t' read -r cat pid pname pdesc _pfile _psha; do
+      [[ "$cat" == "hosts" && -n "$pid" && "$pid" != _* ]] || continue
+      if ! _array_contains_val "$pid" "${AVAILABLE_HOST_PLUGINS[@]}"; then
+        AVAILABLE_HOST_PLUGINS+=("$pid")
+      fi
+      [[ -n "$pname" ]] && HOST_PLUGIN_NAMES[$pid]="$pname"
+      [[ -n "$pdesc" ]] && HOST_PLUGIN_DESCS[$pid]="$pdesc"
+    done < "$reg"
+  fi
+}
+
+register_host_plugin() {
+  local id="" name="" desc=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --id) id="$2"; shift 2 ;;
+      --name) name="$2"; shift 2 ;;
+      --description|--desc) desc="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [[ -n "$id" ]] || return 1
+  if ! _array_contains_val "$id" "${AVAILABLE_HOST_PLUGINS[@]}"; then
+    AVAILABLE_HOST_PLUGINS+=("$id")
+  fi
+  [[ -n "$name" ]] && HOST_PLUGIN_NAMES[$id]="$name"
+  [[ -n "$desc" ]] && HOST_PLUGIN_DESCS[$id]="$desc"
+}
+
+register_tweak() {
+  local id="" stars="3" tier="recommended" os="linux" laptop_rec="true" vm_sup="true" exp_non_arch="false"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --id) id="$2"; shift 2 ;;
+      --stars) stars="$2"; shift 2 ;;
+      --tier) tier="$2"; shift 2 ;;
+      --os) os="$2"; shift 2 ;;
+      --laptop-recommended) laptop_rec="$2"; shift 2 ;;
+      --vm-supported) vm_sup="$2"; shift 2 ;;
+      --experimental-non-arch) exp_non_arch="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [[ -n "$id" ]] || return 1
+  if [[ -z "${TWEAK_REGISTERED[$id]:-}" ]]; then
+    ALL_STEPS+=("$id")
+    TWEAK_REGISTERED[$id]=1
+  fi
+  STEP_GAIN_PTS[$id]="$stars"
+  STEP_TIER[$id]="$tier"
+  STEP_OS[$id]="$os"
+  STEP_LAPTOP_REC[$id]="$laptop_rec"
+  STEP_VM_SUPPORTED[$id]="$vm_sup"
+  STEP_EXP_NON_ARCH[$id]="$exp_non_arch"
+}
+
+load_plugin() {
+  local category="$1" id="$2"
+  if [[ "$category" == "hosts" && -n "${HOST_PLUGIN_LOADED[$id]:-}" ]]; then
+    return 0
+  elif [[ "$category" == "tweaks" && -n "${TWEAK_PACK_LOADED[$id]:-}" ]]; then
+    return 0
+  fi
+
+  local local_file="${SCRIPT_DIR}/plugins/${category}/${id}.sh"
+  local cache_file="${PLUGIN_CACHE_DIR}/${category}/${id}.sh"
+  local target_file="" expected_sha="" actual_sha=""
+
+  if [[ -f "$local_file" ]]; then
+    target_file="$local_file"
+  else
+    expected_sha="$(_registry_sha256 "$category" "$id")"
+    if [[ -f "$cache_file" ]]; then
+      if [[ -z "$expected_sha" ]]; then
+        target_file="$cache_file"
+      else
+        actual_sha="$(_sha256_file "$cache_file" || true)"
+        [[ "$actual_sha" == "$expected_sha" ]] && target_file="$cache_file"
+      fi
+    fi
+    if [[ -z "$target_file" ]]; then
+      mkdir -p "${PLUGIN_CACHE_DIR}/${category}" 2>/dev/null || return 1
+      local tmp_file="${cache_file}.tmp.$$"
+      if ! _fetch_url "${PLUGIN_BASE_URL}/plugins/${category}/${id}.sh" "$tmp_file"; then
+        rm -f "$tmp_file"
+        return 1
+      fi
+      if [[ -n "$expected_sha" ]]; then
+        actual_sha="$(_sha256_file "$tmp_file" || true)"
+        if [[ "$actual_sha" != "$expected_sha" ]]; then
+          rm -f "$tmp_file"
+          echo -e "${C_RED}Checksum mismatch for plugin ${category}/${id}.sh — refusing to load.${C_RESET}" >&2
+          return 1
+        fi
+      fi
+      mv -f "$tmp_file" "$cache_file"
+      target_file="$cache_file"
+    fi
+  fi
+
+  # shellcheck source=/dev/null
+  source "$target_file"
+  if [[ "$category" == "hosts" ]]; then
+    HOST_PLUGIN_LOADED[$id]=1
+    LOADED_HOST_PLUGINS+=("$id")
+    if declare -F "${id}_init" >/dev/null 2>&1; then
+      "${id}_init"
+    fi
+  else
+    TWEAK_PACK_LOADED[$id]=1
+    LOADED_TWEAK_PACKS+=("$id")
+  fi
+}
+
+load_applicable_tweak_packs() {
+  [[ "$NO_PLUGINS" == true ]] && return 0
+  load_plugin tweaks common || true
+  if [[ "$IS_MACOS" == true ]]; then
+    load_plugin tweaks macos || true
+    return 0
+  fi
+  load_plugin tweaks linux-core || true
+  if [[ "$IS_LAPTOP" == true || "$IS_APPLE_LINUX" == true ]]; then
+    load_plugin tweaks linux-laptop || true
+  fi
+  if [[ "$HAS_NVIDIA" == true ]]; then
+    load_plugin tweaks nvidia || true
+  fi
+  if [[ "$HAS_AMD" == true || "${CPU_SUMMARY:-}" == *AMD* || "${CPU_SUMMARY:-}" == *Ryzen* || "${CPU_SUMMARY:-}" == *EPYC* ]]; then
+    load_plugin tweaks amd || true
+  fi
+  if [[ "$HAS_INTEL_GPU" == true || "${CPU_SUMMARY:-}" == *Intel* || -d /sys/class/powercap/intel-rapl ]]; then
+    load_plugin tweaks intel || true
+  fi
+  if [[ "$IS_JETSON" == true ]]; then
+    load_plugin tweaks jetson || true
+  fi
+}
+
+load_all_local_plugins() {
+  local f id
+  if [[ -d "${SCRIPT_DIR}/plugins/tweaks" ]]; then
+    for f in "${SCRIPT_DIR}/plugins/tweaks/"*.sh; do
+      [[ -f "$f" ]] || continue
+      id="$(basename "$f" .sh)"
+      [[ "$id" == _* ]] && continue
+      load_plugin tweaks "$id" || true
+    done
+  fi
+  if [[ -d "${SCRIPT_DIR}/plugins/hosts" ]]; then
+    for f in "${SCRIPT_DIR}/plugins/hosts/"*.sh; do
+      [[ -f "$f" ]] || continue
+      id="$(basename "$f" .sh)"
+      [[ "$id" == _* ]] && continue
+      load_plugin hosts "$id" || true
+    done
+  fi
+}
+
+run_host_hook() {
+  local hook="$1"; shift
+  local pid
+  for pid in "${LOADED_HOST_PLUGINS[@]}"; do
+    if declare -F "${pid}_${hook}" >/dev/null 2>&1; then
+      "${pid}_${hook}" "$@"
+    fi
+  done
+}
+
+# ------------------------------------------------------------------------------
+# Step Registry (populated dynamically by register_tweak)
+# ------------------------------------------------------------------------------
+ALL_STEPS=()
+ACTIVE_STEPS=()
+declare -A STEP_GAIN_PTS=()
+
 build_active_steps() {
-  local step candidates=() pts
+  local step candidates=() pts os_scope
   for step in "${ALL_STEPS[@]}"; do
-    [[ "$IS_MACOS" == true && "$MACOS_ALLOWED_STEPS" != *" $step "* ]] && continue
-    [[ -n "$IS_VIRT" && "$VM_HIDDEN_STEPS" == *" $step "* ]] && continue
+    os_scope="${STEP_OS[$step]:-linux}"
+    if [[ "$IS_MACOS" == true ]]; then
+      [[ "$os_scope" == "macos" || "$os_scope" == "both" ]] || continue
+    else
+      [[ "$os_scope" == "linux" || "$os_scope" == "both" ]] || continue
+    fi
+    if [[ -n "$IS_VIRT" && "${STEP_VM_SUPPORTED[$step]:-true}" == "false" ]]; then
+      continue
+    fi
     "applicable_${step}" && candidates+=("$step")
   done
   ACTIVE_STEPS=()
@@ -2882,25 +3071,19 @@ build_active_steps() {
 }
 
 is_experimental_step() {
-  case "$1" in
-    gpu_unlock) [[ "$DISTRO_FAMILY" != "arch" ]] ;;
-    nvidia_pstate|pcie_acs_disable) return 0 ;;
-    *) return 1 ;;
-  esac
+  if [[ "${STEP_EXP_NON_ARCH[$1]:-false}" == "true" ]]; then
+    [[ "$DISTRO_FAMILY" != "arch" ]]
+    return $?
+  fi
+  [[ "${STEP_TIER[$1]:-recommended}" == "experimental" ]]
 }
 
 is_opt_in_step() {
-  case "$1" in
-    nvidia_power_cap|amd_instinct_partition|hugepages_1g|macos_wired_limit|macos_metal_tuning) return 0 ;;
-    *) return 1 ;;
-  esac
+  [[ "${STEP_TIER[$1]:-recommended}" == "opt_in" ]]
 }
 
 is_high_idle_step() {
-  case "$1" in
-    cpu_performance|pcie_aspm|cstate_limit|nvidia_clock_lock|tuned_profile) return 0 ;;
-    *) return 1 ;;
-  esac
+  [[ "${STEP_TIER[$1]:-recommended}" == "high_idle" ]]
 }
 
 is_recommended_step() {
@@ -2912,12 +3095,7 @@ is_recommended_step() {
 
 is_laptop_recommended_step() {
   is_recommended_step "$1" || return 1
-  case "$1" in
-    prevent_sleep|acpi_platform_profile|msi_cooling|asus_perf|dell_thermal|lenovo_legion|system76_perf|tuxedo_perf|apple_smc_cooling|macos_power_mode|amd_gpu_perf|intel_gpu_perf|nvidia_persistenced|nvidia_fabricmanager|nvidia_mig_disable)
-      return 1 ;;
-    *)
-      return 0 ;;
-  esac
+  [[ "${STEP_LAPTOP_REC[$1]:-true}" == "true" ]]
 }
 
 run_recommended_batch() {
@@ -3058,4086 +3236,6 @@ _pmset_ac_val() {
   printf '%s' "$val"
 }
 
-# 1. Prevent Sleep
-applicable_prevent_sleep() {
-  [[ "$HAS_SYSTEMD" == true ]] || { [[ "$IS_MACOS" == true ]] && command -v pmset >/dev/null 2>&1; }
-}
-title_prevent_sleep() {
-  if [[ "$IS_MACOS" == true ]]; then
-    echo "Disable System Sleep & Idle Suspend (pmset Server Uptime)"
-  else
-    echo "Disable System Sleep & Lid-Close Suspend (Server Uptime)"
-  fi
-}
-status_prevent_sleep() {
-  if [[ "$IS_MACOS" == true ]]; then
-    [[ -f "$MACOS_NOSLEEP_MARKER" ]] || return 1
-    local _slp _sd
-    _slp="$(_pmset_ac_val sleep || true)"
-    _sd="$(pmset -g 2>/dev/null | awk '$1 == "SleepDisabled" {print $2; exit}')"
-    [[ "$_slp" == "0" || "$_sd" == "1" ]]
-    return $?
-  fi
-  [[ "$(systemctl is-enabled sleep.target 2>/dev/null || true)" == "masked" ]]
-}
-explain_prevent_sleep() {
-  if [[ "$IS_MACOS" == true ]]; then
-    cat <<'EOF'
-Impact:
-  Configures pmset so the Mac does not enter idle sleep, standby, autopoweroff,
-  or Power Nap while serving Strata (on MacBooks, scoped to AC power; optionally
-  disables sleep completely for closed-clamshell server operation).
-  Previous pmset values are saved and restored cleanly on revert.
-EOF
-  else
-    cat <<'EOF'
-Impact:
-  Masks systemd sleep/suspend/hibernate targets and ignores lid-close events
-  on laptops so long-running Strata inference is never interrupted.
-EOF
-  fi
-}
-apply_prevent_sleep() {
-  if [[ "$IS_MACOS" == true ]]; then
-    local scope="-a" k v prev_lines=""
-    [[ "$IS_LAPTOP" == true ]] && scope="-c"
-    if [[ -r "$MACOS_NOSLEEP_MARKER" ]]; then
-      prev_lines="$(grep -v '^disablesleep_set=' "$MACOS_NOSLEEP_MARKER" 2>/dev/null || true)"
-      [[ -n "$prev_lines" ]] && prev_lines+=$'\n'
-    fi
-    if [[ -z "$prev_lines" ]]; then
-      prev_lines+="scope=${scope}"$'\n'
-      for k in sleep standby autopoweroff powernap; do
-        v="$(_pmset_ac_val "$k" || true)"
-        [[ "$v" =~ ^[0-9]+$ ]] && prev_lines+="${k}=${v}"$'\n'
-      done
-      local sd_prev=""
-      sd_prev="$(pmset -g 2>/dev/null | awk '$1 == "SleepDisabled" {print $2; exit}')"
-      [[ "$sd_prev" =~ ^[0-9]+$ ]] && prev_lines+="SleepDisabled=${sd_prev}"$'\n'
-    fi
-    if ! run_root pmset "$scope" sleep 0 standby 0 autopoweroff 0 powernap 0; then
-      echo -e "${C_RED}Failed to update pmset sleep settings.${C_RESET}"
-      return 1
-    fi
-    run_root mkdir -p "$MACOS_SUPPORT_DIR"
-    printf '%s' "$prev_lines" | run_root tee "$MACOS_NOSLEEP_MARKER" >/dev/null
-    if [[ "$IS_LAPTOP" == true ]] && confirm_yn "Also disable sleep completely when closed/on lid-close (pmset -a disablesleep 1)? [y/N]: " "N"; then
-      run_root pmset -a disablesleep 1
-      echo "disablesleep_set=1" | run_root tee -a "$MACOS_NOSLEEP_MARKER" >/dev/null
-    fi
-    return 0
-  fi
-  run_root systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
-  if [[ "$IS_LAPTOP" == true ]]; then
-    run_root mkdir -p /etc/systemd/logind.conf.d
-    run_root tee /etc/systemd/logind.conf.d/99-strata-nosleep.conf >/dev/null <<'EOF'
-[Login]
-HandleLidSwitch=ignore
-HandleLidSwitchExternalPower=ignore
-HandleLidSwitchDocked=ignore
-IdleAction=ignore
-EOF
-    run_root systemctl reload-or-restart systemd-logind || true
-  fi
-}
-revert_prevent_sleep() {
-  if [[ "$IS_MACOS" == true ]]; then
-    local scope="-a" line k v had_disablesleep=false
-    [[ "$IS_LAPTOP" == true ]] && scope="-c"
-    if [[ -r "$MACOS_NOSLEEP_MARKER" ]]; then
-      while IFS='=' read -r k v; do
-        case "$k" in
-          scope) [[ -n "$v" ]] && scope="$v" ;;
-          sleep|standby|autopoweroff|powernap)
-            [[ "$v" =~ ^[0-9]+$ ]] && run_root pmset "$scope" "$k" "$v" 2>/dev/null || true
-            ;;
-          SleepDisabled)
-            [[ "$v" =~ ^[0-9]+$ ]] && run_root pmset -a disablesleep "$v" 2>/dev/null || true
-            ;;
-          disablesleep_set) [[ "$v" == "1" ]] && had_disablesleep=true ;;
-        esac
-      done < "$MACOS_NOSLEEP_MARKER"
-      [[ "$had_disablesleep" == true ]] && run_root pmset -a disablesleep 0 2>/dev/null || true
-      run_root rm -f "$MACOS_NOSLEEP_MARKER"
-    else
-      run_root pmset -a disablesleep 0 2>/dev/null || true
-      run_root pmset "$scope" sleep 10 standby 1 autopoweroff 1 powernap 1 2>/dev/null || true
-    fi
-    return 0
-  fi
-  run_root systemctl unmask sleep.target suspend.target hibernate.target hybrid-sleep.target
-  if [[ -f /etc/systemd/logind.conf.d/99-strata-nosleep.conf ]]; then
-    run_root rm -f /etc/systemd/logind.conf.d/99-strata-nosleep.conf
-    run_root systemctl reload-or-restart systemd-logind || true
-  fi
-}
-
-# 3. MSI EC Cooling
-applicable_msi_cooling() {
-  [[ "$HAS_MSI_EC" == true ]] || return 1
-  [[ -d /sys/devices/platform/msi-ec ]] && return 0
-  [[ "$DISTRO_FAMILY" == "arch" ]] && (pkg_available repo msi-ec-dkms-git || pkg_available aur msi-ec-dkms-git)
-}
-title_msi_cooling() { echo "MSI EC Gaming/Turbo Mode & Aggressive Cooling (msi-ec / Cooler Boost)"; }
-status_msi_cooling() { service_installed msi-gaming-cooling.service && unit_enabled msi-gaming-cooling.service; }
-explain_msi_cooling() {
-  cat <<'EOF'
-Impact:
-  Configures msi-ec + ec_sys and creates a persistent service setting
-  shift_mode=turbo, fan_mode=advanced, and optionally cooler_boost=on
-  to maximize thermal headroom under sustained GPU/CPU load.
-EOF
-}
-apply_msi_cooling() {
-  if [[ "$DISTRO_FAMILY" == "arch" ]]; then
-    if [[ ! -d /sys/devices/platform/msi-ec ]]; then
-      prompt_install_deps aur msi-ec-dkms-git mcontrolcenter-bin || true
-    elif ! pkg_installed mcontrolcenter-bin; then
-      prompt_install_deps aur mcontrolcenter-bin || true
-    fi
-  fi
-  run_root mkdir -p /etc/modprobe.d
-  echo "options ec_sys write_support=1" | run_root tee /etc/modprobe.d/strata-ec_sys.conf >/dev/null
-  run_root modprobe ec_sys write_support=1 2>/dev/null || true
-  run_root modprobe msi_ec 2>/dev/null || true
-
-  local enable_cb="off"
-  read -r -p "Also force Cooler Boost (max fan speed) at boot? [y/N]: " cb_ans
-  [[ "$cb_ans" =~ ^[Yy]$ ]] && enable_cb="on"
-
-  install_service msi-gaming-cooling.service <<EOF
-[Unit]
-Description=MSI EC Turbo / Gaming Cooling Profile for Strata
-After=multi-user.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/bin/sh -c '[ -w /sys/devices/platform/msi-ec/shift_mode ] && echo turbo > /sys/devices/platform/msi-ec/shift_mode; [ -w /sys/devices/platform/msi-ec/fan_mode ] && echo advanced > /sys/devices/platform/msi-ec/fan_mode; [ -w /sys/devices/platform/msi-ec/cooler_boost ] && echo ${enable_cb} > /sys/devices/platform/msi-ec/cooler_boost || true'
-ExecStop=/bin/sh -c '[ -w /sys/devices/platform/msi-ec/cooler_boost ] && echo off > /sys/devices/platform/msi-ec/cooler_boost; [ -w /sys/devices/platform/msi-ec/shift_mode ] && echo comfort > /sys/devices/platform/msi-ec/shift_mode || true'
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-revert_msi_cooling() {
-  remove_service msi-gaming-cooling.service
-  run_root rm -f /etc/modprobe.d/strata-ec_sys.conf
-  run_root sh -c '[ -w /sys/devices/platform/msi-ec/cooler_boost ] && echo off > /sys/devices/platform/msi-ec/cooler_boost; [ -w /sys/devices/platform/msi-ec/shift_mode ] && echo comfort > /sys/devices/platform/msi-ec/shift_mode' 2>/dev/null || true
-}
-
-# 3b. ACPI Platform Thermal Profile
-applicable_acpi_platform_profile() {
-  [[ -f /sys/firmware/acpi/platform_profile ]] && grep -qw "performance" /sys/firmware/acpi/platform_profile_choices 2>/dev/null
-}
-title_acpi_platform_profile() { echo "ACPI Platform Thermal Profile (performance)"; }
-status_acpi_platform_profile() {
-  [[ "$(cat /sys/firmware/acpi/platform_profile 2>/dev/null)" == "performance" ]] && service_installed strata-acpi-profile.service
-}
-explain_acpi_platform_profile() {
-  cat <<'EOF'
-Impact:
-  Sets /sys/firmware/acpi/platform_profile to 'performance' (supported on
-  ThinkPad, IdeaPad, Legion, ASUS, HP, Dell, Acer, AMD PMF) via systemd.
-EOF
-}
-apply_acpi_platform_profile() {
-  install_service strata-acpi-profile.service <<'EOF'
-[Unit]
-Description=Set ACPI Platform Thermal Profile to Performance for Strata
-After=multi-user.target power-profiles-daemon.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/bin/sh -c 'if command -v powerprofilesctl >/dev/null 2>&1 && systemctl is-active --quiet power-profiles-daemon.service; then powerprofilesctl set performance; elif [ -w /sys/firmware/acpi/platform_profile ]; then echo performance > /sys/firmware/acpi/platform_profile; fi || true'
-ExecStop=/bin/sh -c 'if command -v powerprofilesctl >/dev/null 2>&1 && systemctl is-active --quiet power-profiles-daemon.service; then powerprofilesctl set balanced; elif [ -w /sys/firmware/acpi/platform_profile ]; then echo balanced > /sys/firmware/acpi/platform_profile; fi || true'
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-revert_acpi_platform_profile() {
-  remove_service strata-acpi-profile.service
-  if command -v powerprofilesctl >/dev/null 2>&1 && unit_active power-profiles-daemon.service; then
-    powerprofilesctl set balanced 2>/dev/null || true
-  else
-    run_root sh -c '[ -w /sys/firmware/acpi/platform_profile ] && echo balanced > /sys/firmware/acpi/platform_profile' 2>/dev/null || true
-  fi
-}
-
-# 3c. ASUS
-applicable_asus_perf() {
-  grep -qi "ASUSTeK" <<< "$SYS_VENDOR" && [[ "$IS_LAPTOP" == true ]] || return 1
-  command -v asusctl >/dev/null 2>&1 || pkg_available repo asusctl || pkg_available aur asusctl
-}
-title_asus_perf() { echo "ASUS ROG/TUF Performance Profile (asusctl / asusd)"; }
-status_asus_perf() { command -v asusctl >/dev/null 2>&1 && unit_active asusd.service && grep -qi "Performance" <<< "$(asusctl profile -p 2>/dev/null || true)"; }
-explain_asus_perf() { echo -e "Impact:\n  Enables asusd.service and switches asusctl profile to 'Performance'."; }
-apply_asus_perf() {
-  command -v asusctl >/dev/null 2>&1 || prompt_install_repo_or_aur asusctl || return 0
-  run_root systemctl enable --now asusd.service 2>/dev/null || true
-  asusctl profile -P Performance 2>/dev/null || true
-}
-revert_asus_perf() { command -v asusctl >/dev/null 2>&1 && asusctl profile -P Balanced 2>/dev/null || true; }
-
-# 3d. Dell
-applicable_dell_thermal() {
-  grep -qi "Dell" <<< "$SYS_VENDOR" || return 1
-  # Modern kernels (dell_pc) expose /sys/firmware/acpi/platform_profile and
-  # filter legacy userspace smbios-thermal-ctl SMI calls; prefer acpi_platform_profile.
-  applicable_acpi_platform_profile && return 1
-  command -v smbios-thermal-ctl >/dev/null 2>&1 || pkg_available repo libsmbios || pkg_available repo smbios-utils
-}
-title_dell_thermal() { echo "Dell BIOS Ultra-Performance Thermal Mode (smbios-thermal-ctl)"; }
-status_dell_thermal() { command -v smbios-thermal-ctl >/dev/null 2>&1 && grep -qi "performance" <<< "$(run_root smbios-thermal-ctl -g 2>/dev/null || true)"; }
-explain_dell_thermal() { echo -e "Impact:\n  Sets Dell BIOS thermal management mode to 'performance' via smbios-thermal-ctl."; }
-apply_dell_thermal() {
-  if ! command -v smbios-thermal-ctl >/dev/null 2>&1; then
-    case "$DISTRO_FAMILY" in
-      arch)   prompt_install_deps repo libsmbios || return 0 ;;
-      fedora) prompt_install_deps repo smbios-utils || prompt_install_deps repo libsmbios || return 0 ;;
-      debian) prompt_install_deps repo smbios-utils || return 0 ;;
-      suse)   prompt_install_deps repo smbios-utils-bin || prompt_install_deps repo libsmbios || return 0 ;;
-    esac
-  fi
-  if ! run_root smbios-thermal-ctl --set-thermal-mode=performance; then
-    echo -e "${C_YELLOW}smbios-thermal-ctl failed (kernel may filter SMI calls or SMM mitigations are enabled in BIOS).${C_RESET}"
-  fi
-}
-revert_dell_thermal() { command -v smbios-thermal-ctl >/dev/null 2>&1 && run_root smbios-thermal-ctl --set-thermal-mode=balanced 2>/dev/null || true; }
-
-# 3e. Lenovo Legion
-applicable_lenovo_legion() {
-  grep -qi "LENOVO" <<< "$SYS_VENDOR" && grep -qi "Legion" <<< "$PRODUCT_NAME" || return 1
-  command -v legion_cli >/dev/null 2>&1 || pkg_available repo lenovo-legion || pkg_available aur lenovo-legion-dkms-git
-}
-title_lenovo_legion() { echo "Lenovo Legion Performance & Cooling (LenovoLegionLinux)"; }
-status_lenovo_legion() { unit_enabled legiond.service && unit_active legiond.service; }
-explain_lenovo_legion() { echo -e "Impact:\n  Enables legiond.service for Lenovo Legion custom fan curves and max TDP."; }
-apply_lenovo_legion() {
-  command -v legion_cli >/dev/null 2>&1 || prompt_install_repo_or_aur lenovo-legion || prompt_install_deps aur lenovo-legion-dkms-git || return 0
-  run_root systemctl enable --now legiond.service 2>/dev/null || true
-}
-revert_lenovo_legion() { run_root systemctl disable --now legiond.service 2>/dev/null || true; }
-
-# 3f. System76
-applicable_system76_perf() {
-  grep -qi "System76" <<< "$SYS_VENDOR" || return 1
-  command -v system76-power >/dev/null 2>&1 || pkg_available repo system76-power || pkg_available aur system76-power
-}
-title_system76_perf() { echo "System76 High Performance Profile (system76-power)"; }
-status_system76_perf() { command -v system76-power >/dev/null 2>&1 && unit_active system76-power.service && grep -qi "Performance" <<< "$(system76-power profile 2>/dev/null || true)"; }
-explain_system76_perf() { echo -e "Impact:\n  Enables system76-power.service and sets the active profile to 'Performance'."; }
-apply_system76_perf() {
-  command -v system76-power >/dev/null 2>&1 || prompt_install_repo_or_aur system76-power || return 0
-  run_root systemctl enable --now system76-power.service 2>/dev/null || true
-  run_root system76-power profile performance 2>/dev/null || true
-}
-revert_system76_perf() { command -v system76-power >/dev/null 2>&1 && run_root system76-power profile balanced 2>/dev/null || true; }
-
-# 3g. TUXEDO / Clevo / XMG / Schenker
-applicable_tuxedo_perf() {
-  grep -qiE "TUXEDO|XMG|SCHENKER|CLEVO|TONGFANG" <<< "${SYS_VENDOR} ${PRODUCT_NAME}" || return 1
-  unit_exists tccd.service || pkg_available repo tuxedo-control-center || pkg_available aur tuxedo-control-center-bin
-}
-title_tuxedo_perf() { echo "TUXEDO Control Center Fan & TDP Daemon (tccd)"; }
-status_tuxedo_perf() { unit_enabled tccd.service && unit_active tccd.service; }
-explain_tuxedo_perf() { echo -e "Impact:\n  Enables tccd.service for high-TDP performance and fan profiles on TUXEDO laptops."; }
-apply_tuxedo_perf() {
-  unit_exists tccd.service || prompt_install_repo_or_aur tuxedo-control-center || prompt_install_deps aur tuxedo-control-center-bin || return 0
-  run_root systemctl enable --now tccd.service 2>/dev/null || true
-}
-revert_tuxedo_perf() { run_root systemctl disable --now tccd.service 2>/dev/null || true; }
-
-# 3h. Apple Mac SMC Cooling (Linux on Intel Macs)
-applicable_apple_smc_cooling() {
-  [[ "$IS_MACOS" == false && "$IS_APPLE_LINUX" == true && "$IS_ASAHI_LINUX" == false ]] || return 1
-  [[ "$HAS_APPLESMC" == true ]] && return 0
-  service_installed strata-applesmc-cooling.service && return 0
-  [[ -f "$APPLESMC_MBPFAN_MARKER" ]] && return 0
-  command -v mbpfan >/dev/null 2>&1 || pkg_available repo mbpfan || pkg_available aur mbpfan-git || pkg_available aur mbpfan
-}
-title_apple_smc_cooling() { echo "Apple Mac SMC Cooling & Aggressive Fan Control (mbpfan / applesmc)"; }
-status_apple_smc_cooling() {
-  if service_installed strata-applesmc-cooling.service && unit_enabled strata-applesmc-cooling.service; then
-    return 0
-  fi
-  [[ -f "$APPLESMC_MBPFAN_MARKER" ]] && unit_enabled mbpfan.service && unit_active mbpfan.service
-}
-explain_apple_smc_cooling() {
-  cat <<'EOF'
-Impact:
-  Improves thermal headroom on Intel Macs running Linux (Mac Pro, Mac mini,
-  iMac, MacBook Pro) by configuring either an aggressive mbpfan thermal curve
-  (55C ramp -> 82C max) or direct applesmc manual fan floors via systemd.
-  Reverts cleanly to your previous mbpfan configuration / automatic SMC control.
-EOF
-}
-apply_apple_smc_cooling() {
-  run_root modprobe applesmc 2>/dev/null || true
-  local smc_dir="" has_sysfs_fan=false has_mbpfan=false mode=""
-  smc_dir="$(_applesmc_dir || true)"
-  if [[ -n "$smc_dir" ]] && compgen -G "${smc_dir}/fan*_manual" >/dev/null 2>&1; then
-    has_sysfs_fan=true
-  fi
-  if command -v mbpfan >/dev/null 2>&1 || pkg_available repo mbpfan || pkg_available aur mbpfan-git || pkg_available aur mbpfan; then
-    has_mbpfan=true
-  fi
-  if [[ "$has_mbpfan" == true && "$has_sysfs_fan" == true ]]; then
-    echo "Select Apple Mac cooling control method:"
-    echo "  1) mbpfan aggressive thermal curve (recommended, scales dynamically)"
-    echo "  2) Direct applesmc sysfs fan floor / manual speed"
-    local c_ans=""
-    read -r -p "Choose [1-2, default 1]: " c_ans || true
-    case "${c_ans:-1}" in
-      2) mode="sysfs" ;;
-      1|"") mode="mbpfan" ;;
-      *) echo -e "${C_RED}Invalid selection '${c_ans}'. Cancelled.${C_RESET}"; return 1 ;;
-    esac
-  elif [[ "$has_mbpfan" == true ]]; then
-    mode="mbpfan"
-  elif [[ "$has_sysfs_fan" == true ]]; then
-    mode="sysfs"
-  else
-    echo -e "${C_YELLOW}Neither mbpfan nor writable applesmc fan*_manual sysfs nodes were found.${C_RESET}"
-    return 1
-  fi
-
-  if [[ "$mode" == "mbpfan" ]]; then
-    if ! command -v mbpfan >/dev/null 2>&1; then
-      if pkg_available repo mbpfan; then
-        prompt_install_deps repo mbpfan || return 0
-      elif ! prompt_install_repo_or_aur mbpfan-git && ! prompt_install_repo_or_aur mbpfan; then
-        return 0
-      fi
-    fi
-    service_installed strata-applesmc-cooling.service && remove_service strata-applesmc-cooling.service
-    run_root sh -c 'for d in "'"${STRATA_APPLESMC_DIR:-}"'" /sys/devices/platform/applesmc* /sys/devices/platform/applesmc*/hwmon/hwmon*; do [ -n "$d" ] && [ -d "$d" ] || continue; for m in "$d"/fan*_manual; do [ -w "$m" ] && echo 0 > "$m"; done; done; true' 2>/dev/null || true
-    local was_active=false
-    unit_active mbpfan.service && was_active=true
-    if [[ -f /etc/mbpfan.conf && ! -f /etc/mbpfan.conf.bak.strata-setup ]]; then
-      run_root cp /etc/mbpfan.conf /etc/mbpfan.conf.bak.strata-setup
-    fi
-    echo "was_active=${was_active}" | run_root tee "$APPLESMC_MBPFAN_MARKER" >/dev/null
-    run_root tee /etc/mbpfan.conf >/dev/null <<'EOF'
-# Managed by strata-performance-setup
-[general]
-low_temp = 55
-high_temp = 72
-max_temp = 82
-polling_interval = 1
-EOF
-    if [[ "$HAS_SYSTEMD" == true ]]; then
-      run_root systemctl enable --now mbpfan.service
-      run_root systemctl restart mbpfan.service
-    else
-      local mbp_bin
-      mbp_bin="$(command -v mbpfan || true)"
-      if [[ -n "$mbp_bin" ]]; then
-        install_service strata-applesmc-cooling.service <<EOF
-[Unit]
-Description=Apple Mac mbpfan Cooling Service for Strata
-After=multi-user.target
-
-[Service]
-Type=simple
-ExecStart=${mbp_bin} -f
-
-[Install]
-WantedBy=multi-user.target
-EOF
-      fi
-    fi
-    echo -e "${C_GREEN}Configured aggressive mbpfan cooling profile.${C_RESET}"
-    return 0
-  fi
-
-  local pct=""
-  read -r -p "Target minimum manual fan speed percentage [50-100, default 85]: " pct || true
-  pct="${pct:-85}"
-  if ! [[ "$pct" =~ ^[0-9]+$ ]] || (( pct < 50 || pct > 100 )); then
-    echo -e "${C_RED}Invalid percentage '${pct}' (must be 50-100). Cancelled.${C_RESET}"
-    return 1
-  fi
-  unit_active mbpfan.service && run_root systemctl disable --now mbpfan.service 2>/dev/null || true
-  install_service strata-applesmc-cooling.service <<EOF
-[Unit]
-Description=Apple Mac applesmc Fan Speed Control for Strata (${pct}%)
-After=multi-user.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/bin/sh -c 'modprobe applesmc 2>/dev/null || true; for d in "${STRATA_APPLESMC_DIR:-}" /sys/devices/platform/applesmc* /sys/devices/platform/applesmc*/hwmon/hwmon*; do [ -n "\$d" ] && [ -d "\$d" ] || continue; for m in "\$d"/fan*_manual; do [ -w "\$m" ] || continue; b="\${m%_manual}"; [ -r "\${b}_min" ] && [ -r "\${b}_max" ] && [ -w "\${b}_output" ] || continue; mn=\$(tr -d "[:space:]" < "\${b}_min" 2>/dev/null || echo 0); mx=\$(tr -d "[:space:]" < "\${b}_max" 2>/dev/null || echo 0); case "\$mn:\$mx" in *[!0-9:]*|:|*:|:* ) continue ;; esac; [ "\$mx" -gt "\$mn" ] 2>/dev/null || continue; tgt=\$(( mn + (mx - mn) * ${pct} / 100 )); echo 1 > "\$m"; echo "\$tgt" > "\${b}_output"; done; done; true'
-ExecStop=/bin/sh -c 'for d in "${STRATA_APPLESMC_DIR:-}" /sys/devices/platform/applesmc* /sys/devices/platform/applesmc*/hwmon/hwmon*; do [ -n "\$d" ] && [ -d "\$d" ] || continue; for m in "\$d"/fan*_manual; do [ -w "\$m" ] && echo 0 > "\$m"; done; done; true'
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-revert_apple_smc_cooling() {
-  service_installed strata-applesmc-cooling.service && remove_service strata-applesmc-cooling.service
-  run_root sh -c 'for d in "'"${STRATA_APPLESMC_DIR:-}"'" /sys/devices/platform/applesmc* /sys/devices/platform/applesmc*/hwmon/hwmon*; do [ -n "$d" ] && [ -d "$d" ] || continue; for m in "$d"/fan*_manual; do [ -w "$m" ] && echo 0 > "$m"; done; done; true' 2>/dev/null || true
-  if [[ -f "$APPLESMC_MBPFAN_MARKER" ]]; then
-    local was_active="false"
-    was_active="$(sed -n 's/^was_active=//p' "$APPLESMC_MBPFAN_MARKER" 2>/dev/null | head -n1)"
-    if [[ -f /etc/mbpfan.conf.bak.strata-setup ]]; then
-      run_root mv -f /etc/mbpfan.conf.bak.strata-setup /etc/mbpfan.conf
-    else
-      run_root rm -f /etc/mbpfan.conf
-    fi
-    if [[ "$HAS_SYSTEMD" == true ]]; then
-      if [[ "$was_active" == "true" ]]; then
-        run_root systemctl restart mbpfan.service 2>/dev/null || true
-      else
-        run_root systemctl disable --now mbpfan.service 2>/dev/null || true
-      fi
-    fi
-    run_root rm -f "$APPLESMC_MBPFAN_MARKER"
-  fi
-}
-
-# 4. CPU Performance
-applicable_cpu_performance() { [[ -d /sys/devices/system/cpu/cpu0/cpufreq ]] || command -v powerprofilesctl >/dev/null 2>&1; }
-title_cpu_performance() { echo "CPU Performance Profile & Governor (performance)"; }
-note_cpu_performance() { echo -e "${C_YELLOW}[!]${C_RESET}"; }
-status_cpu_performance() {
-  local gov ppd
-  gov="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || true)"
-  ppd="$(powerprofilesctl get 2>/dev/null || true)"
-  [[ "$gov" == "performance" ]] || (service_installed strata-cpu-perf.service && [[ "$ppd" == "performance" ]])
-}
-explain_cpu_performance() {
-  cat <<'EOF'
-Impact:
-  Sets power-profiles-daemon to 'performance', enables CPU boost, and forces
-  scaling_governor='performance' (slightly faster ramp-up from idle).
-  Also switches amd_pstate / intel_pstate to 'active' mode (when present) so the
-  hardware EPP hint ('performance') is honored.
-EOF
-  echo -e "\n${C_YELLOW}[WARNING] Enabling this option increases idle power consumption (often +5-10W)${C_RESET}"
-  echo -e "${C_YELLOW}          and hardly provides any sustained performance gains over 'powersave'${C_RESET}"
-  echo -e "${C_YELLOW}          when EPP (energy_performance_preference) is already 'performance'.${C_RESET}"
-}
-apply_cpu_performance() {
-  if unit_active tlp.service || unit_active auto-cpufreq.service; then
-    echo -e "${C_YELLOW}TLP/auto-cpufreq is active and may override the governor/EPP set here; consider disabling it.${C_RESET}"
-  fi
-  if ! command -v cpupower >/dev/null 2>&1; then
-    case "$DISTRO_FAMILY" in
-      arch)   prompt_install_deps repo cpupower || true ;;
-      fedora) prompt_install_deps repo kernel-tools || true ;;
-      debian) pkg_available repo linux-cpupower && prompt_install_deps repo linux-cpupower || true ;;
-      suse)   prompt_install_deps repo cpupower || true ;;
-    esac
-  fi
-  command -v powerprofilesctl >/dev/null 2>&1 && powerprofilesctl set performance 2>/dev/null || true
-  if [[ ! -f "$PSTATE_MARKER" ]]; then
-    local pf
-    for pf in /sys/devices/system/cpu/amd_pstate/status /sys/devices/system/cpu/intel_pstate/status; do
-      [[ -r "$pf" ]] && echo "${pf}=$(cat "$pf")"
-    done | run_root tee "$PSTATE_MARKER" >/dev/null
-  fi
-  install_service strata-cpu-perf.service <<'EOF'
-[Unit]
-Description=Set CPU Governor and Power Profile to Performance
-After=multi-user.target power-profiles-daemon.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/bin/sh -c 'command -v powerprofilesctl >/dev/null 2>&1 && powerprofilesctl set performance || true; [ -w /sys/devices/system/cpu/cpufreq/boost ] && echo 1 > /sys/devices/system/cpu/cpufreq/boost || true; for p in /sys/devices/system/cpu/amd_pstate/status /sys/devices/system/cpu/intel_pstate/status; do [ -w "$p" ] && echo active > "$p"; done; for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -w "$g" ] && echo performance > "$g"; done; for e in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do [ -w "$e" ] && echo performance > "$e"; done; true'
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-revert_cpu_performance() {
-  remove_service strata-cpu-perf.service
-  if [[ -f "$PSTATE_MARKER" ]]; then
-    local pf pm
-    while IFS='=' read -r pf pm; do
-      [[ -n "$pf" && -n "$pm" && -w "$pf" ]] && echo "$pm" | run_root tee "$pf" >/dev/null 2>&1
-    done < "$PSTATE_MARKER"
-    run_root rm -f "$PSTATE_MARKER"
-  fi
-  command -v powerprofilesctl >/dev/null 2>&1 && powerprofilesctl set balanced 2>/dev/null || true
-  run_root sh -c 'for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -w "$g" ] && echo powersave > "$g"; done' 2>/dev/null || true
-}
-
-# 5. Memlock & Realtime
-applicable_memlock_realtime() { [[ "$IS_MACOS" == false ]]; }
-title_memlock_realtime() { echo "Unlimited Memory Lock & Realtime Privileges (memlock=unlimited)"; }
-status_memlock_realtime() {
-  if [[ -n "$STRATA_DOCKER_CONTAINER" ]]; then
-    _docker_ro inspect --format '{{range .HostConfig.Ulimits}}{{.Name}}={{.Soft}}:{{.Hard}} {{end}}' "$STRATA_DOCKER_CONTAINER" | grep -qE '(^|[[:space:]])memlock=-1:-1([[:space:]]|$)'
-    return $?
-  fi
-  [[ -f /etc/security/limits.d/99-strata-memlock.conf ]] && return 0
-  [[ -f /etc/security/limits.d/99-realtime-privileges.conf ]] && id -nG "$TARGET_USER" 2>/dev/null | grep -qw realtime && return 0
-  [[ "$IS_UNRAID" == true && "$(ulimit -l 2>/dev/null || true)" == "unlimited" ]]
-}
-explain_memlock_realtime() {
-  cat <<'EOF'
-Impact:
-  Grants unlimited locked memory (memlock unlimited) and rtprio/nice limits so
-  Strata can pin model weights and KV caches in RAM without swapping (no-op if
-  ulimit -l is already unlimited).
-  Note: Docker containers do not inherit host /etc/security/limits.d/—pass
-  '--ulimit memlock=-1:-1' (or set Docker default-ulimits) for containerized Strata.
-EOF
-}
-apply_memlock_realtime() {
-  if [[ -n "$STRATA_DOCKER_CONTAINER" ]]; then
-    echo -e "${C_YELLOW}Note: Docker containers ignore host /etc/security/limits.d/ — add '--ulimit memlock=-1:-1' to container '${STRATA_DOCKER_CONTAINER}' (or configure Docker default-ulimits).${C_RESET}"
-    [[ "$IS_UNRAID" == true ]] && return 0
-  fi
-  if [[ "$DISTRO_FAMILY" == "arch" ]] && ! pkg_installed realtime-privileges; then
-    prompt_install_deps repo realtime-privileges && run_root usermod -aG realtime "$TARGET_USER" 2>/dev/null || true
-  fi
-  run_root mkdir -p /etc/security/limits.d
-  run_root tee /etc/security/limits.d/99-strata-memlock.conf >/dev/null <<EOF
-$TARGET_USER - memlock unlimited
-$TARGET_USER - nice -11
-$TARGET_USER - rtprio 98
-EOF
-}
-revert_memlock_realtime() { run_root rm -f /etc/security/limits.d/99-strata-memlock.conf; }
-
-# 6. PCIe ASPM
-applicable_pcie_aspm() { [[ "$HAS_ASPM" == true ]] && grep -q "performance" /sys/module/pcie_aspm/parameters/policy 2>/dev/null; }
-title_pcie_aspm() { echo "PCIe ASPM Performance Policy (Low-Latency GPU Transfers)"; }
-note_pcie_aspm() { echo -e "${C_YELLOW}[!]${C_RESET}"; }
-status_pcie_aspm() { grep -q "\[performance\]" /sys/module/pcie_aspm/parameters/policy 2>/dev/null || has_kernel_param "pcie_aspm.policy=performance"; }
-explain_pcie_aspm() {
-  cat <<'EOF'
-Impact:
-  Sets PCIe ASPM policy to 'performance' (runtime sysfs or bootloader kernel
-  parameter fallback if BIOS locks runtime writes).
-EOF
-  echo -e "\n${C_YELLOW}[WARNING] Disabling PCIe ASPM increases idle power consumption${C_RESET}"
-  echo -e "${C_YELLOW}          and hardly provides any sustained performance gains.${C_RESET}"
-}
-apply_pcie_aspm() {
-  if echo performance | run_root tee /sys/module/pcie_aspm/parameters/policy >/dev/null 2>&1; then
-    install_service strata-pcie-aspm.service <<'EOF'
-[Unit]
-Description=Set PCIe ASPM Policy to Performance for Strata
-After=multi-user.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/bin/sh -c '[ -w /sys/module/pcie_aspm/parameters/policy ] && echo performance > /sys/module/pcie_aspm/parameters/policy || true'
-ExecStop=/bin/sh -c '[ -w /sys/module/pcie_aspm/parameters/policy ] && echo default > /sys/module/pcie_aspm/parameters/policy || true'
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  else
-    echo -e "${C_YELLOW}Runtime sysfs write not permitted by BIOS/kernel; configuring via bootloader...${C_RESET}"
-    add_kernel_param "pcie_aspm.policy=performance"
-  fi
-}
-revert_pcie_aspm() {
-  remove_service strata-pcie-aspm.service
-  remove_kernel_param "pcie_aspm.policy=performance"
-  echo default | run_root tee /sys/module/pcie_aspm/parameters/policy >/dev/null 2>&1 || true
-}
-
-# 7. NVIDIA Persistenced
-applicable_nvidia_persistenced() {
-  [[ "$HAS_NVIDIA" == true ]] && { unit_exists nvidia-persistenced.service || service_installed strata-nvidia-persistenced.service || command -v nvidia-persistenced >/dev/null 2>&1 || command -v nvidia-smi >/dev/null 2>&1; }
-}
-title_nvidia_persistenced() { echo "NVIDIA Persistence Mode (nvidia-persistenced)"; }
-status_nvidia_persistenced() {
-  if unit_exists nvidia-persistenced.service && unit_enabled nvidia-persistenced.service && unit_active nvidia-persistenced.service; then
-    return 0
-  fi
-  if service_installed strata-nvidia-persistenced.service && unit_enabled strata-nvidia-persistenced.service; then
-    return 0
-  fi
-  if command -v nvidia-smi >/dev/null 2>&1; then
-    local pm_out
-    pm_out="$(nvidia-smi --query-gpu=persistence_mode --format=csv,noheader 2>/dev/null || true)"
-    if grep -qi "Enabled" <<<"$pm_out" && ! grep -qi "Disabled" <<<"$pm_out"; then
-      return 0
-    fi
-  fi
-  return 1
-}
-explain_nvidia_persistenced() { echo -e "Impact:\n  Keeps the NVIDIA driver initialized on headless hosts to avoid cold-start\n  delays and ensures persistent power/clock settings stay applied (no-op on\n  container/appliance hosts where the driver already stays resident)."; }
-apply_nvidia_persistenced() {
-  if unit_exists nvidia-persistenced.service; then
-    run_root systemctl enable --now nvidia-persistenced.service
-  elif [[ "$HAS_SYSTEMD" == true ]] && command -v nvidia-persistenced >/dev/null 2>&1; then
-    local npd_bin
-    npd_bin="$(command -v nvidia-persistenced)"
-    install_service strata-nvidia-persistenced.service <<EOF
-[Unit]
-Description=NVIDIA Persistence Daemon (Strata)
-Wants=syslog.target
-
-[Service]
-Type=forking
-PIDFile=/var/run/nvidia-persistenced/nvidia-persistenced.pid
-Restart=always
-ExecStart=${npd_bin} --user root --persistence-mode
-ExecStopPost=/bin/rm -rf /var/run/nvidia-persistenced
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  else
-    local smi_bin
-    smi_bin="$(command -v nvidia-smi)" || return 1
-    install_service strata-nvidia-persistenced.service <<EOF
-[Unit]
-Description=NVIDIA Persistence Mode (Strata)
-After=multi-user.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=${smi_bin} -pm 1
-ExecStop=-${smi_bin} -pm 0
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  fi
-}
-revert_nvidia_persistenced() {
-  if service_installed strata-nvidia-persistenced.service; then
-    remove_service strata-nvidia-persistenced.service
-    run_root nvidia-smi -pm 0 >/dev/null 2>&1 || true
-  fi
-  if unit_exists nvidia-persistenced.service; then
-    run_root systemctl disable --now nvidia-persistenced.service 2>/dev/null || true
-  fi
-}
-
-# 7b. NVIDIA Fabric Manager (NVSwitch SXM Systems)
-nvidia_fabricmanager_pkg() {
-  if [[ "${NVIDIA_DRIVER_MAJOR:-0}" -gt 0 ]] && pkg_available repo "nvidia-fabricmanager-${NVIDIA_DRIVER_MAJOR}"; then
-    echo "nvidia-fabricmanager-${NVIDIA_DRIVER_MAJOR}"
-  elif pkg_available repo nvidia-fabricmanager; then
-    echo "nvidia-fabricmanager"
-  elif pkg_available repo nvidia-fabric-manager; then
-    echo "nvidia-fabric-manager"
-  else
-    echo ""
-  fi
-}
-applicable_nvidia_fabricmanager() {
-  [[ "$HAS_NVIDIA" == true && "$HAS_NVIDIA_NVSWITCH" == true ]] || return 1
-  unit_exists nvidia-fabricmanager.service || command -v nv-fabricmanager >/dev/null 2>&1 || [[ -n "$(nvidia_fabricmanager_pkg)" ]]
-}
-title_nvidia_fabricmanager() { echo "NVIDIA Fabric Manager (NVSwitch SXM Multi-GPU Fabric)"; }
-status_nvidia_fabricmanager() { unit_enabled nvidia-fabricmanager.service && unit_active nvidia-fabricmanager.service; }
-explain_nvidia_fabricmanager() {
-  cat <<'EOF'
-Impact:
-  Installs/enables nvidia-fabricmanager.service on HGX / DGX NVSwitch SXM
-  servers. Without Fabric Manager running, multi-GPU CUDA initialization fails
-  with Error 802 ('system not yet initialized') across NVSwitch-linked GPUs.
-EOF
-}
-apply_nvidia_fabricmanager() {
-  if ! unit_exists nvidia-fabricmanager.service; then
-    local pkg
-    pkg="$(nvidia_fabricmanager_pkg)"
-    if [[ -n "$pkg" ]]; then
-      prompt_install_deps repo "$pkg" || return 0
-      refresh_unit_files_cache
-    fi
-  fi
-  if unit_exists nvidia-fabricmanager.service; then
-    run_root systemctl enable --now nvidia-fabricmanager.service
-  else
-    echo -e "${C_YELLOW}nvidia-fabricmanager.service is not available; install the matching nvidia-fabricmanager package for driver ${NVIDIA_DRIVER_VER:-installed}.${C_RESET}"
-    return 1
-  fi
-}
-revert_nvidia_fabricmanager() { run_root systemctl disable --now nvidia-fabricmanager.service 2>/dev/null || true; }
-
-# 8. NVIDIA Dynamic Boost
-applicable_nvidia_powerd() {
-  [[ "$HAS_NVIDIA" == true && "$HAS_NVIDIA_POWERD" == true ]] || return 1
-  [[ "$IS_LAPTOP" == true ]] || grep -qiE "Laptop GPU|Mobile|Max-Q" <<<"${NVIDIA_GPU_NAMES[*]}"
-}
-title_nvidia_powerd() { echo "NVIDIA Dynamic Boost Daemon (nvidia-powerd)"; }
-status_nvidia_powerd() { unit_enabled nvidia-powerd.service && unit_active nvidia-powerd.service; }
-explain_nvidia_powerd() { echo -e "Impact:\n  Enables Dynamic Boost to shift power budget to mobile RTX GPUs under load."; }
-apply_nvidia_powerd() { run_root systemctl enable --now nvidia-powerd.service; }
-revert_nvidia_powerd() { run_root systemctl disable --now nvidia-powerd.service; }
-
-# 9. NVIDIA Power Limit
-nvidia_tunable_pl_indices() {
-  local i
-  for (( i = 0; i < ${#NVIDIA_GPU_INDICES[@]}; i++ )); do
-    [[ "${NVIDIA_GPU_PL_SUPPORTED[$i]}" == true ]] && echo "$i"
-  done
-}
-applicable_nvidia_power_limit() {
-  [[ "$HAS_NVIDIA" == true && -n "$(nvidia_tunable_pl_indices)" ]]
-}
-title_nvidia_power_limit() {
-  local idxs=()
-  mapfile -t idxs < <(nvidia_tunable_pl_indices)
-  if (( ${#idxs[@]} == 1 )); then
-    local i="${idxs[0]}" from_w="${NVIDIA_GPU_DEF_PL[$i]}"
-    [[ -n "${NVIDIA_GPU_CUR_PL[$i]}" && "${NVIDIA_GPU_CUR_PL[$i]}" -lt "${NVIDIA_GPU_DEF_PL[$i]}" ]] && from_w="${NVIDIA_GPU_CUR_PL[$i]}"
-    echo "NVIDIA Persistent Max GPU Power Limit (${from_w}W -> ${NVIDIA_GPU_MAX_PL[$i]}W, headroom only)"
-  else
-    echo "NVIDIA Persistent Max GPU Power Limit (${#idxs[@]} GPUs, headroom only)"
-  fi
-}
-status_nvidia_power_limit() {
-  service_installed nvidia-power-limit.service && unit_enabled nvidia-power-limit.service || return 1
-  local i cur mx any=false
-  for i in $(nvidia_tunable_pl_indices); do
-    any=true
-    cur="${NVIDIA_GPU_CUR_PL[$i]}"
-    mx="${NVIDIA_GPU_MAX_PL[$i]}"
-    [[ -n "$cur" && "$cur" -ge "$mx" ]] || return 1
-  done
-  [[ "$any" == true ]]
-}
-explain_nvidia_power_limit() {
-  local idxs=() i from_w svc_desc="systemd service"
-  [[ "$HAS_SYSTEMD" == true ]] || svc_desc="boot service"
-  mapfile -t idxs < <(nvidia_tunable_pl_indices)
-  if (( ${#idxs[@]} == 1 )); then
-    i="${idxs[0]}"
-    from_w="${NVIDIA_GPU_DEF_PL[$i]}"
-    [[ -n "${NVIDIA_GPU_CUR_PL[$i]}" && "${NVIDIA_GPU_CUR_PL[$i]}" -lt "${NVIDIA_GPU_DEF_PL[$i]}" ]] && from_w="${NVIDIA_GPU_CUR_PL[$i]}"
-    echo -e "Impact:\n  Raises GPU power ceiling from ${from_w}W to ${NVIDIA_GPU_MAX_PL[$i]}W via persistent ${svc_desc}.\n  Prevents artificial throttling if the card hits its current/default cap (no speedup\n  if your workload draws below the default limit)."
-  else
-    echo -e "Impact:\n  Raises GPU power ceilings to maximum per GPU via persistent ${svc_desc}\n  (prevents throttling when power-limited; no effect below default cap):"
-    for i in "${idxs[@]}"; do
-      from_w="${NVIDIA_GPU_DEF_PL[$i]}"
-      [[ -n "${NVIDIA_GPU_CUR_PL[$i]}" && "${NVIDIA_GPU_CUR_PL[$i]}" -lt "${NVIDIA_GPU_DEF_PL[$i]}" ]] && from_w="${NVIDIA_GPU_CUR_PL[$i]}"
-      echo -e "  - GPU ${NVIDIA_GPU_INDICES[$i]} (${NVIDIA_GPU_NAMES[$i]}): ${from_w}W -> ${NVIDIA_GPU_MAX_PL[$i]}W"
-    done
-  fi
-}
-apply_nvidia_power_limit() {
-  if service_installed strata-nvidia-power-cap.service; then
-    remove_service strata-nvidia-power-cap.service
-    run_root rm -f "$NVIDIA_POWER_CAP_MARKER"
-  fi
-  local smi_bin out i idx def mx exec_start="" exec_stop="" applied=0
-  smi_bin="$(command -v nvidia-smi)"
-  for i in $(nvidia_tunable_pl_indices); do
-    idx="${NVIDIA_GPU_INDICES[$i]}"
-    def="${NVIDIA_GPU_DEF_PL[$i]}"
-    mx="${NVIDIA_GPU_MAX_PL[$i]}"
-    if ! out="$(run_root "$smi_bin" -i "$idx" -pl "$mx" 2>&1)" || grep -qiE "not supported|failed|error|invalid|insufficient|unable" <<< "$out"; then
-      echo -e "${C_YELLOW}nvidia-smi -i ${idx} -pl ${mx} failed on ${NVIDIA_GPU_NAMES[$i]}: ${out}${C_RESET}"
-      continue
-    fi
-    exec_start+="ExecStart=${smi_bin} -i ${idx} -pl ${mx}"$'\n'
-    exec_stop+="ExecStop=${smi_bin} -i ${idx} -pl ${def}"$'\n'
-    applied=$((applied + 1))
-  done
-  if (( applied == 0 )); then
-    return 1
-  fi
-  install_service nvidia-power-limit.service <<EOF
-[Unit]
-Description=Set NVIDIA GPU Power Limit to Maximum
-After=nvidia-persistenced.service nvidia-powerd.service
-Wants=nvidia-persistenced.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-${exec_start%$'\n'}
-${exec_stop%$'\n'}
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  refresh_nvidia_power_limits
-}
-revert_nvidia_power_limit() {
-  remove_service nvidia-power-limit.service
-  local i idx def
-  for i in $(nvidia_tunable_pl_indices); do
-    idx="${NVIDIA_GPU_INDICES[$i]}"
-    def="${NVIDIA_GPU_DEF_PL[$i]}"
-    run_root nvidia-smi -i "$idx" -pl "$def" >/dev/null 2>&1 || true
-  done
-  refresh_nvidia_power_limits
-}
-
-# 9b. NVIDIA Passive/Datacenter Thermal Power Cap
-nvidia_cappable_pl_indices() {
-  local i mn mx
-  for (( i = 0; i < ${#NVIDIA_GPU_INDICES[@]}; i++ )); do
-    [[ "${NVIDIA_GPU_IS_DATACENTER[$i]}" == true || "${NVIDIA_GPU_IS_PASSIVE[$i]}" == true ]] || continue
-    mn="${NVIDIA_GPU_MIN_PL[$i]}"
-    mx="${NVIDIA_GPU_MAX_PL[$i]:-${NVIDIA_GPU_DEF_PL[$i]}}"
-    [[ "$mn" =~ ^[0-9]+$ && "$mx" =~ ^[0-9]+$ ]] && (( mn > 0 && mx > mn )) && echo "$i"
-  done
-}
-applicable_nvidia_power_cap() {
-  [[ "$HAS_NVIDIA" == true && ( "$HAS_NVIDIA_DATACENTER" == true || "$HAS_NVIDIA_PASSIVE" == true ) ]] || { [[ -f "$NVIDIA_POWER_CAP_MARKER" ]]; return $?; }
-  [[ -n "$(nvidia_cappable_pl_indices)" || -f "$NVIDIA_POWER_CAP_MARKER" ]]
-}
-title_nvidia_power_cap() { echo "NVIDIA Passive/Datacenter Thermal Power Cap (nvidia-smi -pl)"; }
-note_nvidia_power_cap() { echo -e "${C_BLUE}[OPT]${C_RESET}"; }
-status_nvidia_power_cap() { service_installed strata-nvidia-power-cap.service && unit_enabled strata-nvidia-power-cap.service; }
-explain_nvidia_power_cap() {
-  cat <<'EOF'
-Impact:
-  Applies a custom power cap (e.g. ~70% of default TDP, such as 175W on a 250W
-  Tesla P40/P100/V100/A40/A100) via a persistent service. LLM token decode is
-  memory-bandwidth bound rather than TDP-bound, so moderate capping typically
-  retains ~95%+ decode throughput while preventing passive thermal throttling,
-  cutting chassis fan noise, and lowering power draw.
-  Trade-off: Lowers peak compute power ceiling under heavy prefill or batching.
-EOF
-  local i
-  for i in $(nvidia_cappable_pl_indices); do
-    echo -e "  - GPU ${NVIDIA_GPU_INDICES[$i]} (${NVIDIA_GPU_NAMES[$i]}): cur ${NVIDIA_GPU_CUR_PL[$i]:-?}W, range ${NVIDIA_GPU_MIN_PL[$i]}-${NVIDIA_GPU_MAX_PL[$i]:-${NVIDIA_GPU_DEF_PL[$i]}}W (default ${NVIDIA_GPU_DEF_PL[$i]:-?}W)"
-  done
-}
-apply_nvidia_power_cap() {
-  local -a idxs=()
-  mapfile -t idxs < <(nvidia_cappable_pl_indices)
-  if (( ${#idxs[@]} == 0 )); then
-    echo -e "${C_YELLOW}No NVIDIA GPUs report adjustable min/max power limits via nvidia-smi.${C_RESET}"
-    return 1
-  fi
-  local smi_bin first_i def_w min_w max_w rec_w target_w in_w
-  smi_bin="$(command -v nvidia-smi)"
-  first_i="${idxs[0]}"
-  def_w="${NVIDIA_GPU_DEF_PL[$first_i]:-${NVIDIA_GPU_MAX_PL[$first_i]}}"
-  min_w="${NVIDIA_GPU_MIN_PL[$first_i]}"
-  max_w="${NVIDIA_GPU_MAX_PL[$first_i]:-$def_w}"
-  rec_w="$(awk -v d="$def_w" -v mn="$min_w" 'BEGIN {v=int(d*0.7 + 0.5); if (v < mn) v=mn; print v}')"
-  read -r -p "Target GPU power cap in watts (range ${min_w}-${max_w}W) [default: ${rec_w}]: " in_w
-  target_w="${in_w:-$rec_w}"
-  if ! [[ "$target_w" =~ ^[0-9]+$ ]] || (( target_w < min_w || target_w > max_w )); then
-    echo -e "${C_RED}Power cap must be an integer between ${min_w} and ${max_w} W.${C_RESET}"
-    return 1
-  fi
-  service_installed nvidia-power-limit.service && remove_service nvidia-power-limit.service
-  local i idx g_min g_max g_def g_cap out exec_start="" exec_stop="" marker_lines="" applied=0
-  for i in "${idxs[@]}"; do
-    idx="${NVIDIA_GPU_INDICES[$i]}"
-    g_min="${NVIDIA_GPU_MIN_PL[$i]}"
-    g_max="${NVIDIA_GPU_MAX_PL[$i]:-${NVIDIA_GPU_DEF_PL[$i]}}"
-    g_def="${NVIDIA_GPU_DEF_PL[$i]:-$g_max}"
-    g_cap="$target_w"
-    (( g_cap < g_min )) && g_cap="$g_min"
-    (( g_cap > g_max )) && g_cap="$g_max"
-    out="$(run_root "$smi_bin" -i "$idx" -pl "$g_cap" 2>&1 || true)"
-    if grep -qiE "not supported|failed|error|invalid" <<<"$out"; then
-      echo -e "${C_YELLOW}Could not set -pl ${g_cap} on GPU ${idx} (${NVIDIA_GPU_NAMES[$i]}): ${out}${C_RESET}"
-      continue
-    fi
-    exec_start+="ExecStart=${smi_bin} -i ${idx} -pl ${g_cap}"$'\n'
-    exec_stop+="ExecStop=-${smi_bin} -i ${idx} -pl ${g_def}"$'\n'
-    marker_lines+="${idx}:${g_cap}:${g_def}"$'\n'
-    applied=$((applied + 1))
-  done
-  (( applied > 0 )) || return 1
-  printf "%s" "$marker_lines" | run_root tee "$NVIDIA_POWER_CAP_MARKER" >/dev/null
-  install_service strata-nvidia-power-cap.service <<EOF
-[Unit]
-Description=Set NVIDIA Passive/Datacenter Thermal Power Cap for Strata
-After=nvidia-persistenced.service strata-nvidia-persistenced.service
-Wants=nvidia-persistenced.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-${exec_start%$'\n'}
-${exec_stop%$'\n'}
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  refresh_nvidia_power_limits
-}
-revert_nvidia_power_cap() {
-  remove_service strata-nvidia-power-cap.service
-  if [[ -f "$NVIDIA_POWER_CAP_MARKER" ]]; then
-    local idx _cap def
-    while IFS=: read -r idx _cap def; do
-      [[ "$idx" =~ ^[0-9]+$ && "$def" =~ ^[0-9]+$ ]] || continue
-      run_root nvidia-smi -i "$idx" -pl "$def" >/dev/null 2>&1 || true
-    done < "$NVIDIA_POWER_CAP_MARKER"
-    run_root rm -f "$NVIDIA_POWER_CAP_MARKER"
-  fi
-  refresh_nvidia_power_limits
-}
-
-# 10. LACT GPU Overclocking
-applicable_lact_overclock() {
-  [[ "$IS_JETSON" == true ]] && return 1
-  [[ "$HAS_NVIDIA" == true || "$HAS_AMD" == true || "$HAS_INTEL_ARC" == true ]] || return 1
-  local has_eligible=false
-  [[ "$HAS_NVIDIA_NON_TESLA" == true && "$IS_DGX_SPARK" == false ]] && has_eligible=true
-  [[ "$HAS_AMD_NON_INSTINCT" == true ]] && has_eligible=true
-  [[ "$HAS_INTEL_ARC" == true ]] && has_eligible=true
-  [[ "$has_eligible" == true ]] || return 1
-  command -v lact >/dev/null 2>&1 || pkg_available repo lact || pkg_available aur lact
-}
-title_lact_overclock() { echo "LACT GPU Clock & Memory Offsets (lactd)"; }
-status_lact_overclock() {
-  local cfg
-  cfg="$(lact_config_file)"
-  unit_enabled lactd.service && [[ -f "$cfg" ]] && awk '
-    /^[[:space:]]*(gpu_clock_offsets|mem_clock_offsets):/ {
-      if ($0 ~ /\{[[:space:]]*\}/) { in_off=0; next }
-      if ($0 ~ /:[[:space:]]*\{.*[0-9]/) { found=1; exit }
-      match($0, /^[[:space:]]*/); base_ind=RLENGTH; in_off=1; next
-    }
-    in_off {
-      match($0, /^[[:space:]]*/)
-      if (RLENGTH <= base_ind && $0 ~ /[^[:space:]]/) { in_off=0 }
-      else if ($0 ~ /^[[:space:]]+[0-9]+:[[:space:]]*-?[0-9]+/) { found=1; exit }
-    }
-    END { exit !found }
-  ' "$cfg" 2>/dev/null
-}
-explain_lact_overclock() {
-  cat <<'EOF'
-Impact:
-  Installs/enables LACT (lactd) and applies GPU core & VRAM clock offsets
-  (e.g. +135 MHz core, +1000 MHz VRAM). Higher VRAM bandwidth directly speeds
-  up LLM token generation. On AMD GPUs it also adds the bootloader parameter
-  'amdgpu.ppfeaturemask=0xffffffff' (reboot) to unlock clock/power controls.
-EOF
-}
-
-lact_config_file() {
-  # The config path LACT's own daemon resolves.
-  if [[ -n "${LACT_DAEMON_CONFIG_DIR:-}" ]]; then
-    printf '%s/config.yaml\n' "${LACT_DAEMON_CONFIG_DIR%/}"
-  else
-    printf '/etc/lact/config.yaml\n'
-  fi
-}
-lact_gpu_ids() {
-  # GPU ids are the keys of the `gpus:` map in LACT's config, e.g.
-  #   10DE:2684-1043:88EF-0000:0a:00.0
-  # Ask the daemon first (it only lists the GPUs it manages); fall back to
-  # building the very same id from the PCI uevent if it cannot be reached.
-  local -a ids=()
-  local line id uev
-  if command -v lact >/dev/null 2>&1; then
-    while IFS= read -r line; do
-      id="${line#*: }"          # drop the "0: " index prefix of `lact cli list`
-      id="${id%%[[:space:]]*}"  # the id is the first whitespace-separated token
-      [[ "$id" =~ ^[0-9A-Fa-f]{4}:[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}:[0-9A-Fa-f]{4}- ]] || continue
-      ids+=("$id")
-    done < <(lact cli list 2>/dev/null || true)
-  fi
-  if (( ${#ids[@]} == 0 )); then
-    for uev in /sys/class/drm/card[0-9]*/device/uevent; do
-      [[ -r "$uev" ]] || continue
-      id="$(awk -F= '
-        /^PCI_ID=/        { v = $2 }
-        /^PCI_SUBSYS_ID=/ { s = $2 }
-        /^PCI_SLOT_NAME=/ { p = $2 }
-        END               { if (v && s && p) printf "%s-%s-%s", v, s, p }' "$uev")"
-      [[ -n "$id" ]] && ids+=("$id")
-    done
-  fi
-  (( ${#ids[@]} )) || return 1
-  printf '%s\n' "${ids[@]}"
-}
-
-apply_lact_overclock() {
-  if ! command -v lact >/dev/null 2>&1; then
-    case "$DISTRO_FAMILY" in
-      arch)   prompt_install_repo_or_aur lact || return 0 ;;
-      fedora) prompt_install_deps repo lact || return 0 ;;
-      debian) prompt_install_deps repo lact || return 0 ;;
-      suse)   prompt_install_deps repo lact || return 0 ;;
-    esac
-  fi
-  if ! python3 -c "import yaml" >/dev/null 2>&1; then
-    case "$DISTRO_FAMILY" in
-      arch)   prompt_install_deps repo python-yaml || true ;;
-      fedora) prompt_install_deps repo python3-pyyaml || true ;;
-      debian) prompt_install_deps repo python3-yaml || true ;;
-      suse)   prompt_install_deps repo python3-PyYAML || true ;;
-    esac
-  fi
-
-  run_root systemctl enable --now lactd.service 2>/dev/null || true
-  if [[ "$HAS_AMD" == true ]] && compgen -G "/sys/class/drm/card*/device/power_dpm_force_performance_level" >/dev/null 2>&1; then
-    add_kernel_param "amdgpu.ppfeaturemask=0xffffffff"
-  fi
-  sleep 1
-
-  local core_off="135" mem_off="1000" in_core in_mem
-  read -r -p "GPU Core Clock offset in MHz [default: 135]: " in_core
-  [[ -n "$in_core" ]] && core_off="$in_core"
-  read -r -p "VRAM Memory Clock offset in MHz [default: 1000]: " in_mem
-  [[ -n "$in_mem" ]] && mem_off="$in_mem"
-  if ! [[ "$core_off" =~ ^-?[0-9]+$ && "$mem_off" =~ ^-?[0-9]+$ ]]; then
-    echo -e "${C_RED}Clock offsets must be integers.${C_RESET}"
-    return 1
-  fi
-
-  local cfg out rc i id
-  cfg="$(lact_config_file)"
-  if ! python3 -c "import yaml" >/dev/null 2>&1; then
-    echo -e "${C_YELLOW}PyYAML is missing, cannot edit ${cfg}; set the offsets in the LACT GUI.${C_RESET}"
-    return 1
-  fi
-  if [[ ! -f "$cfg" ]]; then
-    # lactd creates a default config on its first start
-    run_root systemctl restart lactd.service 2>/dev/null || true
-    for i in 1 2 3 4 5 6 7 8 9 10; do
-      [[ -f "$cfg" ]] && break
-      sleep 0.5
-    done
-  fi
-  if [[ ! -f "$cfg" ]]; then
-    echo -e "${C_YELLOW}${cfg} does not exist yet; start lactd once, then re-run.${C_RESET}"
-    return 1
-  fi
-
-  run_root cp -n "$cfg" "${cfg}.bak.strata-setup" 2>/dev/null || true
-
-  # `gpus:` is keyed by GPU id, so tell the editor which GPUs to configure
-  local -a pyargs=("$cfg" "$core_off" "$mem_off")
-  while IFS= read -r id; do
-    [[ -n "$id" ]] && pyargs+=("$id")
-  done < <(lact_gpu_ids || true)
-
-  rc=0
-  out="$(run_root python3 - "${pyargs[@]}" 2>&1 <<'PY'
-import sys
-
-import yaml
-
-path, core_off, mem_off = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
-requested_ids = sys.argv[4:]
-
-try:
-    with open(path) as f:
-        data = yaml.safe_load(f)
-except FileNotFoundError:
-    data = None
-except yaml.YAMLError as err:
-    sys.exit(f"{path}: not valid YAML: {err}")
-except OSError as err:
-    sys.exit(f"{path}: could not be read: {err}")
-if data is None:
-    data = {}
-if not isinstance(data, dict):
-    sys.exit(f"{path}: the top level is not a mapping")
-
-# LACT applies the settings of the active profile when one is selected, and the
-# top level `gpus` map otherwise (see Config::gpus in lact-daemon).
-profile_name = data.get("current_profile")
-if profile_name:
-    profiles = data.setdefault("profiles", {})
-    if not isinstance(profiles, dict):
-        sys.exit(f"{path}: 'profiles' is not a mapping")
-    profile = profiles.get(profile_name)
-    if not isinstance(profile, dict):
-        profile = {}
-        profiles[profile_name] = profile
-    where = f"profile '{profile_name}'"
-else:
-    profile = data
-    where = "the default profile"
-
-gpus = profile.get("gpus")
-if not isinstance(gpus, dict):
-    gpus = {}
-    profile["gpus"] = gpus
-
-# On a fresh LACT install `gpus` does not exist yet, its entries are created here
-gpu_ids = [gpu_id for gpu_id in requested_ids if gpu_id] or list(gpus)
-if not gpu_ids:
-    sys.exit("no GPU id found - is lactd running? (`lact cli list`)")
-
-for gpu_id in gpu_ids:
-    gpu = gpus.get(gpu_id)
-    if not isinstance(gpu, dict):
-        gpu = {}
-    gpu["gpu_clock_offsets"] = {0: core_off}
-    gpu["mem_clock_offsets"] = {0: mem_off}
-    if gpu_id.split(":", 1)[0].upper() == "10DE":
-        # Nvidia only: controls the offsets through the adaptive clock governor
-        gpu.setdefault("power_mizer_mode", "Adaptive")
-    gpus[gpu_id] = gpu
-
-try:
-    with open(path, "w") as f:
-        yaml.safe_dump(data, f, sort_keys=False, default_flow_style=False)
-except OSError as err:
-    sys.exit(f"{path}: could not be written: {err}")
-
-# Read back, so that a reported success means the file really holds the offsets
-with open(path) as f:
-    saved = yaml.safe_load(f)
-if profile_name:
-    saved_gpus = ((saved.get("profiles") or {}).get(profile_name) or {}).get("gpus") or {}
-else:
-    saved_gpus = saved.get("gpus") or {}
-for gpu_id in gpu_ids:
-    gpu = saved_gpus.get(gpu_id) or {}
-    if gpu.get("gpu_clock_offsets") != {0: core_off} or gpu.get("mem_clock_offsets") != {0: mem_off}:
-        sys.exit(f"{path}: wrote the offsets but could not read them back")
-
-print(f"core {core_off:+d} MHz, VRAM {mem_off:+d} MHz for {', '.join(gpu_ids)} in {where}")
-PY
-)" || rc=$?
-
-  if (( rc == 0 )); then
-    echo -e "${C_GREEN}LACT: ${out}${C_RESET}"
-    run_root systemctl restart lactd.service 2>/dev/null || true
-    sleep 1
-    if ! unit_active lactd.service; then
-      echo -e "${C_YELLOW}lactd is not running after the config change:${C_RESET}"
-      run_root journalctl -u lactd.service -n 5 --no-pager 2>/dev/null | sed 's/^/  /' || true
-    fi
-  else
-    echo -e "${C_YELLOW}Could not auto-edit ${cfg}; configure in LACT GUI.${C_RESET}"
-    [[ -n "$out" ]] && printf '%s\n' "$out" | sed 's/^/  /'
-    return 1
-  fi
-}
-revert_lact_overclock() {
-  [[ "$HAS_AMD" == true ]] && remove_kernel_param "amdgpu.ppfeaturemask=0xffffffff"
-  local cfg
-  cfg="$(lact_config_file)"
-  if [[ -f "${cfg}.bak.strata-setup" ]]; then
-    run_root mv -f "${cfg}.bak.strata-setup" "$cfg"
-    run_root systemctl restart lactd.service 2>/dev/null || true
-  else
-    run_root systemctl disable --now lactd.service 2>/dev/null || true
-  fi
-}
-
-# 11. GPU Unlock
-secure_boot_enabled() {
-  local sb_var="/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
-  if [[ -r "$sb_var" ]]; then
-    local val
-    val="$(od -An -t u1 -j 4 -N 1 "$sb_var" 2>/dev/null | tr -d '[:space:]')"
-    [[ "$val" == "1" ]] && return 0
-    [[ "$val" == "0" ]] && return 1
-  fi
-  if command -v mokutil >/dev/null 2>&1; then
-    mokutil --sb-state 2>/dev/null | grep -qi "SecureBoot enabled" && return 0
-  fi
-  return 1
-}
-
-gpu_unlock_installed() {
-  pkg_installed gpu-unlock-dkms || pkg_installed gpu-unlock || [[ -d /sys/module/gpu_unlock ]] ||
-    (command -v dkms >/dev/null 2>&1 && dkms status 2>/dev/null | grep -qi "gpu[_-]unlock")
-}
-
-gpu_unlock_build_deps() {
-  local kver
-  kver="$(uname -r)"
-  case "$DISTRO_FAMILY" in
-    debian)
-      local hdr="linux-headers-${kver}"
-      if ! pkg_installed "$hdr" && ! pkg_available repo "$hdr"; then
-        if pkg_available repo "linux-headers-generic"; then
-          hdr="linux-headers-generic"
-        elif pkg_available repo "linux-headers-amd64"; then
-          hdr="linux-headers-amd64"
-        fi
-      fi
-      echo "git make dkms build-essential debhelper dh-dkms python3 zstd xz-utils curl ${hdr}"
-      ;;
-    fedora)
-      echo "git make dkms gcc python3 zstd xz curl rpm-build kernel-devel"
-      ;;
-    suse)
-      local kdev="kernel-default-devel"
-      if ! pkg_installed "$kdev" && ! pkg_available repo "$kdev"; then
-        kdev="kernel-devel"
-      fi
-      echo "git make dkms gcc python3 zstd xz curl rpm-build ${kdev}"
-      ;;
-  esac
-}
-
-applicable_gpu_unlock() {
-  [[ "$HAS_NVIDIA" == true ]] || return 1
-  secure_boot_enabled && return 1
-  [[ "$HAS_NVIDIA_NON_TESLA" == true ]] || return 1
-  local found_consumer=false n
-  if (( ${#NVIDIA_GPU_NAMES[@]} > 0 )); then
-    for n in "${NVIDIA_GPU_NAMES[@]}"; do
-      _is_nvidia_consumer_unlock_name "$n" && { found_consumer=true; break; }
-    done
-  else
-    while IFS= read -r n; do
-      grep -qi "nvidia" <<<"$n" || continue
-      _is_nvidia_consumer_unlock_name "$n" && { found_consumer=true; break; }
-    done <<<"${GPU_RAW:-$GPU_SUMMARY}"
-  fi
-  [[ "$found_consumer" == true ]] || return 1
-  if [[ "$DISTRO_FAMILY" == "arch" ]]; then
-    pkg_installed gpu-unlock-dkms || pkg_available repo gpu-unlock-dkms || pkg_available aur gpu-unlock-dkms
-  else
-    [[ "$DISTRO_FAMILY" =~ ^(debian|fedora|suse)$ ]]
-  fi
-}
-
-title_gpu_unlock() { echo "NVIDIA GPU Unlock Module & Kernel Param (gpu-unlock-dkms)"; }
-note_gpu_unlock() {
-  if [[ "$DISTRO_FAMILY" != "arch" ]]; then
-    echo -e "${C_MAGENTA}[EXP]${C_RESET}"
-  else
-    echo -e "${C_DIM}-${C_RESET}"
-  fi
-}
-status_gpu_unlock() {
-  has_kernel_param "gpu_unlock.targets=all" && ([[ -d /sys/module/gpu_unlock ]] || lsmod 2>/dev/null | grep -qE "gpu_unlock" || gpu_unlock_installed)
-}
-explain_gpu_unlock() {
-  if [[ "$DISTRO_FAMILY" == "arch" ]]; then
-    cat <<'EOF'
-Impact:
-  Installs gpu-unlock-dkms + gpu-unlock-firmware and adds
-  'gpu_unlock.targets=all' to the bootloader kernel command line.
-EOF
-  else
-    cat <<'EOF'
-Impact:
-  Installs build dependencies, compiles and installs gpu-unlock from source
-  (https://github.com/Zagitta/gpu-unlock) via DKMS, and adds
-  'gpu_unlock.targets=all' to the bootloader kernel command line.
-EOF
-    echo -e "\n${C_MAGENTA}[EXPERIMENTAL] This option is experimental for your distribution (${OS_PRETTY:-$DISTRO_ID})${C_RESET}"
-    echo -e "${C_MAGENTA}               and might not work properly.${C_RESET}"
-  fi
-  echo -e "\n${C_BGREEN}[HIGH IMPACT] Big performance gains can be achieved with gpu-unlock on${C_RESET}"
-  echo -e "${C_BGREEN}              supported consumer Turing/Ampere/Ada GPUs (RTX 20/30/40 series),${C_RESET}"
-  echo -e "${C_BGREEN}              unlocking hardware compute, clock, and power capabilities.${C_RESET}"
-}
-apply_gpu_unlock() {
-  if ! gpu_unlock_installed; then
-    if [[ "$DISTRO_FAMILY" == "arch" ]]; then
-      prompt_install_repo_or_aur gpu-unlock-dkms gpu-unlock-firmware || return 0
-    else
-      local -a deps=()
-      read -r -a deps <<< "$(gpu_unlock_build_deps)"
-      if [[ ${#deps[@]} -gt 0 ]]; then
-        prompt_install_deps repo "${deps[@]}" || return 0
-      fi
-      local build_dir build_ok=false
-      build_dir="$(mktemp -d /tmp/gpu-unlock.XXXXXX)"
-      [[ $EUID -eq 0 && "$TARGET_USER" != "root" ]] && chown "$TARGET_USER" "$build_dir" 2>/dev/null || true
-      echo -e "${C_CYAN}Cloning and building gpu-unlock from source...${C_RESET}"
-      if ! run_as_user_exec git clone --depth 1 https://github.com/Zagitta/gpu-unlock.git "$build_dir/src"; then
-        echo -e "${C_RED}Failed to clone https://github.com/Zagitta/gpu-unlock.git.${C_RESET}"
-        rm -rf "$build_dir"
-        return 0
-      fi
-      case "$DISTRO_FAMILY" in
-        debian)
-          if run_as_user_exec make -C "$build_dir/src" CACHE="$build_dir/cache" deb &&
-             compgen -G "$build_dir/src/build/deb/gpu-unlock-*.deb" >/dev/null 2>&1 &&
-             run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "$build_dir"/src/build/deb/gpu-unlock-*.deb; then
-            build_ok=true
-          fi
-          ;;
-        fedora)
-          if run_as_user_exec make -C "$build_dir/src" CACHE="$build_dir/cache" rpm &&
-             compgen -G "$build_dir/src/build/rpm/RPMS/noarch/gpu-unlock-*.noarch.rpm" >/dev/null 2>&1 &&
-             run_root dnf install -y "$build_dir"/src/build/rpm/RPMS/noarch/gpu-unlock-*.noarch.rpm; then
-            build_ok=true
-          fi
-          ;;
-        suse)
-          if run_as_user_exec make -C "$build_dir/src" CACHE="$build_dir/cache" rpm &&
-             compgen -G "$build_dir/src/build/rpm/RPMS/noarch/gpu-unlock-*.noarch.rpm" >/dev/null 2>&1 &&
-             run_root zypper --non-interactive --no-gpg-checks install "$build_dir"/src/build/rpm/RPMS/noarch/gpu-unlock-*.noarch.rpm; then
-            build_ok=true
-          fi
-          ;;
-      esac
-      rm -rf "$build_dir"
-      PKG_INST_CACHE=()
-      if [[ "$build_ok" != true ]]; then
-        echo -e "${C_RED}Failed to build/install gpu-unlock from source.${C_RESET}"
-        return 0
-      fi
-    fi
-  fi
-  add_kernel_param "gpu_unlock.targets=all"
-}
-revert_gpu_unlock() { remove_kernel_param "gpu_unlock.targets=all"; }
-
-# 11b. AMD GPU DPM
-applicable_amd_gpu_perf() {
-  [[ "$HAS_AMD" == true ]] || return 1
-  local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}"
-  compgen -G "${drm_dir}/card*/device/power_dpm_force_performance_level" >/dev/null 2>&1 && return 0
-  [[ "$HAS_AMD_INSTINCT" == true ]] && { command -v amd-smi >/dev/null 2>&1 || command -v rocm-smi >/dev/null 2>&1; }
-}
-title_amd_gpu_perf() { echo "AMD Radeon / Instinct High Performance DPM Level (amdgpu)"; }
-status_amd_gpu_perf() {
-  local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}" f
-  for f in "${drm_dir}"/card*/device/power_dpm_force_performance_level; do
-    [[ -f "$f" ]] && grep -q "high" "$f" 2>/dev/null && return 0
-  done
-  service_installed strata-amd-gpu-perf.service && unit_enabled strata-amd-gpu-perf.service && return 0
-  return 1
-}
-explain_amd_gpu_perf() { echo -e "Impact:\n  Sets amdgpu power_dpm_force_performance_level='high' (with amd-smi / rocm-smi\n  fallback on Instinct GPUs) via persistent service for ROCm/HIP."; }
-apply_amd_gpu_perf() {
-  install_service strata-amd-gpu-perf.service <<'EOF'
-[Unit]
-Description=Set AMD GPU DPM Performance Level to High for Strata
-After=multi-user.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/bin/sh -c 'w=0; for f in /sys/class/drm/card*/device/power_dpm_force_performance_level; do [ -w "$f" ] && echo high > "$f" 2>/dev/null && w=1; done; if [ "$w" -eq 0 ]; then if command -v amd-smi >/dev/null 2>&1; then amd-smi set --perf-level high >/dev/null 2>&1 || true; elif command -v rocm-smi >/dev/null 2>&1; then rocm-smi --setperflevel high >/dev/null 2>&1 || true; fi; fi; true'
-ExecStop=/bin/sh -c 'w=0; for f in /sys/class/drm/card*/device/power_dpm_force_performance_level; do [ -w "$f" ] && echo auto > "$f" 2>/dev/null && w=1; done; if [ "$w" -eq 0 ]; then if command -v amd-smi >/dev/null 2>&1; then amd-smi set --perf-level auto >/dev/null 2>&1 || true; elif command -v rocm-smi >/dev/null 2>&1; then rocm-smi --setperflevel auto >/dev/null 2>&1 || true; fi; fi; true'
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-revert_amd_gpu_perf() {
-  remove_service strata-amd-gpu-perf.service
-  run_root sh -c 'w=0; for f in /sys/class/drm/card*/device/power_dpm_force_performance_level; do [ -w "$f" ] && echo auto > "$f" 2>/dev/null && w=1; done; if [ "$w" -eq 0 ]; then if command -v amd-smi >/dev/null 2>&1; then amd-smi set --perf-level auto >/dev/null 2>&1 || true; elif command -v rocm-smi >/dev/null 2>&1; then rocm-smi --setperflevel auto >/dev/null 2>&1 || true; fi; fi; true' 2>/dev/null || true
-}
-
-# 11d. NVIDIA Volta (V100 / sm_70) Strata Decode Table
-applicable_nvidia_sm70_table() {
-  [[ "$HAS_NVIDIA" == true && "$HAS_NVIDIA_VOLTA_SM70" == true ]] || [[ -f "$NVIDIA_SM70_MARKER" ]]
-}
-title_nvidia_sm70_table() { echo "NVIDIA Volta (V100 / sm_70) Strata Decode Table (STRATA_SM70_TABLE=1)"; }
-status_nvidia_sm70_table() { [[ -f "$NVIDIA_SM70_MARKER" ]]; }
-explain_nvidia_sm70_table() {
-  cat <<'EOF'
-Impact:
-  Enables Strata's opt-in Volta (sm_70 / Tesla V100) decode table via
-  STRATA_SM70_TABLE=1 across wizard CLI calls, /etc/profile.d/strata-sm70.sh,
-  and a strata.service systemd drop-in. Improves token decode speed on V100
-  with zero idle power impact (remember to run Strata CUDA 12 builds on sm_70).
-EOF
-}
-apply_nvidia_sm70_table() {
-  echo "1" | run_root tee "$NVIDIA_SM70_MARKER" >/dev/null
-  run_root tee /etc/profile.d/strata-sm70.sh >/dev/null <<'EOF'
-export STRATA_SM70_TABLE=1
-EOF
-  run_root chmod 0644 /etc/profile.d/strata-sm70.sh 2>/dev/null || true
-  if [[ "$HAS_SYSTEMD" == true && -f /etc/systemd/system/strata.service ]]; then
-    run_root mkdir -p /etc/systemd/system/strata.service.d
-    run_root tee /etc/systemd/system/strata.service.d/20-sm70-table.conf >/dev/null <<'EOF'
-[Service]
-Environment=STRATA_SM70_TABLE=1
-EOF
-    run_root systemctl daemon-reload
-    unit_active strata.service && echo -e "${C_YELLOW}Restart strata.service for STRATA_SM70_TABLE=1 to take effect.${C_RESET}" || true
-  fi
-}
-revert_nvidia_sm70_table() {
-  run_root rm -f "$NVIDIA_SM70_MARKER" /etc/profile.d/strata-sm70.sh
-  if [[ -f /etc/systemd/system/strata.service.d/20-sm70-table.conf ]]; then
-    run_root rm -f /etc/systemd/system/strata.service.d/20-sm70-table.conf
-    run_root rmdir /etc/systemd/system/strata.service.d 2>/dev/null || true
-    [[ "$HAS_SYSTEMD" == true ]] && run_root systemctl daemon-reload 2>/dev/null || true
-  fi
-}
-
-# 11e. NVIDIA Tesla Idle P-State Daemon (nvidia-pstated / nvidia-pstate)
-nvidia_pstate_target_indices() {
-  local idxs=() i cc g_name
-  for (( i = 0; i < ${#NVIDIA_GPU_INDICES[@]}; i++ )); do
-    [[ "${NVIDIA_GPU_IS_DATACENTER[$i]}" == true ]] || continue
-    cc="${NVIDIA_GPU_COMPUTE_CAP[$i]}"
-    g_name="${NVIDIA_GPU_NAMES[$i]}"
-    if [[ "$cc" =~ ^(5\.|6\.|7\.0$) ]] || grep -qiE "\b(M40|M60|M10|P4|P40|P100|V100)\b|CMP [0-9]+HX|P10[246]-100" <<<"$g_name"; then
-      idxs+=("${NVIDIA_GPU_INDICES[$i]}")
-    fi
-  done
-  local IFS=,
-  echo "${idxs[*]}"
-}
-_find_nvml_include_dir() {
-  local d
-  for d in /usr/include /usr/local/cuda/include /opt/cuda/include /usr/include/x86_64-linux-gnu; do
-    [[ -f "${d}/nvml.h" ]] && { echo "$d"; return 0; }
-  done
-  return 1
-}
-applicable_nvidia_pstate() {
-  [[ "$HAS_NVIDIA" == true && "$HAS_NVIDIA_LEGACY_PSTATE_CARD" == true ]] ||
-    service_installed nvidia-pstated.service || service_installed strata-nvidia-pstate.service
-}
-title_nvidia_pstate() { echo "NVIDIA Tesla Idle P-State Daemon (P0 -> P8 idle power fix, nvidia-pstated)"; }
-note_nvidia_pstate() { echo -e "${C_MAGENTA}[EXP]${C_RESET}"; }
-status_nvidia_pstate() {
-  { service_installed nvidia-pstated.service && unit_enabled nvidia-pstated.service && unit_active nvidia-pstated.service; } ||
-    { service_installed strata-nvidia-pstate.service && unit_enabled strata-nvidia-pstate.service && unit_active strata-nvidia-pstate.service; }
-}
-explain_nvidia_pstate() {
-  cat <<'EOF'
-Impact:
-  Installs and runs sasha0552/nvidia-pstated (or Python nvidia-pstate polling
-  fallback if CUDA/NVML headers are absent) to drop legacy Tesla/CMP GPUs
-  (P40, P100, P4, M40, M60, V100) from stuck P0 (~30-50W idle) into P8 (~9-10W)
-  when no inference workload is running, cutting heat and fan noise.
-EOF
-  echo -e "\n${C_MAGENTA}[EXPERIMENTAL] Relies on undocumented NvAPI calls (requires libnvidia-api.so.1${C_RESET}"
-  echo -e "${C_MAGENTA}               from nvidia-utils / libnvidia-api1) and third-party code.${C_RESET}"
-}
-apply_nvidia_pstate() {
-  if ! ldconfig -p 2>/dev/null | grep -q "libnvidia-api\.so\.1" && ! compgen -G "/usr/lib*/libnvidia-api.so*" >/dev/null 2>&1 && ! compgen -G "/usr/lib/*/libnvidia-api.so*" >/dev/null 2>&1; then
-    echo -e "${C_YELLOW}libnvidia-api.so.1 was not found on this host.${C_RESET}"
-    echo -e "Install it first (Arch: nvidia-utils, Debian/Ubuntu: libnvidia-api1 or libnvidia-tesla-api1, Fedora: nvidia-driver-libs)."
-    return 1
-  fi
-  local target_idxs="" idx_args=""
-  target_idxs="$(nvidia_pstate_target_indices)"
-
-  local daemon_bin=""
-  command -v nvidia-pstated >/dev/null 2>&1 && daemon_bin="$(command -v nvidia-pstated)"
-  [[ -z "$daemon_bin" && -x /usr/local/bin/nvidia-pstated ]] && daemon_bin="/usr/local/bin/nvidia-pstated"
-
-  if [[ -z "$daemon_bin" ]] && _find_nvml_include_dir >/dev/null 2>&1; then
-    local -a bdeps=()
-    command -v git >/dev/null 2>&1 || bdeps+=(git)
-    command -v cmake >/dev/null 2>&1 || bdeps+=(cmake)
-    command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1 || bdeps+=(gcc)
-    if (( ${#bdeps[@]} == 0 )) || prompt_install_deps repo "${bdeps[@]}"; then
-      local bdir nvml_inc
-      nvml_inc="$(_find_nvml_include_dir)"
-      bdir="$(mktemp -d /tmp/nvidia-pstated.XXXXXX)"
-      [[ $EUID -eq 0 && "$TARGET_USER" != "root" ]] && chown "$TARGET_USER" "$bdir" 2>/dev/null || true
-      echo -e "${C_CYAN}Building sasha0552/nvidia-pstated from source...${C_RESET}"
-      if run_as_user_exec git clone --depth 1 https://github.com/sasha0552/nvidia-pstated.git "$bdir/src" &&
-         run_as_user_exec cmake -S "$bdir/src" -B "$bdir/build" "-DCMAKE_C_FLAGS=-I${nvml_inc}" &&
-         run_as_user_exec cmake --build "$bdir/build" &&
-         [[ -x "$bdir/build/nvidia-pstated" ]]; then
-        run_root install -m 0755 "$bdir/build/nvidia-pstated" /usr/local/bin/nvidia-pstated
-        daemon_bin="/usr/local/bin/nvidia-pstated"
-      else
-        echo -e "${C_YELLOW}C build of nvidia-pstated failed; falling back to Python nvidia-pstate daemon.${C_RESET}"
-      fi
-      rm -rf "$bdir"
-    fi
-  fi
-
-  if [[ -n "$daemon_bin" ]]; then
-    if [[ -n "$target_idxs" ]] && "$daemon_bin" --help 2>&1 | grep -q -- "-i"; then
-      idx_args=" -i ${target_idxs}"
-    fi
-    service_installed strata-nvidia-pstate.service && remove_service strata-nvidia-pstate.service
-    echo "daemon" | run_root tee "$NVIDIA_PSTATE_MARKER" >/dev/null
-    if [[ "$HAS_SYSTEMD" == true ]]; then
-      install_service nvidia-pstated.service <<EOF
-[Unit]
-Description=NVIDIA GPU Idle P-State Daemon (nvidia-pstated)
-After=nvidia-persistenced.service strata-nvidia-persistenced.service
-StartLimitIntervalSec=0
-
-[Service]
-DynamicUser=yes
-ExecStart=${daemon_bin}${idx_args}
-Restart=on-failure
-RestartSec=2s
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    else
-      install_service nvidia-pstated.service <<EOF
-[Unit]
-Description=NVIDIA GPU Idle P-State Daemon (nvidia-pstated)
-
-[Service]
-ExecStart=/bin/sh -c 'nohup ${daemon_bin}${idx_args} >/dev/null 2>&1 &'
-ExecStop=/bin/sh -c 'pkill -x nvidia-pstated >/dev/null 2>&1 || true'
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    fi
-    return $?
-  fi
-
-  # Fallback: Python nvidia-pstate polling daemon in isolated venv
-  if ! command -v python3 >/dev/null 2>&1; then
-    echo -e "${C_RED}python3 is required for the nvidia-pstate fallback.${C_RESET}"
-    return 1
-  fi
-  echo -e "${C_CYAN}Setting up Python nvidia-pstate idle daemon in /opt/strata-nvidia-pstate...${C_RESET}"
-  run_root mkdir -p /opt/strata-nvidia-pstate /usr/local/libexec
-  if [[ ! -x /opt/strata-nvidia-pstate/venv/bin/python ]]; then
-    if ! run_root python3 -m venv /opt/strata-nvidia-pstate/venv; then
-      echo -e "${C_RED}Could not create Python venv (install python3-venv / python-virtualenv).${C_RESET}"
-      return 1
-    fi
-  fi
-  if ! run_root /opt/strata-nvidia-pstate/venv/bin/pip install --upgrade nvidia-pstate; then
-    echo -e "${C_RED}Failed to install nvidia-pstate from PyPI.${C_RESET}"
-    return 1
-  fi
-  run_root tee /usr/local/libexec/strata-nvidia-pstated.py >/dev/null <<'PY'
-#!/usr/bin/env python3
-import inspect, signal, subprocess, sys, time
-from nvidia_pstate import set_pstate_high, set_pstate_low
-
-IDLE_DELAY_S = 30.0
-POLL_S = 2.0
-
-def call_pstate(fn, idxs):
-    try:
-        sig = inspect.signature(fn)
-        if not sig.parameters:
-            fn()
-            return
-        pname = next(iter(sig.parameters))
-        if idxs is None:
-            fn()
-        else:
-            for idx in idxs:
-                fn(**{pname: idx})
-    except Exception:
-        fn()
-
-def is_busy(idxs):
-    cmd = ["nvidia-smi", "--query-gpu=index,utilization.gpu", "--format=csv,noheader,nounits"]
-    if idxs:
-        cmd.extend(["-i", ",".join(str(i) for i in idxs)])
-    try:
-        out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
-        for line in out.splitlines():
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) >= 2 and parts[1].isdigit() and int(parts[1]) > 3:
-                return True
-        apps_cmd = ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"]
-        if idxs:
-            apps_cmd.extend(["-i", ",".join(str(i) for i in idxs)])
-        apps = subprocess.check_output(apps_cmd, text=True, stderr=subprocess.DEVNULL).strip()
-        if apps:
-            return True
-    except Exception:
-        return True
-    return False
-
-def main():
-    idxs = None
-    if len(sys.argv) > 1 and sys.argv[1]:
-        idxs = [int(x) for x in sys.argv[1].split(",") if x.strip().isdigit()]
-    def handle_stop(_signum, _frame):
-        try:
-            call_pstate(set_pstate_high, idxs)
-        except Exception:
-            pass
-        sys.exit(0)
-    signal.signal(signal.SIGTERM, handle_stop)
-    signal.signal(signal.SIGINT, handle_stop)
-    state = "high"
-    last_active = time.monotonic()
-    while True:
-        now = time.monotonic()
-        if is_busy(idxs):
-            last_active = now
-            if state != "high":
-                call_pstate(set_pstate_high, idxs)
-                state = "high"
-        elif now - last_active >= IDLE_DELAY_S and state != "low":
-            call_pstate(set_pstate_low, idxs)
-            state = "low"
-        time.sleep(POLL_S)
-
-if __name__ == "__main__":
-    main()
-PY
-  run_root chmod 0755 /usr/local/libexec/strata-nvidia-pstated.py
-  echo "python" | run_root tee "$NVIDIA_PSTATE_MARKER" >/dev/null
-  if [[ "$HAS_SYSTEMD" == true ]]; then
-    install_service strata-nvidia-pstate.service <<EOF
-[Unit]
-Description=NVIDIA GPU Idle P-State Polling Service (Strata)
-After=nvidia-persistenced.service strata-nvidia-persistenced.service
-
-[Service]
-Type=simple
-ExecStart=/opt/strata-nvidia-pstate/venv/bin/python /usr/local/libexec/strata-nvidia-pstated.py ${target_idxs}
-Restart=on-failure
-RestartSec=2s
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  else
-    install_service strata-nvidia-pstate.service <<EOF
-[Unit]
-Description=NVIDIA GPU Idle P-State Polling Service (Strata)
-
-[Service]
-ExecStart=/bin/sh -c 'nohup /opt/strata-nvidia-pstate/venv/bin/python /usr/local/libexec/strata-nvidia-pstated.py ${target_idxs} >/dev/null 2>&1 &'
-ExecStop=/bin/sh -c 'pkill -f strata-nvidia-pstated.py >/dev/null 2>&1 || true'
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  fi
-}
-revert_nvidia_pstate() {
-  service_installed nvidia-pstated.service && remove_service nvidia-pstated.service
-  service_installed strata-nvidia-pstate.service && remove_service strata-nvidia-pstate.service
-  if [[ -x /opt/strata-nvidia-pstate/venv/bin/python ]]; then
-    local _tidxs=""
-    _tidxs="$(nvidia_pstate_target_indices)"
-    run_root /opt/strata-nvidia-pstate/venv/bin/python - "$_tidxs" <<'PY' >/dev/null 2>&1 || true
-import inspect, sys
-from nvidia_pstate import set_pstate_high
-idxs = [int(x) for x in sys.argv[1].split(",") if x.strip().isdigit()] if len(sys.argv) > 1 and sys.argv[1] else None
-sig = inspect.signature(set_pstate_high)
-if not sig.parameters or idxs is None:
-    set_pstate_high()
-else:
-    p = next(iter(sig.parameters))
-    for i in idxs:
-        set_pstate_high(**{p: i})
-PY
-  fi
-  run_root rm -f /usr/local/libexec/strata-nvidia-pstated.py "$NVIDIA_PSTATE_MARKER"
-}
-
-# 11c. Intel Arc / iGPU
-applicable_intel_gpu_perf() {
-  [[ "$HAS_INTEL_GPU" == true ]] || return 1
-  compgen -G "/sys/class/drm/card*/gt_min_freq_mhz" >/dev/null 2>&1 || compgen -G "/sys/class/drm/card*/device/tile*/gt*/freq*/min_freq" >/dev/null 2>&1
-}
-title_intel_gpu_perf() { echo "Intel Arc / iGPU Maximum Base Frequency Lock (xe / i915 / SYCL)"; }
-status_intel_gpu_perf() { service_installed strata-intel-gpu-perf.service && unit_enabled strata-intel-gpu-perf.service; }
-explain_intel_gpu_perf() { echo -e "Impact:\n  Raises Intel GPU minimum frequency to RP0/max (supports xe and i915) for SYCL."; }
-apply_intel_gpu_perf() {
-  install_service strata-intel-gpu-perf.service <<'EOF'
-[Unit]
-Description=Set Intel GPU Min Frequency to Max for Strata
-After=multi-user.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/bin/sh -c 'for d in /sys/class/drm/card*; do [ -w "$d/gt_min_freq_mhz" ] && [ -r "$d/gt_max_freq_mhz" ] && cat "$d/gt_max_freq_mhz" > "$d/gt_min_freq_mhz"; done; for f in /sys/class/drm/card*/device/tile*/gt*/freq*; do [ -w "$f/min_freq" ] && [ -r "$f/rp0_freq" ] && cat "$f/rp0_freq" > "$f/min_freq"; done; true'
-ExecStop=/bin/sh -c 'for d in /sys/class/drm/card*; do [ -w "$d/gt_min_freq_mhz" ] && [ -r "$d/gt_RPn_freq_mhz" ] && cat "$d/gt_RPn_freq_mhz" > "$d/gt_min_freq_mhz"; done; for f in /sys/class/drm/card*/device/tile*/gt*/freq*; do [ -w "$f/min_freq" ] && [ -r "$f/rpn_freq" ] && cat "$f/rpn_freq" > "$f/min_freq"; done; true'
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-revert_intel_gpu_perf() {
-  remove_service strata-intel-gpu-perf.service
-  run_root sh -c 'for d in /sys/class/drm/card*; do [ -w "$d/gt_min_freq_mhz" ] && [ -r "$d/gt_RPn_freq_mhz" ] && cat "$d/gt_RPn_freq_mhz" > "$d/gt_min_freq_mhz"; done; for f in /sys/class/drm/card*/device/tile*/gt*/freq*; do [ -w "$f/min_freq" ] && [ -r "$f/rpn_freq" ] && cat "$f/rpn_freq" > "$f/min_freq"; done' 2>/dev/null || true
-}
-
-# 12. Sysctl & Scheduler
-applicable_sysctl_tuning() { [[ "$IS_MACOS" == false ]]; }
-title_sysctl_tuning() { echo "Kernel VM, Sysctl, THP & Auto-Nice Tuning (ananicy-cpp / bpftune / sysctl)"; }
-strata_swappiness_value() { if status_zram_swap; then echo 100; else echo 10; fi; }
-write_swappiness_conf() {
-  local v
-  v="$(strata_swappiness_value)"
-  printf 'vm.swappiness = %s\n' "$v" | run_root tee /etc/sysctl.d/99-strata-swappiness.conf >/dev/null
-  run_root sysctl -w "vm.swappiness=${v}" >/dev/null 2>&1 || true
-}
-thp_supported() { [[ -e /sys/kernel/mm/transparent_hugepage/enabled ]]; }
-status_sysctl_tuning() {
-  [[ -f /etc/sysctl.d/99-strata-perf.conf ]] && grep -q max_map_count /etc/sysctl.d/99-strata-perf.conf 2>/dev/null || return 1
-  [[ -f /etc/sysctl.d/99-strata-swappiness.conf ]] || return 1
-  if thp_supported; then [[ -f /etc/tmpfiles.d/99-strata-thp.conf ]] || return 1; fi
-  return 0
-}
-explain_sysctl_tuning() {
-  echo -e "Impact:\n  Applies vm.vfs_cache_pressure=50, vm.dirty_ratio=10, vm.zone_reclaim_mode=0,\n  vm.max_map_count>=1048576 (large mmap'd models / CUDA / ROCm),\n  vm.swappiness (100 with zram swap, 10 without), Transparent Huge Pages\n  (enabled=always, defrag=defer+madvise; fewer TLB misses on big weights),\n  and enables ananicy-cpp / bpftune on Arch/CachyOS if available."
-}
-apply_sysctl_tuning() {
-  local cur_map
-  cur_map="$(sysctl -n vm.max_map_count 2>/dev/null || echo 0)"
-  [[ "$cur_map" =~ ^[0-9]+$ ]] || cur_map=0
-  (( cur_map < 1048576 )) && cur_map=1048576
-  run_root tee /etc/sysctl.d/99-strata-perf.conf >/dev/null <<EOF2
-vm.vfs_cache_pressure = 50
-vm.dirty_ratio = 10
-vm.zone_reclaim_mode = 0
-vm.max_map_count = ${cur_map}
-EOF2
-  write_swappiness_conf
-  run_root sysctl --system >/dev/null 2>&1 || true
-  if thp_supported; then
-    local en=/sys/kernel/mm/transparent_hugepage/enabled df=/sys/kernel/mm/transparent_hugepage/defrag prev_en prev_df
-    if [[ -f /etc/tmpfiles.d/99-strata-thp.conf ]]; then
-      prev_en="$(sed -nE 's/^# prev_enabled=([^ ]+).*/\1/p' /etc/tmpfiles.d/99-strata-thp.conf)"
-      prev_df="$(sed -nE 's/^# prev_enabled=[^ ]+ prev_defrag=([^ ]+).*/\1/p' /etc/tmpfiles.d/99-strata-thp.conf)"
-    else
-      prev_en="$(sed -E 's/.*\[([a-z+_]+)\].*/\1/' "$en" 2>/dev/null)"
-      prev_df="$(sed -E 's/.*\[([a-z+_]+)\].*/\1/' "$df" 2>/dev/null)"
-    fi
-    local thp_df_val="defer+madvise"
-    grep -qw "defer+madvise" "$df" 2>/dev/null || thp_df_val="madvise"
-    run_root mkdir -p /etc/tmpfiles.d
-    run_root tee /etc/tmpfiles.d/99-strata-thp.conf >/dev/null <<EOF2
-# prev_enabled=${prev_en:-madvise} prev_defrag=${prev_df:-madvise}
-w /sys/kernel/mm/transparent_hugepage/enabled - - - - always
-w /sys/kernel/mm/transparent_hugepage/defrag - - - - ${thp_df_val}
-EOF2
-    echo always | run_root tee "$en" >/dev/null 2>&1 || true
-    echo "$thp_df_val" | run_root tee "$df" >/dev/null 2>&1 || true
-  fi
-  if [[ "$DISTRO_FAMILY" == "arch" ]]; then
-    local svc
-    for svc in ananicy-cpp.service bpftune.service; do
-      unit_exists "$svc" && run_root systemctl enable --now "$svc" 2>/dev/null || true
-    done
-  fi
-}
-revert_sysctl_tuning() {
-  run_root rm -f /etc/sysctl.d/99-strata-perf.conf /etc/sysctl.d/99-strata-swappiness.conf
-  run_root sysctl -w vm.swappiness=60 >/dev/null 2>&1 || true
-  if [[ -f /etc/tmpfiles.d/99-strata-thp.conf ]]; then
-    local prev_en prev_df
-    prev_en="$(sed -nE 's/^# prev_enabled=([^ ]+).*/\1/p' /etc/tmpfiles.d/99-strata-thp.conf)"
-    prev_df="$(sed -nE 's/^# prev_enabled=[^ ]+ prev_defrag=([^ ]+).*/\1/p' /etc/tmpfiles.d/99-strata-thp.conf)"
-    [[ -n "$prev_en" ]] && echo "$prev_en" | run_root tee /sys/kernel/mm/transparent_hugepage/enabled >/dev/null 2>&1
-    [[ -n "$prev_df" ]] && echo "$prev_df" | run_root tee /sys/kernel/mm/transparent_hugepage/defrag >/dev/null 2>&1
-    run_root rm -f /etc/tmpfiles.d/99-strata-thp.conf
-  fi
-  run_root sysctl --system >/dev/null 2>&1 || true
-}
-
-# 12b. zram Swap
-applicable_zram_swap() {
-  status_zram_swap && return 0
-  case "$DISTRO_FAMILY" in
-    arch)   pkg_available repo zram-generator ;;
-    fedora) pkg_available repo zram-generator-defaults || pkg_available repo zram-generator ;;
-    debian)
-      pkg_available repo zram-tools && return 0
-      pkg_available repo zram-config && return 0
-      [[ "$IS_JETSON" == true ]] && { [[ -d /sys/module/zram ]] || modinfo zram >/dev/null 2>&1; }
-      ;;
-    suse)   pkg_available repo zram-generator ;;
-    *)      return 1 ;;
-  esac
-}
-title_zram_swap() { echo "Compressed zram Swap (zstd/lz4) for Large Model Safety"; }
-status_zram_swap() { swapon --show=NAME --noheadings 2>/dev/null | grep -E "zram" >/dev/null; }
-explain_zram_swap() { echo -e "Impact:\n  Enables compressed RAM swap (/dev/zram0) to prevent OOM crashes on\n  large models without slow storage swap thrashing, and raises vm.swappiness to 100\n  (zram swap is faster than evicting page cache)."; }
-apply_zram_swap() {
-  status_zram_swap && { echo -e "${C_GREEN}zram swap is already active.${C_RESET}"; return 0; }
-  case "$DISTRO_FAMILY" in
-    arch|suse)
-      prompt_install_deps repo zram-generator || return 0
-      run_root tee /etc/systemd/zram-generator.conf >/dev/null <<'EOF'
-[zram0]
-zram-size = ram
-compression-algorithm = zstd
-swap-priority = 100
-EOF
-      run_root systemctl daemon-reload
-      run_root systemctl start systemd-zram-setup@zram0.service
-      ;;
-    fedora)
-      prompt_install_deps repo zram-generator-defaults || return 0
-      run_root systemctl daemon-reload
-      run_root systemctl start systemd-zram-setup@zram0.service 2>/dev/null || true
-      ;;
-    debian)
-      if pkg_available repo zram-tools; then
-        prompt_install_deps repo zram-tools || return 0
-        run_root cp -n /etc/default/zramswap /etc/default/zramswap.bak.strata-setup 2>/dev/null || true
-        run_root tee /etc/default/zramswap >/dev/null <<'EOF'
-ALGO=zstd
-PERCENT=50
-PRIORITY=100
-EOF
-        run_root systemctl enable --now zramswap.service
-      elif pkg_available repo zram-config; then
-        prompt_install_deps repo zram-config || return 0
-        run_root systemctl enable --now zram-config.service 2>/dev/null || true
-      else
-        local zram_kb
-        zram_kb=$(( $(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 4194304) / 2 ))
-        install_service strata-zram.service <<EOF
-[Unit]
-Description=Strata Compressed zram Swap
-After=local-fs.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/bin/sh -c 'modprobe zram num_devices=1; algo=lzo; for a in zstd lz4 lzo; do grep -qw "\$a" /sys/block/zram0/comp_algorithm 2>/dev/null && { algo=\$a; break; }; done; echo "\$algo" > /sys/block/zram0/comp_algorithm 2>/dev/null || true; echo ${zram_kb}K > /sys/block/zram0/disksize && mkswap /dev/zram0 && swapon -p 100 /dev/zram0'
-ExecStop=/bin/sh -c 'swapoff /dev/zram0 2>/dev/null || true; echo 1 > /sys/block/zram0/reset 2>/dev/null || true'
-
-[Install]
-WantedBy=multi-user.target
-EOF
-      fi
-      ;;
-  esac
-  write_swappiness_conf
-}
-revert_zram_swap() {
-  case "$DISTRO_FAMILY" in
-    arch|fedora|suse)
-      if [[ -f /etc/systemd/zram-generator.conf ]]; then
-        run_root systemctl stop systemd-zram-setup@zram0.service 2>/dev/null || true
-        run_root rm -f /etc/systemd/zram-generator.conf
-        run_root systemctl daemon-reload
-      else
-        echo -e "${C_YELLOW}zram was configured by your OS by default; leaving OS zram intact.${C_RESET}"
-      fi
-      ;;
-    debian)
-      if service_installed strata-zram.service; then
-        remove_service strata-zram.service
-      elif unit_exists zramswap.service; then
-        run_root systemctl disable --now zramswap.service 2>/dev/null || true
-        [[ -f /etc/default/zramswap.bak.strata-setup ]] && run_root mv -f /etc/default/zramswap.bak.strata-setup /etc/default/zramswap
-      elif unit_exists zram-config.service; then
-        run_root systemctl disable --now zram-config.service 2>/dev/null || true
-      else
-        echo -e "${C_YELLOW}zram was configured by your OS by default; leaving OS zram intact.${C_RESET}"
-      fi
-      ;;
-  esac
-  [[ -f /etc/sysctl.d/99-strata-swappiness.conf ]] && write_swappiness_conf
-}
-
-# 12c. IRQ Balance
-applicable_irq_balance() { [[ "$IS_MACOS" == false ]] && [[ "$(nproc 2>/dev/null || echo 1)" -gt 1 ]] && { command -v irqbalance >/dev/null 2>&1 || pkg_available repo irqbalance; }; }
-title_irq_balance() { echo "Hardware IRQ Load Balancing (irqbalance)"; }
-status_irq_balance() { unit_enabled irqbalance.service && unit_active irqbalance.service; }
-explain_irq_balance() { echo -e "Impact:\n  Distributes NVMe, NIC, and PCIe/GPU interrupts across CPU cores."; }
-apply_irq_balance() {
-  command -v irqbalance >/dev/null 2>&1 || prompt_install_deps repo irqbalance || return 0
-  run_root systemctl enable --now irqbalance.service
-}
-revert_irq_balance() { run_root systemctl disable --now irqbalance.service 2>/dev/null || true; }
-
-# 12d. NUMA Balancing
-numa_node_count() { echo "${NUMA_NODES:-1}"; }
-cpu_socket_count() { echo "${CPU_SOCKETS:-1}"; }
-applicable_numa_balancing() {
-  [[ -e /proc/sys/kernel/numa_balancing ]] || return 1
-  (( $(numa_node_count) > 1 || $(cpu_socket_count) > 1 ))
-}
-title_numa_balancing() { echo "Disable Automatic NUMA Balancing ($(cpu_socket_count) socket(s), $(numa_node_count) NUMA nodes, page-migration hygiene)"; }
-status_numa_balancing() {
-  [[ -f /etc/sysctl.d/99-strata-numa.conf ]] && [[ "$(cat /proc/sys/kernel/numa_balancing 2>/dev/null)" == "0" ]]
-}
-explain_numa_balancing() {
-  echo -e "Impact:\n  Sets kernel.numa_balancing=0 (persistent via /etc/sysctl.d/99-strata-numa.conf).\n  Stops the kernel from periodically unmapping pages to migrate them between NUMA\n  nodes (jitter/stall hygiene for large model memory; no measured prefill/decode\n  speedup once allocations are resident)."
-}
-apply_numa_balancing() {
-  run_root tee /etc/sysctl.d/99-strata-numa.conf >/dev/null <<'EOF2'
-kernel.numa_balancing = 0
-EOF2
-  run_root sysctl -w kernel.numa_balancing=0 >/dev/null 2>&1 || true
-  run_root sysctl --system >/dev/null 2>&1 || true
-}
-revert_numa_balancing() {
-  run_root rm -f /etc/sysctl.d/99-strata-numa.conf
-  run_root sysctl -w kernel.numa_balancing=1 >/dev/null 2>&1 || true
-  run_root sysctl --system >/dev/null 2>&1 || true
-}
-
-# 12e. Headless Boot Target
-applicable_headless_target() {
-  [[ "$HAS_SYSTEMD" == true ]] || return 1
-  [[ -f "$HEADLESS_MARKER" ]] && return 0
-  [[ "$IS_LAPTOP" == true ]] && return 1
-  [[ "$(systemctl get-default 2>/dev/null)" == "graphical.target" ]] || return 1
-  unit_enabled display-manager.service || unit_active display-manager.service
-}
-title_headless_target() { echo "Headless Boot Target (stop desktop / display manager, free VRAM & RAM)"; }
-status_headless_target() { [[ "$(systemctl get-default 2>/dev/null)" == "multi-user.target" ]]; }
-explain_headless_target() {
-  cat <<'EOF'
-Impact:
-  Sets the default boot target to multi-user.target so the display manager and
-  desktop session no longer start. This frees several hundred MB of VRAM and RAM
-  for models. Over SSH the desktop is stopped immediately; from a local desktop
-  session the change applies on next boot (reboot prompt). Revert restores the
-  previous default target. Only offered on non-laptop machines using a desktop.
-EOF
-}
-apply_headless_target() {
-  local prev
-  prev="$(systemctl get-default 2>/dev/null)"
-  if [[ -n "$prev" && "$prev" != "multi-user.target" ]]; then
-    echo "$prev" | run_root tee "$HEADLESS_MARKER" >/dev/null
-  fi
-  run_root systemctl set-default multi-user.target
-  local remote=false local_gui=false
-  [[ -n "${SSH_CONNECTION:-}${SSH_CLIENT:-}${SSH_TTY:-}" ]] && remote=true
-  if [[ -n "${XDG_SESSION_ID:-}" ]] && [[ "$(loginctl show-session "$XDG_SESSION_ID" -p Remote --value 2>/dev/null)" == "yes" ]]; then
-    remote=true
-  fi
-  if [[ "$remote" == false ]]; then
-    if [[ "${XDG_SESSION_TYPE:-}" =~ ^(x11|wayland)$ || -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
-      local_gui=true
-    elif [[ "$(tty 2>/dev/null || true)" == /dev/pts/* ]] && unit_active display-manager.service; then
-      local_gui=true
-    fi
-  fi
-  if [[ "$local_gui" == true ]]; then
-    echo -e "${C_YELLOW}Running inside a local desktop session; the desktop will stop on next boot.${C_RESET}"
-    REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
-  else
-    run_root systemctl isolate multi-user.target || true
-  fi
-}
-revert_headless_target() {
-  local prev="graphical.target"
-  [[ -f "$HEADLESS_MARKER" ]] && prev="$(cat "$HEADLESS_MARKER" 2>/dev/null)"
-  [[ -n "$prev" ]] || prev="graphical.target"
-  run_root systemctl set-default "$prev"
-  run_root rm -f "$HEADLESS_MARKER"
-  REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
-  echo -e "${C_GREEN}Default target restored to ${prev} (applies on next boot).${C_RESET}"
-}
-
-# 12f. CPU C-State Limit
-cstate_limit_service_installed() { service_installed strata-cstate-limit.service; }
-applicable_cstate_limit() {
-  cstate_limit_service_installed && return 0
-  local f lat
-  for f in /sys/devices/system/cpu/cpu0/cpuidle/state*/latency; do
-    [[ -r "$f" ]] || continue
-    lat="$(cat "$f" 2>/dev/null)"
-    [[ "$lat" =~ ^[0-9]+$ ]] && (( lat > 10 )) && return 0
-  done
-  return 1
-}
-title_cstate_limit() { echo "CPU Deep C-State Limit (lowest wake-up latency, C1 only)"; }
-note_cstate_limit() { echo -e "${C_YELLOW}[!]${C_RESET}"; }
-status_cstate_limit() { cstate_limit_service_installed && unit_enabled strata-cstate-limit.service; }
-explain_cstate_limit() {
-  cat <<'EOF'
-Impact:
-  Disables CPU idle states with an exit latency above 10 us (deep C-states) on
-  all cores via a systemd service, so cores wake instantly when tokens/requests
-  arrive (lower latency jitter for CPU-offloaded layers).
-EOF
-  echo -e "\n${C_YELLOW}[WARNING] Keeping cores out of deep sleep increases idle power consumption${C_RESET}"
-  echo -e "${C_YELLOW}          and hardly provides sustained performance gains for GPU-bound inference.${C_RESET}"
-}
-apply_cstate_limit() {
-  install_service strata-cstate-limit.service <<'EOF'
-[Unit]
-Description=Limit CPU Deep C-States for Strata Low-Latency Inference
-After=multi-user.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/bin/sh -c 'for s in /sys/devices/system/cpu/cpu*/cpuidle/state*; do [ -w "$s/disable" ] && [ "$(cat "$s/latency")" -gt 10 ] && echo 1 > "$s/disable"; done; true'
-ExecStop=/bin/sh -c 'for s in /sys/devices/system/cpu/cpu*/cpuidle/state*; do [ -w "$s/disable" ] && echo 0 > "$s/disable"; done; true'
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-revert_cstate_limit() {
-  remove_service strata-cstate-limit.service
-  run_root sh -c 'for s in /sys/devices/system/cpu/cpu*/cpuidle/state*; do [ -w "$s/disable" ] && echo 0 > "$s/disable"; done; true' 2>/dev/null || true
-}
-
-# 12g. GPU Device Access Groups
-gpu_missing_groups() {
-  local g
-  for g in render video; do
-    getent group "$g" >/dev/null 2>&1 || continue
-    id -nG "$TARGET_USER" 2>/dev/null | tr ' ' '\n' | grep -qx "$g" || echo "$g"
-  done
-}
-applicable_gpu_groups() {
-  [[ "$IS_MACOS" == false && "$TARGET_USER" != "root" ]] || return 1
-  compgen -G "/dev/dri/renderD*" >/dev/null 2>&1 || [[ -e /dev/kfd || -e /dev/nvhost-gpu ]] || return 1
-  getent group render >/dev/null 2>&1 || getent group video >/dev/null 2>&1
-}
-title_gpu_groups() { echo "GPU Device Access Groups (render / video for ROCm, Intel Arc, Vulkan)"; }
-status_gpu_groups() { [[ -z "$(gpu_missing_groups)" ]]; }
-explain_gpu_groups() {
-  cat <<'EOF'
-Impact:
-  Adds your user to the 'render' and 'video' groups (when missing) so ROCm/HIP,
-  Intel SYCL/Level Zero and Vulkan can open /dev/dri/render* and /dev/kfd.
-  Prevents 'GPU not found' / silent CPU fallback. Requires re-login to take effect.
-EOF
-}
-apply_gpu_groups() {
-  local g added=()
-  for g in $(gpu_missing_groups); do
-    run_root usermod -aG "$g" "$TARGET_USER" && added+=("$g")
-  done
-  if (( ${#added[@]} > 0 )); then
-    printf '%s\n' "${added[@]}" | run_root tee -a "$GPU_GROUPS_MARKER" >/dev/null
-    echo -e "${C_GREEN}Added ${TARGET_USER} to: ${added[*]} (log out and back in to apply).${C_RESET}"
-  fi
-}
-revert_gpu_groups() {
-  local g
-  if [[ -f "$GPU_GROUPS_MARKER" ]]; then
-    while IFS= read -r g; do
-      [[ -n "$g" ]] && run_root gpasswd -d "$TARGET_USER" "$g" >/dev/null 2>&1 || true
-    done < "$GPU_GROUPS_MARKER"
-    run_root rm -f "$GPU_GROUPS_MARKER"
-  else
-    echo -e "${C_YELLOW}Group memberships were not added by this script; leaving them intact.${C_RESET}"
-  fi
-}
-
-# 12h. NVIDIA Clock Lock
-applicable_nvidia_clock_lock() { [[ "$HAS_NVIDIA" == true && -n "$NVIDIA_MAX_GFX_CLK" ]]; }
-title_nvidia_clock_lock() {
-  if (( ${#NVIDIA_GPU_INDICES[@]} > 1 )); then
-    echo "NVIDIA Lock GPU Clocks at Maximum (up to ${NVIDIA_MAX_GFX_CLK} MHz core)"
-  else
-    echo "NVIDIA Lock GPU Clocks at Maximum (${NVIDIA_MAX_GFX_CLK} MHz core)"
-  fi
-}
-note_nvidia_clock_lock() { echo -e "${C_YELLOW}[!]${C_RESET}"; }
-status_nvidia_clock_lock() { service_installed nvidia-clock-lock.service && unit_enabled nvidia-clock-lock.service; }
-explain_nvidia_clock_lock() {
-  cat <<EOF
-Impact:
-  Locks GPU core clocks at ${NVIDIA_MAX_GFX_CLK} MHz (and VRAM clocks at ${NVIDIA_MAX_MEM_CLK:-max} MHz when
-  supported) via 'nvidia-smi -lgc/-lmc' (or '-ac' application clocks with
-  Auto Boost disabled on older Kepler/Maxwell/Pascal Tesla GPUs) and a persistent
-  service. Removes clock ramp-up delay for stable, lowest-latency token decode.
-EOF
-  echo -e "\n${C_YELLOW}[WARNING] Locked clocks keep the GPU at high power even when idle${C_RESET}"
-  echo -e "${C_YELLOW}          and hardly provide gains for sustained, GPU-bound generation.${C_RESET}"
-}
-nvidia_best_ac_pair() {
-  local idx="$1" max_mem="${2:-}" max_gfx="${3:-}" raw best=""
-  raw="$(nvidia-smi -i "$idx" --query-supported-clocks=mem,gr --format=csv,noheader,nounits 2>/dev/null || true)"
-  best="$(awk -F', *' '$1~/^[0-9]+$/ && $2~/^[0-9]+$/ {m=$1+0; g=$2+0; if (m > bm || (m == bm && g > bg)) {bm=m; bg=g}} END {if (bm > 0 && bg > 0) printf "%d,%d", bm, bg}' <<<"$raw")"
-  if [[ -n "$best" ]]; then
-    echo "$best"
-  elif [[ -n "$max_mem" && -n "$max_gfx" ]]; then
-    echo "${max_mem},${max_gfx}"
-  fi
-}
-apply_nvidia_clock_lock() {
-  local smi_bin out i idx max_gfx max_mem cc g_name ac_pair exec_start="" exec_stop="" applied=0 lgc_ok ac_ok
-  smi_bin="$(command -v nvidia-smi)"
-  for (( i = 0; i < ${#NVIDIA_GPU_INDICES[@]}; i++ )); do
-    idx="${NVIDIA_GPU_INDICES[$i]}"
-    max_gfx="${NVIDIA_GPU_MAX_GFX_CLK[$i]}"
-    max_mem="${NVIDIA_GPU_MAX_MEM_CLK[$i]}"
-    cc="${NVIDIA_GPU_COMPUTE_CAP[$i]:-}"
-    g_name="${NVIDIA_GPU_NAMES[$i]}"
-    [[ -n "$max_gfx" ]] || continue
-    lgc_ok=false
-    if out="$(run_root "$smi_bin" -i "$idx" -lgc "${max_gfx},${max_gfx}" 2>&1)" && ! grep -qiE "not supported|not a valid|failed|error" <<<"$out"; then
-      lgc_ok=true
-      exec_start+="ExecStart=${smi_bin} -i ${idx} -lgc ${max_gfx},${max_gfx}"$'\n'
-      exec_stop+="ExecStop=-${smi_bin} -i ${idx} -rgc"$'\n'
-      if [[ -n "$max_mem" ]]; then
-        run_root "$smi_bin" -i "$idx" -lmc "${max_mem},${max_mem}" >/dev/null 2>&1 || true
-        exec_start+="ExecStart=-${smi_bin} -i ${idx} -lmc ${max_mem},${max_mem}"$'\n'
-        exec_stop+="ExecStop=-${smi_bin} -i ${idx} -rmc"$'\n'
-      fi
-      applied=$((applied + 1))
-    fi
-    if [[ "$lgc_ok" == false ]]; then
-      ac_pair="$(nvidia_best_ac_pair "$idx" "$max_mem" "$max_gfx")"
-      if [[ "$cc" =~ ^(3\.|5\.) ]] || grep -qiE "\b(K80|K40|K20|K10|M40|M60|M10)\b" <<<"$g_name"; then
-        run_root "$smi_bin" -i "$idx" --auto-boost-default=0 >/dev/null 2>&1 || true
-        exec_start+="ExecStart=-${smi_bin} -i ${idx} --auto-boost-default=0"$'\n'
-        exec_stop+="ExecStop=-${smi_bin} -i ${idx} --auto-boost-default=1"$'\n'
-      fi
-      ac_ok=false
-      if [[ -n "$ac_pair" ]] && out="$(run_root "$smi_bin" -i "$idx" -ac "$ac_pair" 2>&1)" && ! grep -qiE "not supported|not a valid|failed|error" <<<"$out"; then
-        ac_ok=true
-        exec_start+="ExecStart=${smi_bin} -i ${idx} -ac ${ac_pair}"$'\n'
-        exec_stop+="ExecStop=-${smi_bin} -i ${idx} -rac"$'\n'
-        applied=$((applied + 1))
-      else
-        echo -e "${C_YELLOW}nvidia-smi clock lock (-lgc/-ac) is not supported on GPU ${idx} (${g_name}): ${out}${C_RESET}"
-      fi
-    fi
-  done
-  if (( applied == 0 )); then
-    return 1
-  fi
-  install_service nvidia-clock-lock.service <<EOF
-[Unit]
-Description=Lock NVIDIA GPU Clocks at Maximum for Strata
-After=nvidia-persistenced.service strata-nvidia-persistenced.service nvidia-powerd.service
-Wants=nvidia-persistenced.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-${exec_start%$'\n'}
-${exec_stop%$'\n'}
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-revert_nvidia_clock_lock() {
-  remove_service nvidia-clock-lock.service
-  local idx
-  for idx in "${NVIDIA_GPU_INDICES[@]}"; do
-    run_root nvidia-smi -i "$idx" -rgc >/dev/null 2>&1 || true
-    run_root nvidia-smi -i "$idx" -rmc >/dev/null 2>&1 || true
-    run_root nvidia-smi -i "$idx" -rac >/dev/null 2>&1 || true
-    run_root nvidia-smi -i "$idx" --auto-boost-default=1 >/dev/null 2>&1 || true
-  done
-}
-
-# 12i. NVIDIA ECC
-applicable_nvidia_ecc() { [[ "$HAS_NVIDIA" == true && ${#NVIDIA_ECC_INDICES[@]} -gt 0 ]]; }
-title_nvidia_ecc() { echo "NVIDIA ECC Memory Off (reclaim ~6-12% VRAM & bandwidth, reboot)"; }
-status_nvidia_ecc() { [[ "$NVIDIA_ECC_PEND" == "Disabled" ]]; }
-explain_nvidia_ecc() {
-  cat <<'EOF'
-Impact:
-  Disables ECC on workstation/datacenter NVIDIA GPUs ('nvidia-smi -e 0'). ECC
-  consumes roughly 6-12% of VRAM and some memory bandwidth; turning it off gives
-  models more room and slightly higher decode speed. Requires a reboot.
-  Trade-off: GPU memory errors are no longer corrected (fine for inference).
-EOF
-}
-apply_nvidia_ecc() {
-  local idx any_ok=false
-  for idx in "${NVIDIA_ECC_INDICES[@]}"; do
-    if run_root nvidia-smi -i "$idx" -e 0; then
-      any_ok=true
-    else
-      echo -e "${C_YELLOW}Could not disable ECC mode on GPU ${idx}.${C_RESET}"
-    fi
-  done
-  if [[ "$any_ok" == true ]]; then
-    refresh_nvidia_ecc
-    REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
-  else
-    return 1
-  fi
-}
-revert_nvidia_ecc() {
-  local idx any_ok=false
-  for idx in "${NVIDIA_ECC_INDICES[@]}"; do
-    run_root nvidia-smi -i "$idx" -e 1 && any_ok=true
-  done
-  if [[ "$any_ok" == true ]]; then
-    refresh_nvidia_ecc
-    REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
-  fi
-}
-
-# 12i2. NVIDIA Compute Mode
-applicable_nvidia_compute_mode() {
-  [[ "$HAS_NVIDIA" == true ]] && ([[ "$NVIDIA_COMPUTE_MODE_NON_DEFAULT" == true ]] || [[ -f "$NVIDIA_COMPUTE_PREV_MARKER" ]])
-}
-title_nvidia_compute_mode() { echo "NVIDIA Compute Mode Default (Shared GPU Access)"; }
-status_nvidia_compute_mode() { [[ "$NVIDIA_COMPUTE_MODE_NON_DEFAULT" == false ]]; }
-explain_nvidia_compute_mode() {
-  cat <<'EOF'
-Impact:
-  Sets NVIDIA GPU compute mode to Default ('nvidia-smi -c 0') on GPUs currently
-  in Exclusive_Process, Exclusive_Thread, or Prohibited mode (common on Tesla
-  datacenter/cloud hosts). Allows multiple processes/workers to share the GPU.
-EOF
-}
-apply_nvidia_compute_mode() {
-  local i idx cmode mnum prev_lines="" any_ok=false
-  for (( i = 0; i < ${#NVIDIA_GPU_INDICES[@]}; i++ )); do
-    idx="${NVIDIA_GPU_INDICES[$i]}"
-    cmode="${NVIDIA_GPU_COMPUTE_MODE[$i]}"
-    [[ -n "$cmode" && "$cmode" != "Default" ]] || continue
-    case "$cmode" in
-      Exclusive_Thread)  mnum=1 ;;
-      Prohibited)        mnum=2 ;;
-      Exclusive_Process) mnum=3 ;;
-      *)                 mnum="" ;;
-    esac
-    [[ -n "$mnum" ]] && prev_lines+="${idx}:${mnum}"$'\n'
-    if run_root nvidia-smi -i "$idx" -c 0; then
-      any_ok=true
-    else
-      echo -e "${C_YELLOW}Could not set compute mode on GPU ${idx} (${NVIDIA_GPU_NAMES[$i]}).${C_RESET}"
-    fi
-  done
-  if [[ -n "$prev_lines" && "$any_ok" == true ]]; then
-    printf "%s" "$prev_lines" | run_root tee "$NVIDIA_COMPUTE_PREV_MARKER" >/dev/null
-  fi
-  refresh_nvidia_compute_mode
-  [[ "$any_ok" == true ]]
-}
-revert_nvidia_compute_mode() {
-  if [[ -f "$NVIDIA_COMPUTE_PREV_MARKER" ]]; then
-    local line idx mnum
-    while IFS=: read -r idx mnum; do
-      [[ "$idx" =~ ^[0-9]+$ && "$mnum" =~ ^[0-3]$ ]] || continue
-      run_root nvidia-smi -i "$idx" -c "$mnum" >/dev/null 2>&1 || true
-    done < "$NVIDIA_COMPUTE_PREV_MARKER"
-    run_root rm -f "$NVIDIA_COMPUTE_PREV_MARKER"
-    refresh_nvidia_compute_mode
-  else
-    echo -e "${C_YELLOW}Previous compute modes were not recorded by this script; leaving as Default.${C_RESET}"
-  fi
-}
-
-# 12i3. NVIDIA Disable MIG Mode
-applicable_nvidia_mig_disable() {
-  [[ "$HAS_NVIDIA" == true ]] || { [[ -f "$NVIDIA_MIG_PREV_MARKER" ]]; return $?; }
-  { (( ${#NVIDIA_MIG_INDICES[@]} > 0 )) && [[ "$NVIDIA_MIG_ANY_ENABLED" == true || "$NVIDIA_MIG_ANY_PEND_ENABLED" == true ]]; } || [[ -f "$NVIDIA_MIG_PREV_MARKER" ]]
-}
-title_nvidia_mig_disable() { echo "NVIDIA Disable MIG Mode (Full VRAM & Multi-GPU Tensor Parallelism)"; }
-status_nvidia_mig_disable() {
-  [[ "$NVIDIA_MIG_ANY_ENABLED" == false && "$NVIDIA_MIG_ANY_PEND_ENABLED" == false ]]
-}
-explain_nvidia_mig_disable() {
-  cat <<'EOF'
-Impact:
-  Disables NVIDIA Multi-Instance GPU partitioning ('nvidia-smi -mig 0') on
-  A100/A30/H100/H200/B200 GPUs that have MIG enabled (often left on by cloud or
-  used-server images). Reclaims full unpartitioned VRAM and enables multi-GPU
-  NVLink / tensor parallelism. May require GPU reset or reboot to apply.
-EOF
-}
-apply_nvidia_mig_disable() {
-  local i idx cur pend out prev_lines="" any_ok=false
-  for (( i = 0; i < ${#NVIDIA_MIG_INDICES[@]}; i++ )); do
-    idx="${NVIDIA_MIG_INDICES[$i]}"
-    cur="${NVIDIA_GPU_MIG_CUR[$i]}"
-    pend="${NVIDIA_GPU_MIG_PEND[$i]}"
-    [[ "$cur" == "Enabled" || "$pend" == "Enabled" ]] || continue
-    prev_lines+="${idx}"$'\n'
-    if out="$(run_root nvidia-smi -i "$idx" -mig 0 2>&1)" && ! grep -qiE "not supported|failed|error|unable" <<<"$out"; then
-      any_ok=true
-      if [[ "$cur" == "Enabled" ]]; then
-        if [[ -z "$(nvidia-smi -i "$idx" --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -d '[:space:]')" ]]; then
-          run_root nvidia-smi --gpu-reset -i "$idx" >/dev/null 2>&1 || true
-        fi
-      fi
-    else
-      echo -e "${C_YELLOW}Could not disable MIG mode on GPU ${idx}: ${out}${C_RESET}"
-    fi
-  done
-  if [[ -n "$prev_lines" && "$any_ok" == true ]]; then
-    printf "%s" "$prev_lines" | run_root tee "$NVIDIA_MIG_PREV_MARKER" >/dev/null
-  fi
-  refresh_nvidia_mig
-  if [[ "$NVIDIA_MIG_ANY_ENABLED" == true ]]; then
-    REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
-  fi
-  [[ "$any_ok" == true ]]
-}
-revert_nvidia_mig_disable() {
-  if [[ -f "$NVIDIA_MIG_PREV_MARKER" ]]; then
-    local idx any_ok=false
-    while IFS= read -r idx; do
-      [[ "$idx" =~ ^[0-9]+$ ]] || continue
-      if run_root nvidia-smi -i "$idx" -mig 1; then
-        any_ok=true
-        if [[ -z "$(nvidia-smi -i "$idx" --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -d '[:space:]')" ]]; then
-          run_root nvidia-smi --gpu-reset -i "$idx" >/dev/null 2>&1 || true
-        fi
-      fi
-    done < "$NVIDIA_MIG_PREV_MARKER"
-    run_root rm -f "$NVIDIA_MIG_PREV_MARKER"
-    refresh_nvidia_mig
-    if [[ "$any_ok" == true && "$NVIDIA_MIG_ANY_ENABLED" == false ]]; then
-      REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
-    fi
-  else
-    echo -e "${C_YELLOW}Previous MIG state was not recorded by this script; leaving MIG disabled.${C_RESET}"
-  fi
-}
-
-# 12j. AMD APU Unified Memory Limit
-amd_apu_gtt_pages() {
-  local kb reserve
-  kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
-  reserve=$((4 * 1048576))
-  (( kb / 8 > reserve )) && reserve=$((kb / 8))
-  echo $(( (kb - reserve) / 4 ))
-}
-applicable_amd_apu_memory() {
-  [[ "$HAS_AMD" == true && "$HAS_AMD_APU" == true ]] || return 1
-  local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}"
-  compgen -G "${drm_dir}/card*/device/mem_info_gtt_total" >/dev/null 2>&1
-}
-title_amd_apu_memory() { echo "AMD APU Unified Memory GPU Limit (ttm.pages_limit ~ $(( $(amd_apu_gtt_pages) * 4 / 1048576 )) GiB)"; }
-status_amd_apu_memory() { [[ -n "$(kernel_param_value ttm.pages_limit || true)" ]]; }
-explain_amd_apu_memory() {
-  cat <<EOF
-Impact:
-  Raises the amount of system RAM unified-memory AMD APUs (Strix Point gfx1150,
-  Strix Halo gfx1151, Krackan gfx1152, Phoenix/Hawk Point gfx1103, etc.) can
-  address via GTT from the default of about half of RAM to ~$(( $(amd_apu_gtt_pages) * 4 / 1048576 )) GiB
-  (all RAM minus a 4 GiB / 12.5% reserve) by adding 'ttm.pages_limit' and
-  'ttm.page_pool_size' to the bootloader kernel command line.
-  Lets large models fully offload to the integrated GPU. Requires a reboot.
-EOF
-}
-apply_amd_apu_memory() {
-  local pages
-  pages="$(amd_apu_gtt_pages)"
-  add_kernel_param "ttm.pages_limit=${pages}" "ttm.page_pool_size=${pages}"
-}
-revert_amd_apu_memory() {
-  local n v
-  local -a rem=()
-  for n in ttm.pages_limit ttm.page_pool_size; do
-    v="$(kernel_param_value "$n" || true)"
-    [[ -n "$v" ]] && rem+=("${n}=${v}")
-  done
-  (( ${#rem[@]} > 0 )) && remove_kernel_param "${rem[@]}"
-}
-
-# 12j2. AMD Radeon 780M/760M MES Reset Workaround (gfx1103)
-applicable_amd_cwsr_disable() {
-  amd_has_gfx "gfx1103" || has_kernel_param "amdgpu.cwsr_enable=0"
-}
-title_amd_cwsr_disable() { echo "AMD Radeon 780M/760M MES Reset Workaround (amdgpu.cwsr_enable=0)"; }
-status_amd_cwsr_disable() { has_kernel_param "amdgpu.cwsr_enable=0"; }
-explain_amd_cwsr_disable() {
-  cat <<'EOF'
-Impact:
-  Disables Compute Wave Save/Restore (CWSR) preemption by adding
-  'amdgpu.cwsr_enable=0' to the bootloader kernel command line. Stops MES
-  REMOVE_QUEUE GPU resets seen on Linux with Radeon 780M / 760M (gfx1103,
-  Strata #6132) without increasing idle power draw. Requires a reboot.
-EOF
-}
-apply_amd_cwsr_disable() { add_kernel_param "amdgpu.cwsr_enable=0"; }
-revert_amd_cwsr_disable() { remove_kernel_param "amdgpu.cwsr_enable=0"; }
-
-# 12k. NVMe Tuning
-applicable_nvme_tuning() { compgen -G "/sys/block/nvme*n*" >/dev/null 2>&1; }
-title_nvme_tuning() { echo "NVMe I/O Scheduler & Read-Ahead (faster model loading)"; }
-status_nvme_tuning() { [[ -f /etc/udev/rules.d/60-strata-nvme.rules ]]; }
-explain_nvme_tuning() {
-  cat <<'EOF'
-Impact:
-  Installs a udev rule setting every NVMe disk to I/O scheduler 'none' with a
-  4 MiB read-ahead (queue/read_ahead_kb=4096). Large sequential model reads and
-  mmap page-ins load noticeably faster than with the 128 KiB default.
-EOF
-}
-apply_nvme_tuning() {
-  run_root tee /etc/udev/rules.d/60-strata-nvme.rules >/dev/null <<'EOF'
-ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="nvme[0-9]*n[0-9]*", ENV{DEVTYPE}=="disk", ATTR{queue/scheduler}="none", ATTR{queue/read_ahead_kb}="4096"
-EOF
-  run_root udevadm control --reload >/dev/null 2>&1 || true
-  run_root sh -c 'for d in /sys/block/nvme*n*; do echo none > "$d/queue/scheduler" 2>/dev/null; echo 4096 > "$d/queue/read_ahead_kb" 2>/dev/null; done; true'
-}
-revert_nvme_tuning() {
-  run_root rm -f /etc/udev/rules.d/60-strata-nvme.rules
-  run_root udevadm control --reload >/dev/null 2>&1 || true
-  run_root sh -c 'for d in /sys/block/nvme*n*; do echo 128 > "$d/queue/read_ahead_kb" 2>/dev/null; done; true'
-}
-
-# 12l. Network Serving Tuning
-has_physical_nic_up() {
-  local n
-  for n in /sys/class/net/*; do
-    [[ "$(basename "$n")" == "lo" ]] && continue
-    [[ -e "$n/device" && "$(cat "$n/operstate" 2>/dev/null)" == "up" ]] && return 0
-  done
-  return 1
-}
-applicable_net_tuning() {
-  [[ "$IS_MACOS" == false ]] || return 1
-  [[ -f /etc/sysctl.d/99-strata-net.conf ]] && return 0
-  [[ -e /proc/sys/net/core/somaxconn ]] && has_physical_nic_up
-}
-title_net_tuning() { echo "Network Serving Tuning (somaxconn, TCP Fast Open, BBR)"; }
-status_net_tuning() { [[ -f /etc/sysctl.d/99-strata-net.conf ]]; }
-explain_net_tuning() {
-  cat <<'EOF'
-Impact:
-  Raises net.core.somaxconn (4096), enables TCP Fast Open, disables TCP slow-start
-  after idle (keeps streaming token responses fast) and enables BBR congestion
-  control with the fq qdisc when the kernel supports it. Helps when Strata serves
-  many concurrent API clients over the network.
-EOF
-}
-apply_net_tuning() {
-  local opts=("net.core.somaxconn=4096" "net.ipv4.tcp_fastopen=3" "net.ipv4.tcp_slow_start_after_idle=0")
-  run_root modprobe tcp_bbr >/dev/null 2>&1 || true
-  if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
-    opts+=("net.core.default_qdisc=fq" "net.ipv4.tcp_congestion_control=bbr")
-    echo "tcp_bbr" | run_root tee /etc/modules-load.d/strata-bbr.conf >/dev/null
-  fi
-  write_sysctl_with_prev /etc/sysctl.d/99-strata-net.conf "${opts[@]}"
-}
-revert_net_tuning() {
-  restore_sysctl_prev /etc/sysctl.d/99-strata-net.conf
-  run_root rm -f /etc/modules-load.d/strata-bbr.conf
-}
-
-# 12m. Ryzen APU Power Limits (ryzenadj)
-is_amd_mobile_apu_cpu() {
-  grep -qi "AuthenticAMD" /proc/cpuinfo 2>/dev/null || return 1
-  grep -m1 '^model name' /proc/cpuinfo 2>/dev/null | grep -qiE 'Ryzen AI|Radeon|Ryzen.*[0-9]{3,4}(U|HS|H|HX|G|GE)\b'
-}
-applicable_ryzenadj_tdp() {
-  service_installed strata-ryzenadj.service && return 0
-  is_amd_mobile_apu_cpu || return 1
-  command -v ryzenadj >/dev/null 2>&1 || pkg_available repo ryzenadj || pkg_available aur ryzenadj
-}
-title_ryzenadj_tdp() { echo "Ryzen APU Sustained Power Limits (STAPM/PPT via ryzenadj)"; }
-status_ryzenadj_tdp() { service_installed strata-ryzenadj.service && unit_enabled strata-ryzenadj.service; }
-explain_ryzenadj_tdp() {
-  cat <<'EOF'
-Impact:
-  Raises the Ryzen mobile/APU sustained (STAPM), slow and fast PPT power limits via
-  ryzenadj and re-applies them at boot and after resume. Many laptops and mini PCs
-  ship with limits far below what the cooling can handle, which throttles
-  sustained CPU/iGPU inference. You choose the target wattage (default: +25%).
-  Higher limits raise power draw and heat; the previous limits are saved and
-  restored on revert. Needs ryzen_smu or iomem=relaxed support from the kernel.
-EOF
-}
-apply_ryzenadj_tdp() {
-  command -v ryzenadj >/dev/null 2>&1 || prompt_install_repo_or_aur ryzenadj || return 0
-  local bin info stapm slow fast target in_w fast_t
-  bin="$(command -v ryzenadj)" || return 1
-  if ! info="$(run_root "$bin" -i 2>&1)"; then
-    echo -e "${C_YELLOW}ryzenadj cannot read this CPU (load the ryzen_smu module or boot with iomem=relaxed): ${info}${C_RESET}"
-    return 1
-  fi
-  stapm="$(awk -F'|' '/STAPM LIMIT/ {gsub(/ /,"",$3); print $3; exit}' <<<"$info")"
-  slow="$(awk -F'|' '/PPT LIMIT SLOW/ {gsub(/ /,"",$3); print $3; exit}' <<<"$info")"
-  fast="$(awk -F'|' '/PPT LIMIT FAST/ {gsub(/ /,"",$3); print $3; exit}' <<<"$info")"
-  if ! [[ "$slow" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-    echo -e "${C_YELLOW}Could not read current power limits from ryzenadj.${C_RESET}"
-    return 1
-  fi
-  if [[ ! -f "$RYZENADJ_MARKER" ]]; then
-    [[ "$stapm" =~ ^[0-9]+(\.[0-9]+)?$ ]] || stapm=0
-    [[ "$fast" =~ ^[0-9]+(\.[0-9]+)?$ ]] || fast=0
-    awk -v a="$stapm" -v b="$fast" -v c="$slow" 'BEGIN {printf "%d %d %d\n", a*1000, b*1000, c*1000}' | run_root tee "$RYZENADJ_MARKER" >/dev/null
-  fi
-  target="$(awk -v s="$slow" 'BEGIN {printf "%d", s*1.25 + 0.5}')"
-  read -r -p "Sustained power limit in watts [default: ${target}]: " in_w
-  [[ -n "$in_w" ]] && target="$in_w"
-  if ! [[ "$target" =~ ^[0-9]+$ ]] || (( target < 5 || target > 200 )); then
-    echo -e "${C_RED}Power limit must be an integer between 5 and 200 W.${C_RESET}"
-    return 1
-  fi
-  fast_t="$(awk -v t="$target" 'BEGIN {printf "%d", t*1.15 + 0.5}')"
-  local prev_stapm=0 prev_fast=0 prev_slow=0 stop_args=""
-  [[ -r "$RYZENADJ_MARKER" ]] && read -r prev_stapm prev_fast prev_slow < "$RYZENADJ_MARKER"
-  (( ${prev_stapm:-0} > 0 )) && stop_args+=" --stapm-limit=${prev_stapm}"
-  (( ${prev_slow:-0} > 0 )) && stop_args+=" --slow-limit=${prev_slow}"
-  (( ${prev_fast:-0} > 0 )) && stop_args+=" --fast-limit=${prev_fast}"
-  install_service strata-ryzenadj.service <<EOF
-[Unit]
-Description=Raise Ryzen APU Power Limits for Strata
-After=multi-user.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=${bin} --stapm-limit=$((target * 1000)) --slow-limit=$((target * 1000)) --fast-limit=$((fast_t * 1000))
-${stop_args:+ExecStop=-${bin}${stop_args}}
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-revert_ryzenadj_tdp() {
-  remove_service strata-ryzenadj.service
-  run_root rm -f "$RYZENADJ_MARKER"
-}
-
-# 12n. Intel RAPL Power Limits
-RAPL_DIR="/sys/class/powercap/intel-rapl:0"
-rapl_val() { local v; v="$(cat "$1" 2>/dev/null || true)"; [[ "$v" =~ ^[0-9]+$ ]] && echo "$v" || echo 0; }
-applicable_intel_rapl() {
-  service_installed strata-rapl.service && return 0
-  grep -qi "GenuineIntel" /proc/cpuinfo 2>/dev/null || return 1
-  [[ -r "$RAPL_DIR/constraint_0_power_limit_uw" ]] || return 1
-  local max cur
-  max="$(rapl_val "$RAPL_DIR/constraint_0_max_power_uw")"
-  cur="$(rapl_val "$RAPL_DIR/constraint_0_power_limit_uw")"
-  (( max > 0 && max > cur ))
-}
-title_intel_rapl() {
-  echo "Intel CPU Power Limits to Platform Max (PL1 $(( $(rapl_val "$RAPL_DIR/constraint_0_power_limit_uw") / 1000000 ))W -> $(( $(rapl_val "$RAPL_DIR/constraint_0_max_power_uw") / 1000000 ))W)"
-}
-status_intel_rapl() { service_installed strata-rapl.service && unit_enabled strata-rapl.service; }
-explain_intel_rapl() {
-  cat <<'EOF'
-Impact:
-  Raises the Intel RAPL long-term (PL1) and short-term (PL2) package power limits
-  to the platform maximum via a systemd service, removing power-limit throttling
-  under sustained CPU load. Previous limits are saved and restored on revert.
-  Combine with thermald on laptops so thermal limits still protect the CPU.
-EOF
-}
-apply_intel_rapl() {
-  local c0_max c1_max c0_cur c1_cur
-  c0_max="$(rapl_val "$RAPL_DIR/constraint_0_max_power_uw")"
-  c1_max="$(rapl_val "$RAPL_DIR/constraint_1_max_power_uw")"
-  c0_cur="$(rapl_val "$RAPL_DIR/constraint_0_power_limit_uw")"
-  c1_cur="$(rapl_val "$RAPL_DIR/constraint_1_power_limit_uw")"
-  if [[ ! -f "$RAPL_MARKER" ]]; then
-    echo "${c0_cur} ${c1_cur}" | run_root tee "$RAPL_MARKER" >/dev/null
-  fi
-  if ! echo "$c0_max" | run_root tee "$RAPL_DIR/constraint_0_power_limit_uw" >/dev/null 2>&1; then
-    echo -e "${C_YELLOW}The firmware locks the RAPL power limits (BIOS setting); cannot change them.${C_RESET}"
-    run_root rm -f "$RAPL_MARKER"
-    return 1
-  fi
-  local c1_cmd=""
-  (( c1_max > 0 )) && c1_cmd="[ -w ${RAPL_DIR}/constraint_1_power_limit_uw ] && echo ${c1_max} > ${RAPL_DIR}/constraint_1_power_limit_uw; "
-  local p_c0=0 p_c1=0
-  [[ -r "$RAPL_MARKER" ]] && read -r p_c0 p_c1 < "$RAPL_MARKER"
-  install_service strata-rapl.service <<EOF
-[Unit]
-Description=Raise Intel RAPL Power Limits for Strata
-After=multi-user.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/bin/sh -c 'echo ${c0_max} > ${RAPL_DIR}/constraint_0_power_limit_uw; ${c1_cmd}true'
-ExecStop=-/bin/sh -c '[ ${p_c0:-0} -gt 0 ] && echo ${p_c0:-0} > ${RAPL_DIR}/constraint_0_power_limit_uw; [ ${p_c1:-0} -gt 0 ] && echo ${p_c1:-0} > ${RAPL_DIR}/constraint_1_power_limit_uw; true'
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-revert_intel_rapl() {
-  remove_service strata-rapl.service
-  if [[ -f "$RAPL_MARKER" ]]; then
-    local p_c0 p_c1
-    read -r p_c0 p_c1 < "$RAPL_MARKER"
-    (( p_c0 > 0 )) && echo "$p_c0" | run_root tee "$RAPL_DIR/constraint_0_power_limit_uw" >/dev/null 2>&1
-    (( p_c1 > 0 )) && echo "$p_c1" | run_root tee "$RAPL_DIR/constraint_1_power_limit_uw" >/dev/null 2>&1
-    run_root rm -f "$RAPL_MARKER"
-  fi
-}
-
-# 12o. Intel thermald
-applicable_intel_thermald() {
-  grep -qi "GenuineIntel" /proc/cpuinfo 2>/dev/null || return 1
-  unit_exists thermald.service || command -v thermald >/dev/null 2>&1 || pkg_available repo thermald
-}
-title_intel_thermald() { echo "Intel Thermal Daemon (thermald, avoids hard thermal throttling)"; }
-status_intel_thermald() { unit_enabled thermald.service && unit_active thermald.service; }
-explain_intel_thermald() { echo -e "Impact:\n  Installs/enables thermald, which uses RAPL/P-state/powerclamp cooling to hold\n  Intel CPUs just below thermal limits instead of hitting abrupt hardware throttling."; }
-apply_intel_thermald() {
-  command -v thermald >/dev/null 2>&1 || prompt_install_deps repo thermald || return 0
-  run_root systemctl enable --now thermald.service
-}
-revert_intel_thermald() { run_root systemctl disable --now thermald.service 2>/dev/null || true; }
-
-# 12p. tuned profile
-applicable_tuned_profile() {
-  [[ -f "$TUNED_MARKER" ]] && return 0
-  unit_active power-profiles-daemon.service && return 1
-  unit_active tlp.service && return 1
-  unit_exists tuned.service || command -v tuned-adm >/dev/null 2>&1 || pkg_available repo tuned
-}
-tuned_target_profile() {
-  if command -v tuned-adm >/dev/null 2>&1 && tuned-adm list 2>/dev/null | grep -E "accelerator-performance" >/dev/null; then
-    echo accelerator-performance
-  else
-    echo throughput-performance
-  fi
-}
-title_tuned_profile() { echo "tuned Profile (throughput-performance / accelerator-performance)"; }
-note_tuned_profile() { echo -e "${C_YELLOW}[!]${C_RESET}"; }
-status_tuned_profile() {
-  unit_active tuned.service || return 1
-  tuned-adm active 2>/dev/null | grep -E "throughput-performance|accelerator-performance" >/dev/null
-}
-explain_tuned_profile() {
-  cat <<'EOF'
-Impact:
-  Installs/enables tuned and activates the 'throughput-performance' (or
-  'accelerator-performance' when available) profile: performance governor,
-  energy-performance bias, and larger dirty/readahead/scheduler settings.
-  Not offered when power-profiles-daemon or TLP manage power.
-EOF
-  echo -e "\n${C_YELLOW}[WARNING] These profiles keep the CPU at high clocks and raise idle power${C_RESET}"
-  echo -e "${C_YELLOW}          while adding little over the other tuning steps for GPU-bound inference.${C_RESET}"
-}
-apply_tuned_profile() {
-  command -v tuned-adm >/dev/null 2>&1 || prompt_install_deps repo tuned || return 0
-  run_root systemctl enable --now tuned.service || return 1
-  sleep 1
-  if [[ ! -f "$TUNED_MARKER" ]]; then
-    tuned-adm active 2>/dev/null | sed -nE 's/^Current active profile: *//p' | run_root tee "$TUNED_MARKER" >/dev/null
-  fi
-  run_root tuned-adm profile "$(tuned_target_profile)"
-}
-revert_tuned_profile() {
-  local prev=""
-  [[ -f "$TUNED_MARKER" ]] && prev="$(cat "$TUNED_MARKER" 2>/dev/null)"
-  if [[ -n "$prev" ]]; then run_root tuned-adm profile "$prev"; else run_root tuned-adm off 2>/dev/null || true; fi
-  run_root rm -f "$TUNED_MARKER"
-}
-
-# 12q. IOMMU passthrough
-gpu_pci_count() { echo "${DISCRETE_GPU_COUNT:-0}"; }
-applicable_iommu_pt() {
-  has_kernel_param "iommu=pt" && return 0
-  [[ -n "$(ls -A "${STRATA_IOMMU_GROUPS_DIR:-/sys/kernel/iommu_groups}" 2>/dev/null)" ]] && (( $(gpu_pci_count) >= 2 ))
-}
-title_iommu_pt() { echo "IOMMU Passthrough Mode (iommu=pt, lower multi-GPU DMA overhead)"; }
-status_iommu_pt() { has_kernel_param "iommu=pt" || has_kernel_param "iommu.passthrough=1"; }
-explain_iommu_pt() { echo -e "Impact:\n  Adds 'iommu=pt' to the kernel command line so host devices skip IOMMU address\n  translation (lower DMA overhead for multi-GPU transfers and fast NICs). VFIO\n  device passthrough keeps working. Requires a reboot."; }
-apply_iommu_pt() { add_kernel_param "iommu=pt"; }
-revert_iommu_pt() { remove_kernel_param "iommu=pt" "iommu.passthrough=1"; }
-
-# 12q2. Multi-GPU PCIe ACS Disable
-applicable_pcie_acs_disable() {
-  (( $(gpu_pci_count) >= 2 )) && [[ "$HAS_FULL_GPU_INTERCONNECT" == false ]] && command -v setpci >/dev/null 2>&1 &&
-    { service_installed strata-pcie-acs-disable.service || [[ "$PCIE_ACS_CHECKED" == false || "$PCIE_ACS_ENABLED" == true ]]; }
-}
-title_pcie_acs_disable() { echo "Multi-GPU PCIe ACS Disable (setpci, direct GPU-to-GPU P2P)"; }
-note_pcie_acs_disable() { echo -e "${C_MAGENTA}[EXP]${C_RESET}"; }
-status_pcie_acs_disable() { service_installed strata-pcie-acs-disable.service && unit_enabled strata-pcie-acs-disable.service; }
-explain_pcie_acs_disable() {
-  cat <<'EOF'
-Impact:
-  Clears PCIe Access Control Services (ECAP_ACS+0x6.w=0000) via setpci at boot
-  on PCIe bridges/switches when GPUs lack NVLink or XGMI. Allows direct
-  peer-to-peer GPU transfers across PCIe switches instead of detouring through
-  the CPU root complex (boosts multi-GPU tensor parallelism bandwidth).
-EOF
-  echo -e "\n${C_MAGENTA}[EXPERIMENTAL] Disabling ACS removes PCIe isolation between devices.${C_RESET}"
-  echo -e "${C_YELLOW}[WARNING] Bare-metal single-tenant hosts only — DO NOT enable if you use${C_RESET}"
-  echo -e "${C_YELLOW}          VFIO VM passthrough or untrusted multi-tenant VMs.${C_RESET}"
-}
-apply_pcie_acs_disable() {
-  local setpci_bin lspci_bin
-  setpci_bin="$(command -v setpci)" || return 1
-  lspci_bin="$(command -v lspci)" || return 1
-  run_root mkdir -p /usr/local/sbin
-  run_root tee /usr/local/sbin/strata-disable-acs.sh >/dev/null <<EOF
-#!/bin/sh
-bdfs="\$("${lspci_bin}" -d "*:*:0604" 2>/dev/null | awk '{print \$1}')"
-[ -n "\$bdfs" ] || bdfs="\$("${lspci_bin}" -d "*:*:*" 2>/dev/null | awk '{print \$1}')"
-for bdf in \$bdfs; do
-  "${setpci_bin}" -s "\$bdf" ECAP_ACS+0x6.w >/dev/null 2>&1 || continue
-  "${setpci_bin}" -s "\$bdf" ECAP_ACS+0x6.w=0000 >/dev/null 2>&1 || true
-done
-EOF
-  run_root chmod 0755 /usr/local/sbin/strata-disable-acs.sh
-  install_service strata-pcie-acs-disable.service <<'EOF'
-[Unit]
-Description=Disable PCIe ACS for Multi-GPU P2P (Strata)
-After=multi-user.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/sbin/strata-disable-acs.sh
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  detect_gpu_topology
-}
-revert_pcie_acs_disable() {
-  remove_service strata-pcie-acs-disable.service
-  run_root rm -f /usr/local/sbin/strata-disable-acs.sh
-  REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
-  echo -e "${C_YELLOW}Removed PCIe ACS disable service; reboot to restore BIOS default ACS settings.${C_RESET}"
-}
-
-# 12q3. AMD Instinct Compute/Memory Partition Mode
-amd_instinct_partition_supported() {
-  [[ "$HAS_AMD" == true && "$HAS_AMD_INSTINCT" == true ]] || return 1
-  local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}"
-  compgen -G "${drm_dir}/card*/device/current_compute_partition" >/dev/null 2>&1 && return 0
-  command -v amd-smi >/dev/null 2>&1 && amd-smi partition --current >/dev/null 2>&1 && return 0
-  return 1
-}
-applicable_amd_instinct_partition() {
-  amd_instinct_partition_supported || [[ -f "$AMD_INSTINCT_PART_MARKER" ]]
-}
-title_amd_instinct_partition() { echo "AMD Instinct Compute/Memory Partition Mode (SPX/CPX, NPS1/NPS4)"; }
-note_amd_instinct_partition() { echo -e "${C_BLUE}[OPT]${C_RESET}"; }
-status_amd_instinct_partition() { [[ -f "$AMD_INSTINCT_PART_MARKER" ]]; }
-explain_amd_instinct_partition() {
-  cat <<'EOF'
-Impact:
-  Switches AMD Instinct MI250X/MI300X/MI325X compute and memory partitioning:
-    - SPX + NPS1: Single unified GPU per package (best for massive single LLMs)
-    - CPX + NPS4: Splits XCDs & memory domains (best for concurrent small models)
-  Saves your original modes and restores them on revert. May require a reboot.
-EOF
-}
-apply_amd_instinct_partition() {
-  local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}" cur_cp="" cur_mp="" f
-  for f in "${drm_dir}"/card*/device/current_compute_partition; do
-    [[ -r "$f" ]] && { cur_cp="$(cat "$f" 2>/dev/null | tr -d '[:space:]')"; break; }
-  done
-  for f in "${drm_dir}"/card*/device/current_memory_partition; do
-    [[ -r "$f" ]] && { cur_mp="$(cat "$f" 2>/dev/null | tr -d '[:space:]')"; break; }
-  done
-  if [[ -z "$cur_cp" ]] && command -v amd-smi >/dev/null 2>&1; then
-    local part_out
-    part_out="$(amd-smi partition --current 2>/dev/null || true)"
-    cur_cp="$(awk -F: '/COMPUTE_PARTITION/ {gsub(/ /,"",$2); print $2; exit}' <<<"$part_out")"
-    cur_mp="$(awk -F: '/MEMORY_PARTITION/ {gsub(/ /,"",$2); print $2; exit}' <<<"$part_out")"
-  fi
-  echo -e "\n${C_BOLD}Select AMD Instinct Partition Preset (current: compute=${cur_cp:-unknown}, memory=${cur_mp:-unknown}):${C_RESET}"
-  echo "  1) SPX + NPS1 (Unified GPU — recommended for large single LLMs)"
-  echo "  2) CPX + NPS4 (Split XCDs — concurrent smaller models)"
-  local pchoice="" tgt_cp="SPX" tgt_mp="NPS1"
-  read -r -p "Choose [1-2, default 1]: " pchoice
-  case "$pchoice" in
-    2) tgt_cp="CPX"; tgt_mp="NPS4" ;;
-    1|"") ;;
-    *) echo -e "${C_RED}Invalid choice '${pchoice}'. Cancelled.${C_RESET}"; return 1 ;;
-  esac
-  if [[ ! -f "$AMD_INSTINCT_PART_MARKER" ]]; then
-    echo "${cur_cp:-SPX}:${cur_mp:-NPS1}" | run_root tee "$AMD_INSTINCT_PART_MARKER" >/dev/null
-  fi
-  local ok=false
-  if command -v amd-smi >/dev/null 2>&1; then
-    run_root amd-smi set --compute-partition "$tgt_cp" >/dev/null 2>&1 && ok=true
-    run_root amd-smi set --memory-partition "$tgt_mp" >/dev/null 2>&1 && ok=true
-  fi
-  if [[ "$ok" == false ]]; then
-    for f in "${drm_dir}"/card*/device/current_compute_partition; do
-      [[ -f "$f" ]] && echo "$tgt_cp" | run_root tee "$f" >/dev/null 2>&1 && ok=true
-    done
-    for f in "${drm_dir}"/card*/device/current_memory_partition; do
-      [[ -f "$f" ]] && echo "$tgt_mp" | run_root tee "$f" >/dev/null 2>&1 && ok=true
-    done
-  fi
-  if [[ "$ok" == false ]]; then
-    run_root rm -f "$AMD_INSTINCT_PART_MARKER"
-    echo -e "${C_YELLOW}Could not change Instinct partition mode (may require idle GPU or root amd-smi).${C_RESET}"
-    return 1
-  fi
-  if [[ -n "$cur_mp" && "$cur_mp" != "$tgt_mp" ]]; then
-    REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
-  fi
-}
-revert_amd_instinct_partition() {
-  if [[ -f "$AMD_INSTINCT_PART_MARKER" ]]; then
-    local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}" orig_cp orig_mp f
-    IFS=: read -r orig_cp orig_mp < "$AMD_INSTINCT_PART_MARKER"
-    if command -v amd-smi >/dev/null 2>&1; then
-      [[ -n "$orig_cp" ]] && run_root amd-smi set --compute-partition "$orig_cp" >/dev/null 2>&1 || true
-      [[ -n "$orig_mp" ]] && run_root amd-smi set --memory-partition "$orig_mp" >/dev/null 2>&1 || true
-    fi
-    for f in "${drm_dir}"/card*/device/current_compute_partition; do
-      [[ -n "$orig_cp" && -f "$f" ]] && echo "$orig_cp" | run_root tee "$f" >/dev/null 2>&1 || true
-    done
-    for f in "${drm_dir}"/card*/device/current_memory_partition; do
-      [[ -n "$orig_mp" && -f "$f" ]] && echo "$orig_mp" | run_root tee "$f" >/dev/null 2>&1 || true
-    done
-    run_root rm -f "$AMD_INSTINCT_PART_MARKER"
-    REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
-  fi
-}
-
-# 12r. Intel compute stack
-intel_compute_pkgs() {
-  case "$DISTRO_FAMILY" in
-    arch)   echo "intel-compute-runtime level-zero-loader" ;;
-    fedora) echo "intel-compute-runtime oneapi-level-zero" ;;
-    debian) echo "intel-opencl-icd libze-intel-gpu1 libze1" ;;
-    suse)
-      local pkgs=()
-      if pkg_available repo intel-opencl; then pkgs+=(intel-opencl)
-      elif pkg_available repo intel-compute-runtime; then pkgs+=(intel-compute-runtime)
-      else return 0; fi
-      pkg_available repo libze_intel_gpu1 && pkgs+=(libze_intel_gpu1)
-      if pkg_available repo level-zero; then pkgs+=(level-zero)
-      elif pkg_available repo libze1; then pkgs+=(libze1)
-      else return 0; fi
-      echo "${pkgs[*]}"
-      ;;
-    *)      echo "" ;;
-  esac
-}
-applicable_intel_compute_stack() {
-  [[ "$HAS_INTEL_GPU" == true ]] || return 1
-  local pkgs p
-  pkgs="$(intel_compute_pkgs)"
-  [[ -n "$pkgs" ]] || return 1
-  for p in $pkgs; do pkg_available repo "$p" || return 1; done
-}
-title_intel_compute_stack() { echo "Intel GPU Compute Runtime (OpenCL / Level Zero for SYCL inference)"; }
-status_intel_compute_stack() {
-  local p
-  for p in $(intel_compute_pkgs); do pkg_installed "$p" || return 1; done
-}
-explain_intel_compute_stack() { echo -e "Impact:\n  Installs the Intel compute runtime and Level Zero loader ($(intel_compute_pkgs)).\n  Without them SYCL/OpenCL inference cannot use the Intel GPU and silently falls back to the CPU."; }
-apply_intel_compute_stack() { prompt_install_deps repo $(intel_compute_pkgs) || return 0; }
-revert_intel_compute_stack() { echo -e "${C_YELLOW}Compute runtime packages are shared libraries and are kept installed.${C_RESET}"; }
-
-# 12s. NVIDIA Jetson
-is_jetson() {
-  [[ "$IS_JETSON" == true ]] && return 0
-  [[ -f /etc/nv_tegra_release ]] && return 0
-  [[ -r /proc/device-tree/model ]] && tr -d '\0' < /proc/device-tree/model | grep -qi "jetson"
-}
-jetson_maxn_id() {
-  local id
-  id="$(grep -oE 'POWER_MODEL ID=[0-9]+ NAME=MAXN[A-Za-z_]*' /etc/nvpmodel.conf 2>/dev/null | head -n1 | sed -E 's/POWER_MODEL ID=([0-9]+).*/\1/')"
-  echo "${id:-0}"
-}
-applicable_jetson_perf() { is_jetson && command -v nvpmodel >/dev/null 2>&1; }
-title_jetson_perf() { echo "NVIDIA Jetson MAXN Power Mode & Max Clocks (nvpmodel / jetson_clocks)"; }
-status_jetson_perf() { service_installed strata-jetson-perf.service && unit_enabled strata-jetson-perf.service; }
-explain_jetson_perf() {
-  echo -e "Impact:\n  Switches the Jetson to its MAXN power model (nvpmodel -m $(jetson_maxn_id)) and pins CPU/GPU/EMC\n  clocks to maximum (jetson_clocks) at every boot. Clocks are restored on revert."
-  if [[ "$IS_JETSON_TX2" == true ]]; then
-    echo -e "  On Jetson TX2 (L4T R32), MAXN also enables both Denver 2 cores alongside\n  the 4 Cortex-A57 cores (default boot mode leaves Denver 2 cores offline)."
-  fi
-}
-apply_jetson_perf() {
-  local nv jc id
-  nv="$(command -v nvpmodel)"; jc="$(command -v jetson_clocks || echo /usr/bin/jetson_clocks)"; id="$(jetson_maxn_id)"
-  install_service strata-jetson-perf.service <<EOF
-[Unit]
-Description=Set Jetson MAXN Power Mode and Maximum Clocks for Strata
-After=nvpmodel.service multi-user.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStartPre=-${jc} --store
-ExecStart=${nv} -m ${id}
-ExecStart=-${jc}
-ExecStop=-${jc} --restore
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-revert_jetson_perf() { remove_service strata-jetson-perf.service; }
-
-# 12s2. NVIDIA Jetson PWM Fan Maximum Cooling
-jetson_fan_pwm_path() {
-  if [[ -e /sys/devices/pwm-fan/target_pwm ]]; then
-    echo "/sys/devices/pwm-fan/target_pwm"
-    return 0
-  fi
-  local hm
-  for hm in /sys/class/hwmon/hwmon*; do
-    [[ -r "$hm/name" ]] || continue
-    if grep -qiE "pwm-?fan|tegra_pwmfan" "$hm/name" 2>/dev/null && [[ -e "$hm/pwm1" ]]; then
-      echo "$hm/pwm1"
-      return 0
-    fi
-  done
-  return 1
-}
-applicable_jetson_fan() { is_jetson && jetson_fan_pwm_path >/dev/null 2>&1; }
-title_jetson_fan() { echo "NVIDIA Jetson PWM Fan Maximum Cooling (target_pwm=255)"; }
-status_jetson_fan() { service_installed strata-jetson-fan.service && unit_enabled strata-jetson-fan.service; }
-explain_jetson_fan() {
-  echo -e "Impact:\n  Locks the Jetson carrier board PWM fan to 100% (255) via systemd so the\n  SoC stays below thermal throttling thresholds during sustained MAXN inference."
-}
-apply_jetson_fan() {
-  local pwm_path tc_path=""
-  pwm_path="$(jetson_fan_pwm_path)" || return 1
-  [[ -e /sys/devices/pwm-fan/temp_control ]] && tc_path="/sys/devices/pwm-fan/temp_control"
-  install_service strata-jetson-fan.service <<EOF
-[Unit]
-Description=Set Jetson PWM Fan to Maximum Cooling for Strata
-After=multi-user.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/bin/sh -c '${tc_path:+[ -w ${tc_path} ] && echo 0 > ${tc_path}; }[ -w ${pwm_path} ] && echo 255 > ${pwm_path} || true'
-ExecStop=/bin/sh -c '[ -w ${pwm_path} ] && echo 0 > ${pwm_path}; ${tc_path:+[ -w ${tc_path} ] && echo 1 > ${tc_path}; }true'
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-revert_jetson_fan() { remove_service strata-jetson-fan.service; }
-
-# 12t. numactl interleave
-applicable_numactl_interleave() {
-  [[ "$HAS_SYSTEMD" == true ]] || return 1
-  [[ -z "$STRATA_BIN" && -n "$STRATA_DOCKER_CONTAINER" ]] && return 1
-  (( $(numa_node_count) > 1 )) || return 1
-  [[ -f "$NUMACTL_MARKER" ]] || command -v numactl >/dev/null 2>&1 || pkg_available repo numactl
-}
-title_numactl_interleave() { echo "NUMA Memory Interleaving for Strata (numactl --interleave=all)"; }
-status_numactl_interleave() { [[ -f "$NUMACTL_MARKER" ]] && command -v numactl >/dev/null 2>&1; }
-explain_numactl_interleave() {
-  cat <<'EOF'
-Impact:
-  Installs numactl and starts native Strata (strata.service) under
-  'numactl --interleave=all', spreading CPU-resident model weights across all
-  NUMA nodes so memory bandwidth from every socket is used (primarily benefits
-  multi-socket CPU/MoE-offload inference; restart strata.service after applying).
-EOF
-}
-apply_numactl_interleave() {
-  command -v numactl >/dev/null 2>&1 || prompt_install_deps repo numactl || return 0
-  echo "enabled" | run_root tee "$NUMACTL_MARKER" >/dev/null
-  if [[ -f /etc/systemd/system/strata.service ]] && ! grep -q numactl /etc/systemd/system/strata.service; then
-    run_root sed -i "s|^ExecStart=|ExecStart=$(command -v numactl) --interleave=all |" /etc/systemd/system/strata.service
-    run_root systemctl daemon-reload
-    echo -e "${C_YELLOW}Restart strata.service for the interleave policy to take effect.${C_RESET}"
-  fi
-}
-revert_numactl_interleave() {
-  run_root rm -f "$NUMACTL_MARKER"
-  if [[ -f /etc/systemd/system/strata.service ]]; then
-    run_root sed -i "s|^ExecStart=[^ ]*/numactl --interleave=all |ExecStart=|" /etc/systemd/system/strata.service
-    run_root systemctl daemon-reload
-  fi
-}
-
-# 12u. 1 GiB hugepages
-applicable_hugepages_1g() {
-  [[ -n "$(kernel_param_value hugepages || true)" ]] && return 0
-  grep -qw pdpe1gb /proc/cpuinfo 2>/dev/null || return 1
-  (( ${RAM_GB:-0} >= 64 )) && (( $(numa_node_count) > 1 ))
-}
-title_hugepages_1g() { echo "Reserve 1 GiB Hugepages ($(( RAM_GB / 4 )) GiB, multi-socket CPU inference)"; }
-note_hugepages_1g() { echo -e "${C_BLUE}[OPT]${C_RESET}"; }
-status_hugepages_1g() { [[ -n "$(kernel_param_value hugepages || true)" ]]; }
-explain_hugepages_1g() {
-  cat <<EOF
-Impact:
-  Reserves $(( RAM_GB / 4 )) GiB of 1 GiB hugepages at boot (default_hugepagesz=1G
-  hugepagesz=1G hugepages=$(( RAM_GB / 4 ))) for hugetlb-aware CPU inference. Requires a reboot.
-EOF
-  echo -e "\n${C_YELLOW}[WARNING] The reserved memory is permanently unavailable to the rest of the system${C_RESET}"
-  echo -e "${C_YELLOW}          and only helps workloads that explicitly use hugetlbfs.${C_RESET}"
-}
-apply_hugepages_1g() {
-  add_kernel_param "default_hugepagesz=1G" "hugepagesz=1G" "hugepages=$(( RAM_GB / 4 ))"
-}
-revert_hugepages_1g() {
-  local n v
-  local -a rem=()
-  for n in default_hugepagesz hugepagesz hugepages; do
-    v="$(kernel_param_value "$n" || true)"
-    [[ -n "$v" ]] && rem+=("${n}=${v}")
-  done
-  (( ${#rem[@]} > 0 )) && remove_kernel_param "${rem[@]}"
-}
-
-# 12v. sched_ext scheduler
-scx_unit() {
-  local u
-  for u in scx.service scx_loader.service strata-scx.service; do
-    if unit_exists "$u" || systemctl cat "$u" >/dev/null 2>&1; then
-      echo "$u"; return 0
-    fi
-  done
-  return 1
-}
-applicable_scx_scheduler() {
-  [[ -d /sys/kernel/sched_ext ]] || return 1
-  scx_unit >/dev/null 2>&1 || command -v scx_bpfland >/dev/null 2>&1 || pkg_available repo scx-scheds
-}
-title_scx_scheduler() { echo "sched_ext BPF CPU Scheduler (scx, lower scheduling latency)"; }
-status_scx_scheduler() { [[ "$(cat /sys/kernel/sched_ext/state 2>/dev/null)" == "enabled" ]]; }
-explain_scx_scheduler() { echo -e "Impact:\n  Installs scx-scheds (if needed) and enables its service so a sched_ext BPF\n  scheduler (default: scx_bpfland) replaces the kernel CPU scheduler, improving\n  responsiveness of the API/server threads when CPU cores are saturated."; }
-apply_scx_scheduler() {
-  if ! scx_unit >/dev/null 2>&1; then
-    local pkgs=()
-    command -v scx_bpfland >/dev/null 2>&1 || pkgs+=(scx-scheds)
-    pkg_available repo scx-tools && pkgs+=(scx-tools)
-    if (( ${#pkgs[@]} > 0 )); then
-      prompt_install_deps repo "${pkgs[@]}" || true
-    fi
-  fi
-  local u
-  u="$(scx_unit 2>/dev/null || true)"
-  if [[ "$u" == "scx_loader.service" ]] && command -v scxctl >/dev/null 2>&1; then
-    local scxctl_bin
-    scxctl_bin="$(command -v scxctl)"
-    run_root mkdir -p /etc/systemd/system/scx_loader.service.d
-    run_root tee /etc/systemd/system/scx_loader.service.d/strata.conf >/dev/null <<EOF
-[Service]
-ExecStartPost=-${scxctl_bin} start -s bpfland
-EOF
-    run_root systemctl daemon-reload
-    run_root systemctl enable --now "$u"
-    if [[ "$(cat /sys/kernel/sched_ext/state 2>/dev/null)" != "enabled" ]]; then
-      run_root "$scxctl_bin" start -s bpfland 2>/dev/null || run_root "$scxctl_bin" switch -s bpfland
-    fi
-  elif [[ -n "$u" && "$u" != "strata-scx.service" ]]; then
-    run_root systemctl enable --now "$u"
-  elif command -v scx_bpfland >/dev/null 2>&1; then
-    local bpfland_bin
-    bpfland_bin="$(command -v scx_bpfland)"
-    install_service strata-scx.service <<EOF
-[Unit]
-Description=Strata sched_ext BPF CPU Scheduler (scx_bpfland)
-After=multi-user.target
-
-[Service]
-Type=simple
-ExecStart=${bpfland_bin}
-Restart=on-failure
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  else
-    echo -e "${C_YELLOW}No scx service or scx_bpfland binary found after installation.${C_RESET}"
-    return 1
-  fi
-}
-revert_scx_scheduler() {
-  command -v scxctl >/dev/null 2>&1 && run_root scxctl stop 2>/dev/null || true
-  if [[ -f /etc/systemd/system/scx_loader.service.d/strata.conf ]]; then
-    run_root rm -f /etc/systemd/system/scx_loader.service.d/strata.conf
-    run_root rmdir /etc/systemd/system/scx_loader.service.d 2>/dev/null || true
-    run_root systemctl daemon-reload
-  fi
-  if service_installed strata-scx.service; then
-    remove_service strata-scx.service
-  fi
-  local u
-  u="$(scx_unit 2>/dev/null || true)"
-  [[ -n "$u" ]] && run_root systemctl disable --now "$u" 2>/dev/null || true
-}
-
-# 12w. AMD X3D V-Cache Mode
-applicable_amd_x3d_mode() {
-  service_installed strata-amd-x3d.service && return 0
-  compgen -G "/sys/bus/platform/drivers/amd_x3d_vcache/*/amd_x3d_mode" >/dev/null 2>&1
-}
-title_amd_x3d_mode() { echo "AMD Ryzen X3D V-Cache CCD Mode (amd_x3d_vcache -> cache)"; }
-status_amd_x3d_mode() {
-  local f
-  for f in /sys/bus/platform/drivers/amd_x3d_vcache/*/amd_x3d_mode; do
-    [[ -r "$f" ]] && [[ "$(cat "$f" 2>/dev/null)" == "cache" ]] && return 0
-  done
-  return 1
-}
-explain_amd_x3d_mode() {
-  echo -e "Impact:\n  Sets amd_x3d_mode='cache' via systemd so dual-CCD Ryzen X3D processors\n  prefer the 3D V-Cache CCD for inference threads instead of migrating across CCDs."
-}
-apply_amd_x3d_mode() {
-  install_service strata-amd-x3d.service <<'EOF'
-[Unit]
-Description=Set AMD X3D V-Cache Mode to Cache for Strata
-After=multi-user.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/bin/sh -c 'for f in /sys/bus/platform/drivers/amd_x3d_vcache/*/amd_x3d_mode; do [ -w "$f" ] && echo cache > "$f"; done; true'
-ExecStop=/bin/sh -c 'for f in /sys/bus/platform/drivers/amd_x3d_vcache/*/amd_x3d_mode; do [ -w "$f" ] && echo frequency > "$f"; done; true'
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-revert_amd_x3d_mode() {
-  remove_service strata-amd-x3d.service
-  run_root sh -c 'for f in /sys/bus/platform/drivers/amd_x3d_vcache/*/amd_x3d_mode; do [ -w "$f" ] && echo frequency > "$f"; done; true' 2>/dev/null || true
-}
-
-# 12x. Intel Hybrid P-Core Pinning
-applicable_intel_pcore_pinning() {
-  [[ "$HAS_SYSTEMD" == true ]] || return 1
-  [[ -f /etc/systemd/system/strata.service.d/10-pcore-affinity.conf ]] && return 0
-  [[ -r /sys/devices/cpu_core/cpus && -r /sys/devices/cpu_atom/cpus ]]
-}
-title_intel_pcore_pinning() {
-  local pcpus=""
-  [[ -r /sys/devices/cpu_core/cpus ]] && pcpus="$(cat /sys/devices/cpu_core/cpus 2>/dev/null || true)"
-  echo "Intel Hybrid P-Core Pinning for strata.service (CPUs ${pcpus:-P-cores})"
-}
-status_intel_pcore_pinning() { [[ -f /etc/systemd/system/strata.service.d/10-pcore-affinity.conf ]]; }
-explain_intel_pcore_pinning() {
-  echo -e "Impact:\n  Adds a systemd drop-in for strata.service (CPUAffinity=<P-cores>) so Strata\n  runs on Performance cores instead of getting scheduled onto Efficiency cores."
-}
-apply_intel_pcore_pinning() {
-  local pcpus
-  pcpus="$(cat /sys/devices/cpu_core/cpus 2>/dev/null || true)"
-  if [[ -z "$pcpus" ]]; then
-    echo -e "${C_YELLOW}Could not read P-core list from /sys/devices/cpu_core/cpus.${C_RESET}"
-    return 1
-  fi
-  run_root mkdir -p /etc/systemd/system/strata.service.d
-  run_root tee /etc/systemd/system/strata.service.d/10-pcore-affinity.conf >/dev/null <<EOF
-[Service]
-CPUAffinity=${pcpus}
-EOF
-  run_root systemctl daemon-reload
-  unit_active strata.service && echo -e "${C_YELLOW}Restart strata.service for P-core affinity to take effect.${C_RESET}" || true
-}
-revert_intel_pcore_pinning() {
-  run_root rm -f /etc/systemd/system/strata.service.d/10-pcore-affinity.conf
-  run_root rmdir /etc/systemd/system/strata.service.d 2>/dev/null || true
-  run_root systemctl daemon-reload
-}
-
-# 12y. macOS Metal GPU Wired Memory Limit (iogpu.wired_limit_mb)
-_macos_wired_limit_cur_mb() {
-  local v="${STRATA_MACOS_WIRED_LIMIT_MB:-$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)}"
-  [[ "$v" =~ ^[0-9]+$ ]] || v=0
-  echo "$v"
-}
-_macos_wired_limit_rec_gb() {
-  local r="${1:-${RAM_GB:-0}}"
-  if (( r >= 128 )); then echo $(( r - 16 ))
-  elif (( r >= 96 )); then echo $(( r - 12 ))
-  elif (( r >= 64 )); then echo $(( r - 10 ))
-  elif (( r >= 48 )); then echo $(( r - 8 ))
-  elif (( r >= 32 )); then echo $(( r - 6 ))
-  else echo $(( r - 5 ))
-  fi
-}
-applicable_macos_wired_limit() {
-  [[ "$IS_MACOS" == true && "$IS_APPLE_SILICON" == true ]] && (( RAM_GB >= 24 ))
-}
-title_macos_wired_limit() { echo "macOS Metal GPU Wired Memory Limit (iogpu.wired_limit_mb)"; }
-note_macos_wired_limit() { echo -e "${C_BLUE}[OPT]${C_RESET}"; }
-status_macos_wired_limit() {
-  service_installed strata-macos-wired-limit.service && return 0
-  (( $(_macos_wired_limit_cur_mb) > 0 ))
-}
-explain_macos_wired_limit() {
-  local rec_gb cur_mb
-  rec_gb="$(_macos_wired_limit_rec_gb "$RAM_GB")"
-  cur_mb="$(_macos_wired_limit_cur_mb)"
-  cat <<EOF
-Impact:
-  Overrides macOS's ~75% Metal GPU memory residency cap by setting
-  'sysctl iogpu.wired_limit_mb' and persisting it via LaunchDaemon.
-  Allows larger resident packs (e.g. UD-Q4_K_XL, IQ3_S, Gyro) on 32-192+ GiB
-  Apple Silicon Macs without spilling experts to SSD streaming.
-  Recommended safe ceiling for ${RAM_GB} GiB RAM: ~${rec_gb} GiB ($(( rec_gb * 1024 )) MiB).
-  Current wired limit: $( (( cur_mb > 0 )) && echo "${cur_mb} MiB ($(( cur_mb / 1024 )) GiB)" || echo "0 (macOS default ~75%)" )
-EOF
-  echo -e "\n${C_YELLOW}[NOTE] Always leave enough RAM for macOS (5-16+ GiB); setting this too${C_RESET}"
-  echo -e "${C_YELLOW}       close to physical RAM can trigger kernel memory-watchdog panics.${C_RESET}"
-}
-apply_macos_wired_limit() {
-  local rec_gb rec_mb max_safe_mb cur_mb target_mb=""
-  rec_gb="$(_macos_wired_limit_rec_gb "$RAM_GB")"
-  rec_mb=$(( rec_gb * 1024 ))
-  max_safe_mb=$(( (RAM_GB - 4) * 1024 ))
-  (( rec_mb > max_safe_mb )) && rec_mb="$max_safe_mb"
-  cur_mb="$(_macos_wired_limit_cur_mb)"
-  echo "Detected unified memory: ${RAM_GB} GiB (current iogpu.wired_limit_mb=${cur_mb})"
-  echo "Recommended safe limit: ${rec_mb} MiB ($(( rec_mb / 1024 )) GiB; hard max ${max_safe_mb} MiB)"
-  read -r -p "Target Metal wired memory limit in MiB [${rec_mb}]: " target_mb || true
-  target_mb="${target_mb:-$rec_mb}"
-  if ! [[ "$target_mb" =~ ^[0-9]+$ ]] || (( target_mb < 4096 || target_mb > max_safe_mb )); then
-    echo -e "${C_RED}Invalid value '${target_mb}' (must be between 4096 and ${max_safe_mb} MiB). Cancelled.${C_RESET}"
-    return 1
-  fi
-  if ! run_root sysctl -w "iogpu.wired_limit_mb=${target_mb}"; then
-    echo -e "${C_RED}Failed to set iogpu.wired_limit_mb=${target_mb}.${C_RESET}"
-    return 1
-  fi
-  MACOS_WIRED_LIMIT_MB="$target_mb"
-  install_service strata-macos-wired-limit.service <<EOF
-[Unit]
-Description=Set macOS Metal Wired Memory Limit for Strata
-
-[Service]
-ExecStart=/usr/sbin/sysctl -w iogpu.wired_limit_mb=${target_mb}
-ExecStop=/usr/sbin/sysctl -w iogpu.wired_limit_mb=0
-EOF
-  echo -e "${C_GREEN}Set iogpu.wired_limit_mb=${target_mb} MiB ($(( target_mb / 1024 )) GiB).${C_RESET}"
-}
-revert_macos_wired_limit() {
-  remove_service strata-macos-wired-limit.service
-  run_root sysctl -w iogpu.wired_limit_mb=0 2>/dev/null || true
-  MACOS_WIRED_LIMIT_MB=0
-  echo -e "${C_GREEN}Restored iogpu.wired_limit_mb=0 (macOS default ~75%).${C_RESET}"
-}
-
-# 12z. macOS Power Mode (High Power Mode / Disable Low Power Mode)
-applicable_macos_power_mode() {
-  [[ "$IS_MACOS" == true && "$IS_APPLE_SILICON" == true ]] && command -v pmset >/dev/null 2>&1
-}
-title_macos_power_mode() {
-  if [[ "$MACOS_POWER_MODE_SUPPORTED" == true ]]; then
-    echo "macOS High Power Mode & Disable Low Power Mode (pmset)"
-  else
-    echo "macOS Disable Low Power Mode (pmset)"
-  fi
-}
-status_macos_power_mode() {
-  [[ -f "$MACOS_POWER_MODE_MARKER" ]] || return 1
-  local applied_mode="" cur_pm="" cur_lp=""
-  applied_mode="$(sed -n 's/^applied_mode=//p' "$MACOS_POWER_MODE_MARKER" 2>/dev/null | head -n1)"
-  cur_pm="$(_pmset_ac_val powermode || true)"
-  cur_lp="$(_pmset_ac_val lowpowermode || true)"
-  if [[ "$applied_mode" == "high" ]]; then
-    [[ "$cur_pm" == "2" ]]
-  else
-    [[ ( -z "$cur_pm" || "$cur_pm" == "0" ) && ( -z "$cur_lp" || "$cur_lp" == "0" ) ]]
-  fi
-}
-explain_macos_power_mode() {
-  cat <<'EOF'
-Impact:
-  Enables macOS High Power Mode (pmset powermode 2, where supported by Max/Ultra
-  Apple Silicon chips) and ensures Low Power Mode is disabled so fans ramp more
-  proactively and sustained prefill/decode avoids early thermal throttling.
-  On MacBooks, scoped to AC power (-c) so battery behavior stays untouched.
-EOF
-}
-apply_macos_power_mode() {
-  local scope="-a" prev_pm="" prev_lp="" applied_mode="auto"
-  [[ "$IS_LAPTOP" == true ]] && scope="-c"
-  if [[ -r "$MACOS_POWER_MODE_MARKER" ]]; then
-    prev_pm="$(sed -n 's/^prev_powermode=//p' "$MACOS_POWER_MODE_MARKER" 2>/dev/null | head -n1)"
-    prev_lp="$(sed -n 's/^prev_lowpowermode=//p' "$MACOS_POWER_MODE_MARKER" 2>/dev/null | head -n1)"
-  fi
-  [[ -n "$prev_pm" ]] || prev_pm="$(_pmset_ac_val powermode || true)"
-  [[ -n "$prev_lp" ]] || prev_lp="$(_pmset_ac_val lowpowermode || true)"
-  run_root mkdir -p "$MACOS_SUPPORT_DIR"
-  if run_root pmset "$scope" powermode 2 2>/dev/null && [[ "$(_pmset_ac_val powermode || true)" == "2" ]]; then
-    applied_mode="high"
-  else
-    [[ -n "$prev_pm" ]] && run_root pmset "$scope" powermode 0 2>/dev/null || true
-    run_root pmset "$scope" lowpowermode 0 2>/dev/null || true
-    applied_mode="auto"
-  fi
-  run_root tee "$MACOS_POWER_MODE_MARKER" >/dev/null <<EOF
-scope=${scope}
-applied_mode=${applied_mode}
-prev_powermode=${prev_pm}
-prev_lowpowermode=${prev_lp}
-EOF
-  if [[ "$applied_mode" == "high" ]]; then
-    echo -e "${C_GREEN}Enabled macOS High Power Mode (${scope}).${C_RESET}"
-  else
-    echo -e "${C_GREEN}Set macOS Power Mode to Automatic / Low Power Mode off (${scope}).${C_RESET}"
-  fi
-}
-revert_macos_power_mode() {
-  local scope="-a" prev_pm="" prev_lp=""
-  [[ "$IS_LAPTOP" == true ]] && scope="-c"
-  if [[ -r "$MACOS_POWER_MODE_MARKER" ]]; then
-    scope="$(sed -n 's/^scope=//p' "$MACOS_POWER_MODE_MARKER" 2>/dev/null | head -n1)"
-    prev_pm="$(sed -n 's/^prev_powermode=//p' "$MACOS_POWER_MODE_MARKER" 2>/dev/null | head -n1)"
-    prev_lp="$(sed -n 's/^prev_lowpowermode=//p' "$MACOS_POWER_MODE_MARKER" 2>/dev/null | head -n1)"
-    [[ -n "$scope" ]] || scope="-a"
-  fi
-  [[ -n "$prev_pm" ]] && run_root pmset "$scope" powermode "$prev_pm" 2>/dev/null || true
-  [[ -n "$prev_lp" ]] && run_root pmset "$scope" lowpowermode "$prev_lp" 2>/dev/null || true
-  run_root rm -f "$MACOS_POWER_MODE_MARKER"
-  echo -e "${C_GREEN}Restored previous macOS power mode settings.${C_RESET}"
-}
-
-# 12aa. macOS Spotlight Exclusion for Strata Models & Data
-_macos_spotlight_dirs() {
-  local -a dirs=("$TARGET_HOME/.local/share/strata" "$TARGET_HOME/.cache/strata")
-  [[ -d "$TARGET_HOME/.strata" ]] && dirs+=("$TARGET_HOME/.strata")
-  [[ -d "$TARGET_HOME/Documents/Strata" ]] && dirs+=("$TARGET_HOME/Documents/Strata")
-  [[ -n "${STRATA_DATA_DIR:-}" ]] && dirs+=("$STRATA_DATA_DIR")
-  printf '%s\n' "${dirs[@]}" | awk '!seen[$0]++'
-}
-applicable_macos_spotlight_exclude() { [[ "$IS_MACOS" == true ]]; }
-title_macos_spotlight_exclude() { echo "Exclude Strata Data & Models from Spotlight Indexing (SSD I/O)"; }
-status_macos_spotlight_exclude() {
-  [[ -f "$TARGET_HOME/.local/share/strata/.metadata_never_index" && -f "$TARGET_HOME/.cache/strata/.metadata_never_index" ]] || return 1
-  if [[ -r "$MACOS_SPOTLIGHT_LIST" ]]; then
-    local d
-    while IFS= read -r d; do
-      [[ -n "$d" && -d "$d" ]] || continue
-      [[ -f "${d}/.metadata_never_index" ]] || return 1
-    done < "$MACOS_SPOTLIGHT_LIST"
-  fi
-  return 0
-}
-explain_macos_spotlight_exclude() {
-  cat <<'EOF'
-Impact:
-  Places '.metadata_never_index' markers inside Strata's data, cache, and model
-  directories (~/.local/share/strata, ~/.cache/strata, ~/.strata, and optional
-  custom model paths) so Spotlight (mds_stores) does not scan multi-GB GGUF/
-  expert files and introduce SSD latency spikes during SSD expert streaming.
-EOF
-}
-apply_macos_spotlight_exclude() {
-  local -a raw_dirs=() dirs=()
-  local d extra_dir=""
-  while IFS= read -r d; do
-    [[ -n "$d" ]] && raw_dirs+=("$d")
-  done < <(_macos_spotlight_dirs)
-  read -r -p "Optional extra Strata model folder to exclude from Spotlight (blank to skip): " extra_dir || true
-  if [[ -n "$extra_dir" ]]; then
-    extra_dir="${extra_dir%\"}"; extra_dir="${extra_dir#\"}"
-    extra_dir="${extra_dir%\'}"; extra_dir="${extra_dir#\'}"
-    if [[ "$extra_dir" == "~" ]]; then
-      extra_dir="$TARGET_HOME"
-    elif [[ "$extra_dir" == "~/"* ]]; then
-      extra_dir="${TARGET_HOME}/${extra_dir#\~/}"
-    fi
-    [[ "$extra_dir" != "/" ]] && extra_dir="${extra_dir%/}"
-    if [[ -d "$extra_dir" ]]; then
-      raw_dirs+=("$extra_dir")
-    else
-      echo -e "${C_YELLOW}Directory not found (${extra_dir}); skipping custom path.${C_RESET}"
-    fi
-  fi
-  while IFS= read -r d; do
-    [[ -n "$d" ]] && dirs+=("$d")
-  done < <(printf '%s\n' "${raw_dirs[@]}" | awk '!seen[$0]++')
-  run_as_user_exec mkdir -p "$(dirname "$MACOS_SPOTLIGHT_LIST")"
-  : | run_as_user_exec tee "$MACOS_SPOTLIGHT_LIST" >/dev/null
-  for d in "${dirs[@]}"; do
-    run_as_user_exec mkdir -p "$d"
-    run_as_user_exec touch "${d}/.metadata_never_index"
-    printf '%s\n' "$d" | run_as_user_exec tee -a "$MACOS_SPOTLIGHT_LIST" >/dev/null
-    echo -e "  ${C_GREEN}Excluded:${C_RESET} ${d}"
-  done
-}
-revert_macos_spotlight_exclude() {
-  local -a dirs=()
-  local d
-  if [[ -r "$MACOS_SPOTLIGHT_LIST" ]]; then
-    while IFS= read -r d; do
-      [[ -n "$d" ]] && dirs+=("$d")
-    done < "$MACOS_SPOTLIGHT_LIST"
-  fi
-  while IFS= read -r d; do
-    [[ -n "$d" ]] && dirs+=("$d")
-  done < <(_macos_spotlight_dirs)
-  while IFS= read -r d; do
-    [[ -n "$d" && -f "${d}/.metadata_never_index" ]] && run_as_user_exec rm -f "${d}/.metadata_never_index"
-  done < <(printf '%s\n' "${dirs[@]}" | awk '!seen[$0]++')
-  run_as_user_exec rm -f "$MACOS_SPOTLIGHT_LIST"
-  echo -e "${C_GREEN}Removed Spotlight exclusion markers from Strata directories.${C_RESET}"
-}
-
-# 12ab. Strata Metal Engine Environment Switches
-_strip_shell_hook_line() {
-  local rc_file="$1" tag="$2" tmp=""
-  [[ -f "$rc_file" ]] && grep -qF "$tag" "$rc_file" 2>/dev/null || return 0
-  if tmp="$(awk -v t="$tag" 'index($0, t) == 0 {print}' "$rc_file")"; then
-    if [[ -n "$tmp" ]]; then
-      printf '%s\n' "$tmp" | run_as_user_exec tee "$rc_file" >/dev/null
-    else
-      : | run_as_user_exec tee "$rc_file" >/dev/null
-    fi
-  fi
-}
-applicable_macos_metal_tuning() { [[ "$IS_MACOS" == true && "$IS_APPLE_SILICON" == true ]]; }
-title_macos_metal_tuning() { echo "Strata Metal Engine Switches (FP16 Decode / Rootless Sensors / Arena)"; }
-note_macos_metal_tuning() { echo -e "${C_BLUE}[OPT]${C_RESET}"; }
-status_macos_metal_tuning() {
-  [[ -s "$MACOS_METAL_ENV_FILE" ]] && grep -qE '^STRATA_[A-Z0-9_]+=' "$MACOS_METAL_ENV_FILE" 2>/dev/null
-}
-explain_macos_metal_tuning() {
-  cat <<'EOF'
-Impact:
-  Configures documented Strata Metal runtime environment switches in
-  ~/.config/strata/macos-metal-env.conf (automatically applied to wizard CLI
-  runs, benchmarks, and the com.strata.server launchd service, plus optional
-  ~/.zprofile shell integration):
-    - STRATA_METAL_F16=1        : FP16 GEMVs on resident Q2_0/IQ3_S (+9-15% decode)
-    - STRATA_MACOS_SENSORS=1    : Rootless SMC/IOReport GPU temp & power in Monitor
-    - STRATA_METAL_PROMPT_CHUNK : Optional SSD streaming prompt chunk override
-    - STRATA_METAL_ARENA_GB     : Optional SSD streaming expert cache arena size
-    - STRATA_METAL_WIRE_ARENA=0 : Leave 64+ GiB streaming arena pageable
-EOF
-}
-apply_macos_metal_tuning() {
-  local -a vars=()
-  local pchunk="" arena_gb=""
-  if confirm_yn "Enable FP16 decode GEMVs for resident IQ3_S / Q2_0 packs (STRATA_METAL_F16=1)? [Y/n]: " "Y"; then
-    vars+=("STRATA_METAL_F16=1")
-  fi
-  if confirm_yn "Enable rootless GPU temp/power sensors in Strata Monitor (STRATA_MACOS_SENSORS=1, uses private SMC/IOReport APIs)? [y/N]: " "N"; then
-    vars+=("STRATA_MACOS_SENSORS=1")
-  fi
-  read -r -p "Override Metal prompt chunk size (STRATA_METAL_PROMPT_CHUNK, blank for auto): " pchunk || true
-  if [[ -n "$pchunk" ]]; then
-    if [[ "$pchunk" =~ ^[0-9]+$ ]] && (( pchunk >= 256 && pchunk <= 32768 )); then
-      vars+=("STRATA_METAL_PROMPT_CHUNK=${pchunk}")
-    else
-      echo -e "${C_RED}Invalid prompt chunk '${pchunk}' (expected 256-32768). Skipping.${C_RESET}"
-    fi
-  fi
-  read -r -p "Override SSD streaming expert arena size in GB (STRATA_METAL_ARENA_GB, blank for auto): " arena_gb || true
-  if [[ -n "$arena_gb" ]]; then
-    if [[ "$arena_gb" =~ ^[0-9]+$ ]] && (( arena_gb >= 1 && arena_gb <= RAM_GB )); then
-      vars+=("STRATA_METAL_ARENA_GB=${arena_gb}")
-    else
-      echo -e "${C_RED}Invalid arena size '${arena_gb}' (expected 1-${RAM_GB}). Skipping.${C_RESET}"
-    fi
-  fi
-  if (( RAM_GB >= 64 )) && confirm_yn "Disable mlock wiring of the SSD streaming arena (STRATA_METAL_WIRE_ARENA=0)? [y/N]: " "N"; then
-    vars+=("STRATA_METAL_WIRE_ARENA=0")
-  fi
-  if (( ${#vars[@]} == 0 )); then
-    echo -e "${C_YELLOW}No Metal switches selected; nothing written.${C_RESET}"
-    return 0
-  fi
-
-  run_as_user_exec mkdir -p "$(dirname "$MACOS_METAL_ENV_FILE")"
-  : | run_as_user_exec tee "$MACOS_METAL_ENV_FILE" >/dev/null
-  : | run_as_user_exec tee "$MACOS_METAL_ENV_SH" >/dev/null
-  local kv
-  for kv in "${vars[@]}"; do
-    printf '%s\n' "$kv" | run_as_user_exec tee -a "$MACOS_METAL_ENV_FILE" >/dev/null
-    printf 'export %s\n' "$kv" | run_as_user_exec tee -a "$MACOS_METAL_ENV_SH" >/dev/null
-  done
-  if [[ -t 0 ]] && confirm_yn "Also source ${MACOS_METAL_ENV_SH} from ~/.zprofile for interactive shells? [y/N]: " "N"; then
-    local zprof="$TARGET_HOME/.zprofile"
-    local hook="[ -r \"${MACOS_METAL_ENV_SH}\" ] && . \"${MACOS_METAL_ENV_SH}\" # strata-metal-env"
-    _strip_shell_hook_line "$zprof" "# strata-metal-env"
-    printf '%s\n' "$hook" | run_as_user_exec tee -a "$zprof" >/dev/null
-  fi
-  echo -e "${C_GREEN}Saved Strata Metal switches to ${MACOS_METAL_ENV_FILE}.${C_RESET}"
-  if strata_service_installed; then
-    echo -e "${C_YELLOW}Note: Restart com.strata.server from [STRATA] -> Service so launchd picks up the updated Metal switches.${C_RESET}"
-  fi
-}
-revert_macos_metal_tuning() {
-  run_as_user_exec rm -f "$MACOS_METAL_ENV_FILE" "$MACOS_METAL_ENV_SH"
-  _strip_shell_hook_line "$TARGET_HOME/.zprofile" "# strata-metal-env"
-  _strip_shell_hook_line "$TARGET_HOME/.bash_profile" "# strata-metal-env"
-  if [[ "$HAS_LAUNCHD" == true ]]; then
-    local _sc _lb _pl _rn _tmp=""
-    IFS='|' read -r _sc _lb _pl _rn <<< "$(_launchd_meta strata.service)"
-    if [[ -f "$_rn" ]] && grep -qE '^export STRATA_(METAL_|MACOS_SENSORS=)' "$_rn" 2>/dev/null; then
-      if _tmp="$(awk '!/^export STRATA_(METAL_|MACOS_SENSORS=)/ {print}' "$_rn")"; then
-        printf '%s\n' "$_tmp" | run_as_user_exec tee "$_rn" >/dev/null
-        run_as_user_exec chmod 755 "$_rn"
-      fi
-    fi
-  fi
-  echo -e "${C_GREEN}Removed Strata Metal engine environment overrides.${C_RESET}"
-}
-
-# 13. Strata Manager
-strata_service_label() {
-  if [[ "$HAS_LAUNCHD" == true ]]; then
-    echo "com.strata.server"
-  else
-    echo "strata.service"
-  fi
-}
-applicable_strata_manager() { return 0; }
-title_strata_manager() {
-  if [[ "$HAS_LAUNCHD" == true ]]; then
-    echo "Strata: Install, Update, Launch & launchd Service"
-  else
-    echo "Strata: Install, Update, Launch & Systemd Service"
-  fi
-}
-strata_service_installed() { service_installed strata.service; }
-
-strata_components_engine_dir() {
-  local base="${STRATA_COMPONENTS_DIR:-}"
-  if [[ -z "$base" ]]; then
-    local xdg=""
-    [[ -n "${XDG_DATA_HOME:-}" && ( $EUID -ne 0 || "$TARGET_USER" == "root" ) ]] && xdg="$XDG_DATA_HOME"
-    base="${xdg:-$TARGET_HOME/.local/share}/strata/components"
-  fi
-  echo "${base%/}/engine"
-}
-
-invalidate_local_hip_engine_cache() {
-  LOCAL_HIP_INFO_CACHE_KEY=""
-  LOCAL_HIP_INFO_CACHE_MATCH=""
-  LOCAL_HIP_INFO_CACHE_ANY=""
-}
-
-_refresh_local_hip_engine_cache() {
-  local eng_dir=""
-  eng_dir="$(strata_components_engine_dir)"
-  if [[ ! -d "$eng_dir" ]]; then
-    invalidate_local_hip_engine_cache
-    return 0
-  fi
-
-  local missing_key="" mtime_sig="" ckey=""
-  if (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )); then
-    local IFS=','
-    missing_key="${AMD_MISSING_GFX_ARCHS[*]}"
-  fi
-  if [[ "$IS_MACOS" == true ]]; then
-    mtime_sig="$(stat -f '%N:%m:%z' "$eng_dir" "$eng_dir"/*/engine-component.json 2>/dev/null || true)"
-  else
-    mtime_sig="$(stat -c '%n:%Y:%s' "$eng_dir" "$eng_dir"/*/engine-component.json 2>/dev/null || true)"
-  fi
-  ckey="${eng_dir}|${missing_key}|${mtime_sig}"
-  [[ "$ckey" == "$LOCAL_HIP_INFO_CACHE_KEY" ]] && return 0
-
-  LOCAL_HIP_INFO_CACHE_MATCH=""
-  LOCAL_HIP_INFO_CACHE_ANY=""
-  if has_working_python3; then
-    local py_out="" line=""
-    py_out="$(python3 - "$eng_dir" "${AMD_MISSING_GFX_ARCHS[@]+"${AMD_MISSING_GFX_ARCHS[@]}"}" <<'PY' 2>/dev/null || true
-import json, os, re, sys
-
-eng_dir = sys.argv[1]
-missing = set(sys.argv[2:])
-
-def ver_key(v):
-    return tuple(int(x) for x in re.findall(r"\d+", str(v or "")))
-
-best_match = None
-best_any = None
-try:
-    entries = os.listdir(eng_dir)
-except OSError:
-    sys.exit(0)
-
-for name in entries:
-    pkg_dir = os.path.join(eng_dir, name)
-    manifest = os.path.join(pkg_dir, "engine-component.json")
-    if not os.path.isfile(manifest):
-        continue
-    try:
-        with open(manifest, encoding="utf-8") as f:
-            d = json.load(f)
-    except Exception:
-        continue
-    if d.get("backend") != "hip":
-        continue
-    entry = d.get("entrypoint") or "strata"
-    if not os.path.isfile(os.path.join(pkg_dir, entry)):
-        continue
-    archs = [str(a) for a in (d.get("archs") or []) if a]
-    arch_set = set(archs)
-    is_local = (bool(d.get("local")) or (d.get("signature") is None)
-                or str(d.get("variant") or "").startswith("local") or "-local" in name)
-    covers_all = 1 if (not missing or missing <= arch_set) else 0
-    ver = str(d.get("version") or "0")
-    cand = (covers_all, ver_key(ver), name, ver, ",".join(archs))
-    if missing and (arch_set & missing):
-        if best_match is None or cand[:3] > best_match[:3]:
-            best_match = cand
-        if best_any is None or cand[:3] > best_any[:3]:
-            best_any = cand
-    elif is_local:
-        if best_any is None or cand[:3] > best_any[:3]:
-            best_any = cand
-
-if best_match is not None:
-    print(f"MATCH:{best_match[2]}|{best_match[3]}|{best_match[4]}|{best_match[0]}")
-if best_any is not None:
-    print(f"ANY:{best_any[2]}|{best_any[3]}|{best_any[4]}|{best_any[0]}")
-PY
-)"
-    while IFS= read -r line; do
-      case "$line" in
-        MATCH:*) LOCAL_HIP_INFO_CACHE_MATCH="${line#MATCH:}" ;;
-        ANY:*)   LOCAL_HIP_INFO_CACHE_ANY="${line#ANY:}" ;;
-      esac
-    done <<< "$py_out"
-  fi
-  LOCAL_HIP_INFO_CACHE_KEY="$ckey"
-  return 0
-}
-
-strata_local_hip_engine_info() {
-  local any_local=false
-  [[ "${1:-}" == "--any-local" ]] && any_local=true
-  if [[ "$any_local" == false ]] && (( ${#AMD_MISSING_GFX_ARCHS[@]} == 0 )); then
-    return 0
-  fi
-  _refresh_local_hip_engine_cache
-  if [[ "$any_local" == true ]]; then
-    [[ -n "$LOCAL_HIP_INFO_CACHE_ANY" ]] && printf '%s\n' "$LOCAL_HIP_INFO_CACHE_ANY"
-  else
-    [[ -n "$LOCAL_HIP_INFO_CACHE_MATCH" ]] && printf '%s\n' "$LOCAL_HIP_INFO_CACHE_MATCH"
-  fi
-  return 0
-}
-
-_amd_gfx_covered_by_local_hip() {
-  local gfx="$1" arch_csv=""
-  _refresh_local_hip_engine_cache
-  [[ -n "$LOCAL_HIP_INFO_CACHE_ANY" ]] || return 1
-  IFS='|' read -r _ _ arch_csv _ <<< "$LOCAL_HIP_INFO_CACHE_ANY"
-  [[ ",${arch_csv}," == *",${gfx},"* ]]
-}
-
-status_strata_build_hip() {
-  (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )) || return 1
-  _refresh_local_hip_engine_cache
-  [[ -n "$LOCAL_HIP_INFO_CACHE_MATCH" && "${LOCAL_HIP_INFO_CACHE_MATCH##*|}" == "1" ]]
-}
-
-check_strata_update_sync() {
-  [[ -n "$STRATA_BIN" ]] || return 1
-  local json_out parsed=""
-  json_out="$(run_as_user_exec "$STRATA_BIN" update --check --json 2>/dev/null || true)"
-  if [[ -n "$json_out" ]] && has_working_python3; then
-    parsed="$(python3 -c '
-import json, sys
-try:
-    d = json.loads(sys.stdin.read())
-except Exception:
-    sys.exit(1)
-updates = []
-for key in ("engine", "control"):
-    comp = d.get(key)
-    if not isinstance(comp, dict):
-        continue
-    inst = comp.get("installed")
-    off = comp.get("offered")
-    inst_v = inst.get("version") if isinstance(inst, dict) else inst
-    off_v = off.get("version") if isinstance(off, dict) else off
-    st = comp.get("status", "")
-    if inst_v and off_v and (st not in ("", "current", "unknown-installed") or inst_v != off_v):
-        updates.append(f"{key} {inst_v} -> {off_v}")
-if updates:
-    print("1|" + ", ".join(updates))
-else:
-    print("0|")
-' <<< "$json_out" 2>/dev/null || true)"
-  fi
-
-  if [[ -z "$parsed" ]]; then
-    local txt_out
-    txt_out="$(run_as_user_exec "$STRATA_BIN" update --check 2>/dev/null || true)"
-    if grep -qiE "update available|newer|out of date" <<< "$txt_out"; then
-      parsed="1|new version available"
-    else
-      parsed="0|"
-    fi
-  fi
-
-  if [[ -n "$STRATA_UPDATE_CACHE_FILE" ]]; then
-    printf "%s\n" "$parsed" > "${STRATA_UPDATE_CACHE_FILE}.tmp" 2>/dev/null && mv -f "${STRATA_UPDATE_CACHE_FILE}.tmp" "$STRATA_UPDATE_CACHE_FILE" 2>/dev/null || true
-  fi
-
-  if [[ "$parsed" == 1\|* ]]; then
-    STRATA_UPDATE_AVAILABLE=true
-    STRATA_UPDATE_SUMMARY="${parsed#1|}"
-    return 0
-  else
-    STRATA_UPDATE_AVAILABLE=false
-    STRATA_UPDATE_SUMMARY=""
-    return 1
-  fi
-}
-
-load_strata_update_state() {
-  [[ -n "$STRATA_UPDATE_CACHE_FILE" && -r "$STRATA_UPDATE_CACHE_FILE" ]] || return 0
-  local line
-  line="$(<"$STRATA_UPDATE_CACHE_FILE")"
-  if [[ "$line" == 1\|* ]]; then
-    STRATA_UPDATE_AVAILABLE=true
-    STRATA_UPDATE_SUMMARY="${line#1|}"
-  else
-    STRATA_UPDATE_AVAILABLE=false
-    STRATA_UPDATE_SUMMARY=""
-  fi
-}
-
-stop_strata_update_poller() {
-  if [[ -n "$STRATA_POLLER_PID" ]]; then
-    kill "$STRATA_POLLER_PID" 2>/dev/null || true
-    wait "$STRATA_POLLER_PID" 2>/dev/null || true
-    STRATA_POLLER_PID=""
-  fi
-  [[ -n "$STRATA_UPDATE_CACHE_FILE" ]] && rm -f "$STRATA_UPDATE_CACHE_FILE" "${STRATA_UPDATE_CACHE_FILE}.tmp" 2>/dev/null || true
-  STRATA_UPDATE_CACHE_FILE=""
-}
-
-start_strata_update_poller() {
-  [[ -n "$STRATA_BIN" && -z "$STRATA_POLLER_PID" ]] || return 0
-  [[ -n "$STRATA_UPDATE_CACHE_FILE" ]] || STRATA_UPDATE_CACHE_FILE="$(mktemp /tmp/strata-update-check.XXXXXX 2>/dev/null || echo "")"
-  [[ -n "$STRATA_UPDATE_CACHE_FILE" ]] || return 0
-  (
-    trap 'kill $(jobs -p) 2>/dev/null || true; exit 0' TERM INT
-    while true; do
-      check_strata_update_sync >/dev/null 2>&1 || true
-      sleep 60 &
-      wait $! 2>/dev/null || exit 0
-    done
-  ) &
-  STRATA_POLLER_PID=$!
-}
-
-wait_for_strata_model_live() {
-  local max_wait="${1:-120}" elapsed=0 json_out ready_profile="" svc_lbl log_hint=""
-  svc_lbl="$(strata_service_label)"
-  if [[ "$HAS_SYSTEMD" == true ]]; then
-    log_hint=" (check 'journalctl -u strata -n 50')"
-  elif [[ "$HAS_LAUNCHD" == true ]]; then
-    log_hint=" (check '${TARGET_HOME}/Library/Logs/strata.err.log')"
-  fi
-  echo -e "${C_DIM}Waiting for Strata model to become ready...${C_RESET}"
-  while (( elapsed < max_wait )); do
-    if ! unit_active strata.service; then
-      echo -e "${C_RED}${svc_lbl} is not active${log_hint}.${C_RESET}"
-      return 1
-    fi
-    json_out="$(run_as_user_exec "$STRATA_BIN" update --check --json 2>/dev/null || true)"
-    if [[ -n "$json_out" ]] && has_working_python3; then
-      ready_profile="$(python3 -c '
-import json, sys
-try:
-    d = json.loads(sys.stdin.read())
-except Exception:
-    sys.exit(0)
-for s in d.get("serving") or []:
-    if isinstance(s, dict) and s.get("state") == "ready":
-        print(s.get("profile") or "model")
-        break
-' <<< "$json_out" 2>/dev/null || true)"
-      if [[ -n "$ready_profile" ]]; then
-        echo -e "${C_BGREEN}[LIVE] Strata service is active and model '${ready_profile}' is ready!${C_RESET}"
-        return 0
-      fi
-    fi
-    sleep 2
-    ((elapsed += 2))
-  done
-  if unit_active strata.service; then
-    echo -e "${C_GREEN}${svc_lbl} is active (model readiness not reported via JSON within ${max_wait}s).${C_RESET}"
-    return 0
-  fi
-  return 1
-}
-
-wait_for_strata_stopped() {
-  local max_wait="${1:-60}" elapsed=0 svc_active=false
-  echo -e "${C_DIM}Waiting for Strata to stop completely...${C_RESET}"
-  while (( elapsed < max_wait )); do
-    svc_active=false
-    unit_active strata.service && svc_active=true
-    refresh_strata_running
-    if [[ "$svc_active" == false && -z "$STRATA_RUNNING_PRESET" ]]; then
-      echo -e "${C_GREEN}Strata stopped.${C_RESET}"
-      return 0
-    fi
-    sleep 1
-    (( elapsed += 1 ))
-  done
-  echo -e "${C_RED}Timed out waiting for Strata to stop after ${max_wait}s.${C_RESET}"
-  return 1
-}
-
-perform_strata_update() {
-  refresh_strata_bin
-  if [[ -z "$STRATA_BIN" ]]; then
-    echo -e "${C_YELLOW}Strata is not installed.${C_RESET}"
-    return 1
-  fi
-
-  local was_active=false was_launch_running=false
-  unit_active strata.service && was_active=true
-  if [[ "$was_active" == false ]]; then
-    refresh_strata_running
-    [[ -n "$STRATA_RUNNING_PRESET" ]] && was_launch_running=true
-  fi
-
-  echo -e "${C_BOLD}Strata Update${C_RESET}"
-  [[ -n "$STRATA_UPDATE_SUMMARY" ]] && echo -e "Pending update: ${C_CYAN}${STRATA_UPDATE_SUMMARY}${C_RESET}"
-  if [[ "$was_active" == true ]]; then
-    echo -e "Service status: ${C_GREEN}active (will stop & restart)${C_RESET}\n"
-  elif [[ "$was_launch_running" == true ]]; then
-    echo -e "Strata status: ${C_GREEN}running (${STRATA_RUNNING_PRESET}; will stop before updating)${C_RESET}\n"
-  else
-    echo -e "Service status: ${C_DIM}inactive${C_RESET}\n"
-  fi
-
-  if ! confirm_yn "Install Strata update now? [Y/n]: " "Y"; then
-    echo -e "${C_DIM}Update cancelled.${C_RESET}"
-    return 0
-  fi
-
-  # Pause background update polling and wait for any in-flight 'strata update --check'
-  # to release the component-folder lock before running 'strata update --yes'.
-  stop_strata_update_poller
-
-  local svc_lbl
-  svc_lbl="$(strata_service_label)"
-  if [[ "$was_active" == true ]]; then
-    echo -e "\n${C_CYAN}Stopping ${svc_lbl} before updating...${C_RESET}"
-    service_ctl stop strata.service || true
-    if ! wait_for_strata_stopped 60; then
-      start_strata_update_poller
-      return 1
-    fi
-  else
-    refresh_strata_running
-    if [[ "$was_launch_running" == true || -n "$STRATA_RUNNING_PRESET" ]]; then
-      echo -e "\n${C_CYAN}Stopping Strata ('strata launch --stop') before updating...${C_RESET}"
-      run_as_user_exec "$STRATA_BIN" launch --stop || true
-      if ! wait_for_strata_stopped 60; then
-        start_strata_update_poller
-        return 1
-      fi
-    fi
-  fi
-
-  echo -e "\n${C_CYAN}Running 'strata update --yes'...${C_RESET}"
-  local rc=0 attempt=0
-  for (( attempt = 1; attempt <= 4; attempt++ )); do
-    rc=0
-    run_as_user_exec "$STRATA_BIN" update --yes || rc=$?
-    if (( rc != 7 || attempt == 4 )); then
-      break
-    fi
-    echo -e "${C_YELLOW}Strata update lock is busy (exit code 7); waiting 5s to retry (${attempt}/3)...${C_RESET}"
-    sleep 5
-  done
-
-  refresh_strata_bin
-  if (( rc == 0 )); then
-    echo -e "\n${C_GREEN}Strata update completed successfully!${C_RESET}"
-    echo -e "${C_DIM}Installed version: $(run_as_user_exec "$STRATA_BIN" --version 2>/dev/null || echo unknown)${C_RESET}"
-    check_strata_update_sync >/dev/null 2>&1 || true
-  else
-    echo -e "\n${C_RED}Strata update failed (exit code ${rc}).${C_RESET}"
-  fi
-
-  if [[ "$was_active" == true ]]; then
-    echo -e "\n${C_CYAN}Restarting ${svc_lbl}...${C_RESET}"
-    if service_ctl start strata.service; then
-      wait_for_strata_model_live 120
-    else
-      local log_hint=""
-      [[ "$HAS_SYSTEMD" == true ]] && log_hint=" (check 'journalctl -u strata -n 50')"
-      [[ "$HAS_LAUNCHD" == true ]] && log_hint=" (check '${TARGET_HOME}/Library/Logs/strata.err.log')"
-      echo -e "${C_RED}Failed to start ${svc_lbl}${log_hint}.${C_RESET}"
-    fi
-  elif strata_service_installed; then
-    echo ""
-    if confirm_yn "${svc_lbl} is installed but was stopped. Start it now? [y/N]: " "N"; then
-      if service_ctl start strata.service; then
-        wait_for_strata_model_live 120
-      else
-        echo -e "${C_RED}Failed to start ${svc_lbl}.${C_RESET}"
-      fi
-    fi
-  fi
-
-  start_strata_update_poller
-}
-format_strata_hw_warnings() {
-  if [[ "$IS_MACOS" == true ]]; then
-    if [[ "$IS_APPLE_SILICON" == false ]]; then
-      echo -e "${C_RED}[WARNING] Intel Macs (x86_64) are not supported by Strata for macOS. Upstream Strata requires Apple Silicon (M1 or newer).${C_RESET}"
-      return 0
-    fi
-    if (( MACOS_MAJOR > 0 && MACOS_MAJOR < 15 )); then
-      echo -e "${C_RED}[WARNING] Detected macOS ${MACOS_VER}. Strata's Metal engine requires macOS 15 or newer (Metal residency sets).${C_RESET}"
-    fi
-    if (( RAM_GB > 0 && RAM_GB < 16 )); then
-      echo -e "${C_YELLOW}[WARNING] Unified memory is ${RAM_GB} GiB (< 16 GiB). Strata models require at least 16 GiB unified memory.${C_RESET}"
-    elif (( RAM_GB >= 16 && RAM_GB < 64 )); then
-      echo -e "${C_YELLOW}[NOTE] Unified memory is ${RAM_GB} GiB (16-48 GiB tier): Strata streams experts from the internal SSD. Keep models on the internal SSD and apply Spotlight exclusion.${C_RESET}"
-    fi
-    return 0
-  fi
-
-  if (( RAM_MB > 0 && RAM_MB <= 31744 )) || (( RAM_MB == 0 && RAM_GB > 0 && RAM_GB <= 31 )); then
-    echo -e "${C_YELLOW}[WARNING] System RAM is ${RAM_GB} GiB (<= 31 GiB). Larger Strata models may not fit or may swap.${C_RESET}"
-  fi
-  if [[ "$IS_JETSON" == true ]]; then
-    return 0
-  elif [[ "$IS_ASAHI_LINUX" == true && "$HAS_NVIDIA" == false && "$HAS_AMD" == false && "$HAS_INTEL_ARC" == false ]]; then
-    echo -e "${C_YELLOW}[NOTE] Apple Silicon on Linux (Asahi) detected. Upstream Strata's Apple Silicon Metal engine currently requires macOS 15+ (Linux ARM64 prebuilt engines target DGX Spark CUDA).${C_RESET}"
-    return 0
-  elif [[ "$HAS_NVIDIA" == false && "$HAS_AMD" == false && "$HAS_INTEL_ARC" == false ]]; then
-    echo -e "${C_YELLOW}[WARNING] No dedicated NVIDIA, AMD Radeon, or Intel Arc GPU detected (${GPU_SUMMARY}). Strata models may not run.${C_RESET}"
-  elif [[ "$HAS_NVIDIA" == true && "$HAS_NVIDIA_UNIFIED_MEM" == false && "$NVIDIA_VRAM_MB" -gt 0 && "$NVIDIA_VRAM_MB" -le 5120 ]]; then
-    echo -e "${C_YELLOW}[WARNING] NVIDIA GPU VRAM is $((NVIDIA_VRAM_MB / 1024)) GiB (<= 5 GiB). Larger Strata models may not fit in VRAM.${C_RESET}"
-  fi
-  if (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )) && [[ "$HAS_NVIDIA" == false && "$HAS_AMD_PREBUILT_GFX" == false && "$HAS_INTEL_ARC" == false ]]; then
-    if ! status_strata_build_hip; then
-      echo -e "${C_YELLOW}[NOTE] AMD GPU (${AMD_MISSING_GFX_SUMMARY}) has no official prebuilt Strata Linux engine. Open [STRATA] -> Build Local HIP Engine to compile & register support from source.${C_RESET}"
-    fi
-  fi
-  if [[ "$HAS_NVIDIA_DATACENTER" == true && ${#NVIDIA_GPU_INDICES[@]} -eq 0 ]]; then
-    echo -e "${C_YELLOW}[WARNING] NVIDIA Tesla / datacenter GPU detected without active nvidia-smi. Ensure Above 4G Decoding is enabled in BIOS, use the proprietary nvidia driver (not nvidia-open) for pre-Turing GPUs, use the R580 legacy branch for Maxwell/Pascal/Volta (R590+ dropped M40/M60/P4/P40/P100/V100), or R470 legacy for Kepler (K80/K40).${C_RESET}"
-  elif [[ "$HAS_NVIDIA_PASCAL" == true || "$HAS_NVIDIA_VOLTA_SM70" == true ]]; then
-    local _arch_note="Pascal/Volta (sm_60/sm_61/sm_70) GPU detected: CUDA 13 dropped sm_60-sm_70, so use Strata CUDA 12 builds and R580-branch drivers"
-    if [[ "$HAS_NVIDIA_VOLTA_SM70" == true ]] && [[ ! -f "$NVIDIA_SM70_MARKER" ]]; then
-      _arch_note+=" (enable the V100 STRATA_SM70_TABLE step for faster decode)"
-    fi
-    echo -e "${C_YELLOW}[NOTE] ${_arch_note}.${C_RESET}"
-  fi
-}
-
-status_strata_manager() { [[ -n "$STRATA_BIN" ]] && strata_service_installed; }
-explain_strata_manager() {
-  local svc_lbl
-  svc_lbl="$(strata_service_label)"
-  cat <<EOF
-Impact:
-  Installs Strata (Niko1221/Strata), checks for updates ('strata update'),
-  runs 'strata launch', benchmarks running instances ('strata bench run'),
-  and installs/uninstalls ${svc_lbl} using a saved preset.
-EOF
-  local hw_warns=""
-  hw_warns="$(format_strata_hw_warnings)"
-  if [[ -n "$hw_warns" ]]; then
-    echo ""
-    printf "%s\n" "$hw_warns"
-  fi
-}
-list_strata_presets() {
-  local preset_dir="$TARGET_HOME/.config/strata/launch-presets" cli_out f
-  if [[ -n "$STRATA_BIN" ]]; then
-    cli_out="$(run_as_user_exec "$STRATA_BIN" launch --list-presets 2>/dev/null || true)"
-    if [[ -n "$cli_out" ]]; then
-      echo "$cli_out" | awk -F'  +' '{print $1}' | sed '/^$/d'
-      return 0
-    fi
-  fi
-  if [[ -d "$preset_dir" ]]; then
-    for f in "$preset_dir"/*.json; do [[ -f "$f" ]] && basename "$f" .json; done
-  fi
-}
-install_strata_service_fn() {
-  local presets=() line i=1 choice selected_preset user_group
-  while IFS= read -r line; do [[ -n "$line" ]] && presets+=("$line"); done < <(list_strata_presets)
-  if [[ ${#presets[@]} -eq 0 ]]; then
-    echo -e "${C_YELLOW}No saved Strata presets found. Run 'strata launch' first to save a preset.${C_RESET}"
-    return 1
-  fi
-  local svc_mgr="systemd" svc_lbl
-  svc_lbl="$(strata_service_label)"
-  [[ "$HAS_LAUNCHD" == true ]] && svc_mgr="launchd"
-  [[ "$HAS_SYSTEMD" == false && "$HAS_LAUNCHD" == false ]] && svc_mgr="service"
-  echo -e "\n${C_BOLD}Select a Strata preset for ${svc_mgr} service:${C_RESET}"
-  for line in "${presets[@]}"; do echo "  $i) $line"; ((i++)); done
-  read -r -p "Preset number [1-${#presets[@]}]: " choice
-  if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#presets[@]} )); then
-    echo -e "${C_RED}Invalid selection.${C_RESET}"; return 1
-  fi
-  selected_preset="${presets[$((choice-1))]}"
-  user_group="$(id -gn "$TARGET_USER")"
-  local numa_prefix="" env_lines="" kv=""
-  [[ -f "$NUMACTL_MARKER" ]] && command -v numactl >/dev/null 2>&1 && numa_prefix="$(command -v numactl) --interleave=all "
-  while IFS= read -r kv; do
-    [[ -n "$kv" ]] && env_lines+="Environment=${kv}"$'\n'
-  done < <(strata_runtime_env_list)
-
-  install_service strata.service <<EOF
-[Unit]
-Description=Strata LLM Service (${selected_preset})
-After=network-online.target multi-user.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-User=${TARGET_USER}
-Group=${user_group}
-WorkingDirectory=${TARGET_HOME}
-${env_lines:+${env_lines%$'\n'}$'\n'}ExecStart=${numa_prefix}${STRATA_BIN} launch --preset "${selected_preset}" --no-tui --yes
-ExecStop=${STRATA_BIN} launch --stop --preset "${selected_preset}"
-LimitMEMLOCK=infinity
-TimeoutStartSec=0
-TimeoutStopSec=30
-SyslogIdentifier=strata
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  echo -e "${C_GREEN}${svc_lbl} installed and started with preset '${selected_preset}'.${C_RESET}"
-}
-format_avg_power_str() {
-  local sys_w="${1:-}" gpu_w="${2:-}" cpu_w="${3:-}"
-  local parts=()
-  [[ -n "$gpu_w" ]] && parts+=("GPU ${gpu_w}W")
-  [[ -n "$cpu_w" ]] && parts+=("CPU ${cpu_w}W")
-  local detail=""
-  if (( ${#parts[@]} > 0 )); then
-    local i
-    for ((i=0; i<${#parts[@]}; i++)); do
-      (( i > 0 )) && detail+=", "
-      detail+="${parts[$i]}"
-    done
-  fi
-  if [[ -n "$sys_w" ]]; then
-    [[ -n "$detail" ]] && echo "Sys ${sys_w}W (${detail})" || echo "Sys ${sys_w}W"
-  elif [[ -n "$detail" ]]; then
-    echo "$detail"
-  fi
-}
-
-find_latest_results_json() {
-  local min_mtime="${1:-0}" newest="" d f fm
-  local search_dirs=("$PWD/bench/results" "$PWD/bench-results" "$TARGET_HOME/bench/results" "$TARGET_HOME/bench-results" "$TARGET_HOME/.local/share/strata/bench-results" "$TARGET_HOME/.config/strata/bench-results")
-  for d in "${search_dirs[@]}"; do
-    [[ -d "$d" ]] || continue
-    for f in "$d"/*/results.json "$d"/results.json; do
-      [[ -r "$f" ]] || continue
-      if (( min_mtime > 0 )); then
-        fm="$(file_mtime "$f")"
-        (( fm >= min_mtime )) || continue
-      fi
-      if [[ -z "$newest" || "$f" -nt "$newest" ]]; then
-        newest="$f"
-      fi
-    done
-  done
-  [[ -n "$newest" ]] && printf "%s" "$newest"
-}
-
-read_jetson_ina3221_watts() {
-  local d ch rname pval mv ma sw="" gw="" cw=""
-  for d in /sys/bus/i2c/drivers/ina3221x/*/iio:device*; do
-    [[ -d "$d" ]] || continue
-    for ch in 0 1 2; do
-      [[ -r "$d/rail_name_${ch}" && -r "$d/in_power${ch}_input" ]] || continue
-      rname="$(cat "$d/rail_name_${ch}" 2>/dev/null || true)"
-      pval="$(cat "$d/in_power${ch}_input" 2>/dev/null || true)"
-      [[ "$pval" =~ ^[0-9]+$ ]] || continue
-      case "$rname" in
-        VDD_IN|POM_5V_IN|VIN_SYS_5V0) [[ -z "$sw" ]] && sw="$(awk -v m="$pval" 'BEGIN{printf "%.2f", m/1000.0}')" ;;
-        VDD_GPU|POM_5V_GPU|VDD_GPU_SOC|VDD_CPU_GPU_CV) [[ -z "$gw" ]] && gw="$(awk -v m="$pval" 'BEGIN{printf "%.2f", m/1000.0}')" ;;
-        VDD_CPU|POM_5V_CPU|VDD_SYS_CPU|VDD_CPU_CV) [[ -z "$cw" ]] && cw="$(awk -v m="$pval" 'BEGIN{printf "%.2f", m/1000.0}')" ;;
-      esac
-    done
-  done
-  if [[ -z "$sw" && -z "$gw" && -z "$cw" ]]; then
-    local hm_base="${STRATA_HWMON_DIR:-/sys/class/hwmon}" hm
-    for hm in "$hm_base"/hwmon*; do
-      [[ -r "$hm/name" ]] || continue
-      [[ "$(cat "$hm/name" 2>/dev/null || true)" == "ina3221" ]] || continue
-      for ch in 0 1 2 3; do
-        [[ -r "$hm/in${ch}_label" && -r "$hm/in${ch}_input" && -r "$hm/curr${ch}_input" ]] || continue
-        rname="$(cat "$hm/in${ch}_label" 2>/dev/null || true)"
-        mv="$(cat "$hm/in${ch}_input" 2>/dev/null || true)"
-        ma="$(cat "$hm/curr${ch}_input" 2>/dev/null || true)"
-        [[ "$mv" =~ ^[0-9]+$ && "$ma" =~ ^[0-9]+$ ]] || continue
-        pval="$(awk -v v="$mv" -v c="$ma" 'BEGIN{printf "%.2f", (v*c)/1000000.0}')"
-        case "$rname" in
-          VDD_IN|POM_5V_IN|VIN_SYS_5V0) [[ -z "$sw" ]] && sw="$pval" ;;
-          VDD_GPU|POM_5V_GPU|VDD_GPU_SOC|VDD_CPU_GPU_CV) [[ -z "$gw" ]] && gw="$pval" ;;
-          VDD_CPU|POM_5V_CPU|VDD_SYS_CPU|VDD_CPU_CV) [[ -z "$cw" ]] && cw="$pval" ;;
-        esac
-      done
-    done
-  fi
-  printf "%s|%s|%s" "$sw" "$gw" "$cw"
-}
 
 _parse_macos_powermetrics() {
   local fmt="${1:-%.2f}" pm_out="$2"
@@ -7384,2099 +3482,6 @@ stop_bench_power_sampler() {
   fi
 }
 
-_strata_bench_search_dirs() {
-  printf '%s\n' \
-    "$PWD/bench/results" \
-    "$PWD/bench-results" \
-    "$TARGET_HOME/bench/results" \
-    "$TARGET_HOME/bench-results" \
-    "$TARGET_HOME/.local/share/strata/bench-results" \
-    "$TARGET_HOME/.config/strata/bench-results"
-}
-
-_strata_bench_py() {
-  local action="$1"; shift
-  python3 - "$action" "$STRATA_BENCH_HISTORY_FILE" "$@" <<'PY'
-import datetime, glob, json, os, statistics, sys
-
-action = sys.argv[1]
-hist_path = sys.argv[2]
-rest = sys.argv[3:]
-
-def fmt_ts(ts):
-    ts = (ts or "").replace("T", " ")
-    if ts.endswith("Z"):
-        ts = ts[:-1] + " UTC"
-    if len(ts) > 20 and " UTC" in ts:
-        ts = ts[:16] + " UTC"
-    return ts
-
-def load_hist(path):
-    hist_list, hist_by_file = [], {}
-    if path and os.path.exists(path):
-        try:
-            with open(path) as f:
-                loaded = json.load(f)
-            if isinstance(loaded, list):
-                hist_list = [e for e in loaded if isinstance(e, dict)]
-                for e in hist_list:
-                    rf = e.get("results_file")
-                    if rf:
-                        hist_by_file[rf] = e
-                        hist_by_file[os.path.realpath(rf)] = e
-        except Exception:
-            pass
-    return hist_list, hist_by_file
-
-def extract_metrics(d, path=None, he=None, default_tag="", preset=""):
-    run = d.get("run") if isinstance(d.get("run"), dict) else {}
-    raw_ts = run.get("started_at") or run.get("timestamp") or d.get("timestamp") or ""
-    ts = fmt_ts(raw_ts)
-    if not ts and path:
-        try:
-            ts = datetime.datetime.fromtimestamp(os.path.getmtime(path), tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        except Exception:
-            ts = "Unknown"
-    cfg = d.get("configuration") if isinstance(d.get("configuration"), dict) else {}
-    proto_d = d.get("protocol") if isinstance(d.get("protocol"), dict) else {}
-    prof = proto_d.get("profile") or cfg.get("profile") or preset or ""
-    proto = proto_d.get("id") or d.get("protocol_id") or d.get("format") or ""
-    tag = prof or ("standard-v1" if "standard" in proto else proto) or (he.get("tag") if he else "") or default_tag
-    mdl = d.get("model")
-    if isinstance(mdl, dict):
-        m_name = mdl.get("name") or mdl.get("id") or ""
-        m_quant = mdl.get("quantization") or ""
-        if m_name and m_quant and m_quant.lower() not in m_name.lower():
-            model_s = f"{m_name} ({m_quant})"
-        else:
-            model_s = m_name or m_quant or "Unknown"
-    elif isinstance(mdl, str) and mdl:
-        model_s = mdl
-    else:
-        model_s = (he.get("model") if he else None) or "Unknown"
-
-    sums_raw = d.get("summaries") if "summaries" in d else d.get("summary")
-    reqs = d.get("requests") if isinstance(d.get("requests"), list) else []
-    dec = pre = tot_r = None
-    fail_r = 0
-    if isinstance(sums_raw, list):
-        perf_dec = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("phase") == "performance" and s.get("metric") == "decode_tps" and isinstance(s.get("median"), (int, float))]
-        all_dec = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("metric") == "decode_tps" and isinstance(s.get("median"), (int, float))]
-        perf_pre = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("phase") == "performance" and s.get("metric") == "prompt_tps" and isinstance(s.get("median"), (int, float))]
-        all_pre = [s.get("median") for s in sums_raw if isinstance(s, dict) and s.get("metric") == "prompt_tps" and isinstance(s.get("median"), (int, float))]
-        dec = statistics.median(perf_dec) if perf_dec else (statistics.median(all_dec) if all_dec else None)
-        pre = statistics.median(perf_pre) if perf_pre else (statistics.median(all_pre) if all_pre else None)
-    elif isinstance(sums_raw, dict):
-        dec = sums_raw.get("median_decode_tok_s") or sums_raw.get("decode_tps") or sums_raw.get("decode_tok_s")
-        pre = sums_raw.get("median_prefill_tok_s") or sums_raw.get("prompt_tps") or sums_raw.get("prefill_tok_s")
-        tot_r = sums_raw.get("total_requests")
-        fail_r = sums_raw.get("failed_requests") if isinstance(sums_raw.get("failed_requests"), int) else 0
-    if dec is None:
-        vals = [r.get("decode_tok_s") for r in reqs if isinstance(r, dict) and isinstance(r.get("decode_tok_s"), (int, float))]
-        if vals:
-            dec = statistics.median(vals)
-    if pre is None:
-        vals = [r.get("prefill_tok_s") for r in reqs if isinstance(r, dict) and isinstance(r.get("prefill_tok_s"), (int, float))]
-        if vals:
-            pre = statistics.median(vals)
-
-    perf_reqs = [r for r in reqs if isinstance(r, dict) and r.get("phase") == "performance"]
-    req_pool = perf_reqs if perf_reqs else [r for r in reqs if isinstance(r, dict) and r.get("phase") != "warmup"]
-    avg_dec_vals, avg_pre_vals = [], []
-    for r in req_pool:
-        m = r.get("metrics") if isinstance(r.get("metrics"), dict) else {}
-        dv = m.get("decode_tps") if isinstance(m.get("decode_tps"), (int, float)) else r.get("decode_tok_s")
-        pv = m.get("prompt_tps") if isinstance(m.get("prompt_tps"), (int, float)) else r.get("prefill_tok_s")
-        if dv is None:
-            tk = r.get("tokens") if isinstance(r.get("tokens"), dict) else {}
-            tm = r.get("timings") if isinstance(r.get("timings"), dict) else {}
-            if isinstance(tk.get("decode_tokens"), (int, float)) and isinstance(tm.get("decode_s"), (int, float)) and tm["decode_s"] > 0:
-                dv = tk["decode_tokens"] / tm["decode_s"]
-        if pv is None:
-            tk = r.get("tokens") if isinstance(r.get("tokens"), dict) else {}
-            tm = r.get("timings") if isinstance(r.get("timings"), dict) else {}
-            rtok = tk.get("read_tokens") if isinstance(tk.get("read_tokens"), (int, float)) else tk.get("input_tokens")
-            if isinstance(rtok, (int, float)) and isinstance(tm.get("prompt_s"), (int, float)) and tm["prompt_s"] > 0:
-                pv = rtok / tm["prompt_s"]
-        if isinstance(dv, (int, float)):
-            avg_dec_vals.append(dv)
-        if isinstance(pv, (int, float)):
-            avg_pre_vals.append(pv)
-    avg_dec = statistics.mean(avg_dec_vals) if avg_dec_vals else (he.get("avg_decode_tok_s") if he else None)
-    avg_pre = statistics.mean(avg_pre_vals) if avg_pre_vals else (he.get("avg_prefill_tok_s") if he else None)
-
-    req_d, opt_d = run.get("required_duration_s"), run.get("optional_duration_s")
-    dur_s = f"{req_d + (opt_d if isinstance(opt_d, (int, float)) else 0.0):.1f}s" if isinstance(req_d, (int, float)) else ""
-
-    rcounts = d.get("request_counts") if isinstance(d.get("request_counts"), dict) else {}
-    if not isinstance(tot_r, int) and rcounts:
-        tot_r = sum(v.get("attempted", 0) for v in rcounts.values() if isinstance(v, dict) and isinstance(v.get("attempted"), int))
-        fail_r = sum(v.get("failed", 0) for v in rcounts.values() if isinstance(v, dict) and isinstance(v.get("failed"), int))
-    if not isinstance(tot_r, int) and reqs:
-        tot_r = len(reqs)
-        fail_r = sum(1 for r in reqs if isinstance(r, dict) and r.get("status") not in (None, "ok", "completed"))
-
-    qual = d.get("quality") if isinstance(d.get("quality"), dict) else {}
-    qp = qual.get("sanity_checks_passed") if qual.get("sanity_checks_passed") is not None else qual.get("passed")
-    qt = qual.get("sanity_checks_total") if qual.get("sanity_checks_total") is not None else qual.get("total")
-    pwr = he.get("avg_power") if isinstance((he or {}).get("avg_power"), dict) else {}
-    has_opts = "1" if (he is not None and "active_steps" in he) else "0"
-    act_list = he.get("active_steps") if isinstance((he or {}).get("active_steps"), list) else []
-
-    return {
-        "run_id": run.get("id"), "raw_ts": raw_ts, "ts": ts, "tag": tag, "model": model_s,
-        "dec": float(dec) if isinstance(dec, (int, float)) else None,
-        "pre": float(pre) if isinstance(pre, (int, float)) else None,
-        "avg_dec": float(avg_dec) if isinstance(avg_dec, (int, float)) else None,
-        "avg_pre": float(avg_pre) if isinstance(avg_pre, (int, float)) else None,
-        "tot_r": tot_r if isinstance(tot_r, int) else None,
-        "fail_r": fail_r if isinstance(fail_r, int) else 0,
-        "qp": qp, "qt": qt, "dur_s": dur_s,
-        "sw": str(pwr.get("sys_w") or ""), "gw": str(pwr.get("gpu_w") or ""), "cw": str(pwr.get("cpu_w") or ""),
-        "has_opts": has_opts, "act_list": act_list,
-        "key": os.path.realpath(path) if path else "",
-    }
-
-def from_results_file(path, he, default_tag=""):
-    try:
-        with open(path) as f:
-            d = json.load(f)
-    except Exception:
-        return None
-    if not isinstance(d, dict):
-        return None
-    return extract_metrics(d, path=path, he=he, default_tag=default_tag)
-
-def from_hist_entry(e, idx_fallback):
-    pwr = e.get("avg_power") if isinstance(e.get("avg_power"), dict) else {}
-    rf = e.get("results_file") or ""
-    act_list = e.get("active_steps") if isinstance(e.get("active_steps"), list) else []
-    dec, pre = e.get("decode_tok_s"), e.get("prefill_tok_s")
-    avg_dec, avg_pre = e.get("avg_decode_tok_s"), e.get("avg_prefill_tok_s")
-    tot_r = e.get("total_requests")
-    fail_r = e.get("failed_requests") if isinstance(e.get("failed_requests"), int) else 0
-    return {
-        "ts": fmt_ts(e.get("timestamp")),
-        "tag": e.get("tag") or e.get("mode") or "",
-        "model": e.get("model") or "Unknown",
-        "dec": float(dec) if isinstance(dec, (int, float)) else None,
-        "pre": float(pre) if isinstance(pre, (int, float)) else None,
-        "avg_dec": float(avg_dec) if isinstance(avg_dec, (int, float)) else None,
-        "avg_pre": float(avg_pre) if isinstance(avg_pre, (int, float)) else None,
-        "tot_r": tot_r if isinstance(tot_r, int) else None,
-        "fail_r": fail_r,
-        "qp": e.get("sanity_checks_passed"), "qt": e.get("sanity_checks_total"),
-        "dur_s": "",
-        "sw": str(pwr.get("sys_w") or ""), "gw": str(pwr.get("gpu_w") or ""), "cw": str(pwr.get("cpu_w") or ""),
-        "has_opts": "1", "act_list": act_list,
-        "key": os.path.realpath(rf) if rf else f"hist:{e.get('id') or e.get('timestamp') or idx_fallback}",
-    }
-
-def collect_items(search_dirs, default_tag=""):
-    hist_list, hist_by_file = load_hist(hist_path)
-    items, seen = [], set()
-    for e in reversed(hist_list):
-        rf = e.get("results_file") or ""
-        rec = from_results_file(rf, e, default_tag) if (rf and os.path.exists(rf)) else from_hist_entry(e, len(items))
-        if rec and rec["key"] not in seen:
-            seen.add(rec["key"])
-            items.append(rec)
-    found_files = []
-    for d in search_dirs:
-        if not os.path.isdir(d):
-            continue
-        for pat in (os.path.join(d, "*", "results.json"), os.path.join(d, "results.json")):
-            for p in glob.glob(pat):
-                try:
-                    found_files.append((os.path.getmtime(p), os.path.realpath(p), p))
-                except Exception:
-                    pass
-    found_files.sort(reverse=True)
-    for _, rp, p in found_files:
-        if rp in seen:
-            continue
-        rec = from_results_file(p, hist_by_file.get(rp) or hist_by_file.get(p), default_tag)
-        if rec:
-            seen.add(rp)
-            items.append(rec)
-    return items
-
-def score_key(rec):
-    d = rec.get("avg_dec") if rec.get("avg_dec") is not None else rec.get("dec")
-    p = rec.get("avg_pre") if rec.get("avg_pre") is not None else rec.get("pre")
-    return (d if isinstance(d, (int, float)) else -1.0, p if isinstance(p, (int, float)) else -1.0)
-
-def pct_vs_ref(rec, ref_rec):
-    rec_d = rec.get("avg_dec") if rec.get("avg_dec") is not None else rec.get("dec")
-    ref_d = ref_rec.get("avg_dec") if ref_rec.get("avg_dec") is not None else ref_rec.get("dec")
-    rec_p = rec.get("avg_pre") if rec.get("avg_pre") is not None else rec.get("pre")
-    ref_p = ref_rec.get("avg_pre") if ref_rec.get("avg_pre") is not None else ref_rec.get("pre")
-    dp = f"{((rec_d - ref_d) / ref_d) * 100.0:.1f}" if (isinstance(rec_d, (int, float)) and isinstance(ref_d, (int, float)) and ref_d > 0) else ""
-    pp = f"{((rec_p - ref_p) / ref_p) * 100.0:.1f}" if (isinstance(rec_p, (int, float)) and isinstance(ref_p, (int, float)) and ref_p > 0) else ""
-    return dp, pp
-
-if action == "save":
-    tmp_path, res_path, mode, preset, url, avg_sys, avg_gpu, avg_cpu, samples_s, active_csv, applicable_csv = rest[:11]
-    history, _ = load_hist(hist_path)
-    res_data = {}
-    if res_path and os.path.exists(res_path):
-        try:
-            with open(res_path) as f:
-                loaded = json.load(f)
-                if isinstance(loaded, dict):
-                    res_data = loaded
-        except Exception:
-            pass
-    m = extract_metrics(res_data, default_tag=mode, preset=preset)
-    ts = m["raw_ts"] or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    entry = {
-        "id": m["run_id"] or ts,
-        "timestamp": ts,
-        "mode": mode,
-        "tag": m["tag"],
-        "preset": preset,
-        "url": url,
-        "results_file": res_path,
-        "model": m["model"],
-        "decode_tok_s": round(m["dec"], 2) if m["dec"] is not None else None,
-        "prefill_tok_s": round(m["pre"], 2) if m["pre"] is not None else None,
-        "avg_decode_tok_s": round(m["avg_dec"], 2) if m["avg_dec"] is not None else None,
-        "avg_prefill_tok_s": round(m["avg_pre"], 2) if m["avg_pre"] is not None else None,
-        "total_requests": m["tot_r"],
-        "failed_requests": m["fail_r"],
-        "sanity_checks_passed": m["qp"],
-        "sanity_checks_total": m["qt"],
-        "avg_power": {
-            "sys_w": avg_sys, "gpu_w": avg_gpu, "cpu_w": avg_cpu,
-            "samples": int(samples_s) if samples_s.isdigit() else 0,
-        },
-        "active_steps": [s for s in active_csv.split(",") if s],
-        "applicable_steps": [s for s in applicable_csv.split(",") if s],
-    }
-    history.append(entry)
-    with open(tmp_path, "w") as f:
-        json.dump(history, f, indent=2)
-    os.replace(tmp_path, hist_path)
-elif action == "count":
-    hist_list, _ = load_hist(hist_path)
-    seen, count = set(), 0
-    for e in hist_list:
-        rf = e.get("results_file") or ""
-        key = os.path.realpath(rf) if rf else f"hist:{e.get('id') or e.get('timestamp') or count}"
-        if key not in seen:
-            seen.add(key)
-            count += 1
-    for sd in rest:
-        if not os.path.isdir(sd):
-            continue
-        for pat in (os.path.join(sd, "*", "results.json"), os.path.join(sd, "results.json")):
-            for p in glob.glob(pat):
-                rp = os.path.realpath(p)
-                if rp not in seen:
-                    seen.add(rp)
-                    count += 1
-    print(count)
-elif action == "history":
-    items = collect_items(rest, default_tag="cli")
-    best_idx = max(range(len(items)), key=lambda i: score_key(items[i])) if any(
-        (items[i].get("avg_dec") is not None or items[i].get("dec") is not None) for i in range(len(items))
-    ) else None
-    for idx, rec in enumerate(items):
-        d_pct, p_pct = pct_vs_ref(rec, items[best_idx]) if (best_idx is not None and idx != best_idx) else ("", "")
-        is_best = "1" if (best_idx is not None and idx == best_idx) else "0"
-        dec_s = f"{rec['dec']:.1f}" if rec["dec"] is not None else "—"
-        pre_s = f"{rec['pre']:.1f}" if rec["pre"] is not None else "—"
-        avg_dec_s = f"{rec['avg_dec']:.1f}" if rec["avg_dec"] is not None else ""
-        avg_pre_s = f"{rec['avg_pre']:.1f}" if rec["avg_pre"] is not None else ""
-        req_s = f"{rec['tot_r'] - rec['fail_r']}/{rec['tot_r']} ok" if isinstance(rec["tot_r"], int) and rec["tot_r"] > 0 else ""
-        qual_s = f"Sanity {rec['qp']}/{rec['qt']}" if isinstance(rec["qp"], int) and isinstance(rec["qt"], int) and rec["qt"] > 0 else ""
-        act = ",".join(rec["act_list"])
-        act_n = str(len(rec["act_list"])) if rec["has_opts"] == "1" else "untracked"
-        cols = [idx, rec["ts"], rec["tag"], rec["model"], dec_s, pre_s, rec["sw"], rec["gw"], rec["cw"],
-                act_n, act, req_s, qual_s, rec["has_opts"], avg_dec_s, avg_pre_s, rec["dur_s"], d_pct, p_pct, is_best]
-        print("|".join(str(c).replace("|", "/").replace("\n", " ").replace("\r", "") for c in cols))
-elif action == "summary":
-    items = collect_items(rest, default_tag="")
-    if not items:
-        sys.exit(0)
-    def fmt_rec(kind, rec, d_pct="", p_pct="", prev_d_pct="", prev_p_pct=""):
-        dec_s = f"{rec['dec']:.1f} tok/s" if rec["dec"] is not None else "—"
-        pre_s = f"{rec['pre']:.1f} tok/s" if rec["pre"] is not None else "—"
-        avg_dec_s = f"{rec['avg_dec']:.1f} tok/s" if rec.get("avg_dec") is not None else ""
-        avg_pre_s = f"{rec['avg_pre']:.1f} tok/s" if rec.get("avg_pre") is not None else ""
-        req_s = f"{rec['tot_r'] - rec['fail_r']}/{rec['tot_r']} ok" if isinstance(rec["tot_r"], int) and rec["tot_r"] > 0 else ""
-        qual_s = f"Sanity: {rec['qp']}/{rec['qt']}" if isinstance(rec["qp"], int) and isinstance(rec["qt"], int) and rec["qt"] > 0 else ""
-        cols = [kind, rec["ts"], rec["tag"], rec["model"], dec_s, pre_s, req_s, qual_s,
-                rec["sw"], rec["gw"], rec["cw"], d_pct, p_pct, avg_dec_s, avg_pre_s, prev_d_pct, prev_p_pct]
-        return "|".join(str(c).replace("|", "/").replace("\n", " ").replace("\r", "") for c in cols)
-    best = max(items, key=score_key)
-    if len(items) >= 2:
-        cur_dp, cur_pp = pct_vs_ref(items[0], best)
-        cur_prev_dp, cur_prev_pp = pct_vs_ref(items[0], items[1])
-        print(fmt_rec("CUR", items[0], cur_dp, cur_pp, cur_prev_dp, cur_prev_pp))
-        prev_dp, prev_pp = pct_vs_ref(items[1], best)
-        print(fmt_rec("PREV", items[1], prev_dp, prev_pp))
-        print(fmt_rec("BEST", best))
-    else:
-        print(fmt_rec("CUR", items[0]))
-PY
-}
-
-save_bench_history_entry() {
-  local results_file="$1" mode="$2" avg_sys="$3" avg_gpu="$4" avg_cpu="$5" samples="$6" active_csv="$7" applicable_csv="$8"
-  has_working_python3 || return 0
-  local hist_dir
-  hist_dir="$(dirname "$STRATA_BENCH_HISTORY_FILE")"
-  run_as_user_exec mkdir -p "$hist_dir" 2>/dev/null || mkdir -p "$hist_dir"
-  local tmp_file
-  tmp_file="$(mktemp "${STRATA_BENCH_HISTORY_FILE}.tmp.XXXXXX" 2>/dev/null || echo "")"
-  [[ -n "$tmp_file" ]] || return 1
-
-  _strata_bench_py save "$tmp_file" "$results_file" "$mode" "${STRATA_RUNNING_PRESET:-}" "${STRATA_RUNNING_URL:-}" "$avg_sys" "$avg_gpu" "$avg_cpu" "${samples:-0}" "$active_csv" "$applicable_csv"
-  if [[ $EUID -eq 0 && "$TARGET_USER" != "root" ]]; then
-    chown -R "$TARGET_USER:$(id -gn "$TARGET_USER")" "$hist_dir" 2>/dev/null || true
-  fi
-}
-
-count_bench_history() {
-  has_working_python3 || { echo 0; return 0; }
-  local newest="" hist_mtime="0" newest_mtime="0" ckey
-  newest="$(find_latest_results_json 0)"
-  [[ -r "$STRATA_BENCH_HISTORY_FILE" ]] && hist_mtime="$(file_mtime "$STRATA_BENCH_HISTORY_FILE")"
-  [[ -n "$newest" ]] && newest_mtime="$(file_mtime "$newest")"
-  ckey="${STRATA_BENCH_HISTORY_FILE}:${hist_mtime}:${newest}:${newest_mtime}"
-  if [[ "$ckey" == "$BENCH_HISTORY_COUNT_KEY" ]]; then
-    echo "$BENCH_HISTORY_COUNT_CACHE"
-    return 0
-  fi
-  local -a _sdirs=()
-  mapfile -t _sdirs < <(_strata_bench_search_dirs)
-  local cnt
-  cnt="$(_strata_bench_py count "${_sdirs[@]}" 2>/dev/null || echo 0)"
-  [[ "$cnt" =~ ^[0-9]+$ ]] || cnt=0
-  BENCH_HISTORY_COUNT_KEY="$ckey"
-  BENCH_HISTORY_COUNT_CACHE="$cnt"
-  echo "$cnt"
-}
-
-apply_bench_history_config() {
-  local target_csv="$1"
-  build_active_steps
-  local -A target_map=()
-  local st
-  IFS=',' read -ra _tarr <<< "$target_csv"
-  for st in "${_tarr[@]}"; do
-    [[ -n "$st" ]] && target_map["$st"]=1
-  done
-
-  local to_apply=() to_revert=()
-  for st in "${ACTIVE_STEPS[@]}"; do
-    [[ "$st" == "strata_manager" ]] && continue
-    local cur_applied=false
-    "status_${st}" && cur_applied=true
-    if [[ -n "${target_map[$st]+x}" ]]; then
-      [[ "$cur_applied" == false ]] && to_apply+=("$st")
-    else
-      [[ "$cur_applied" == true ]] && to_revert+=("$st")
-    fi
-  done
-
-  if (( ${#to_apply[@]} == 0 && ${#to_revert[@]} == 0 )); then
-    echo -e "\n${C_GREEN}System already matches this benchmark's active options.${C_RESET}"
-    return 0
-  fi
-
-  if (( ${#to_apply[@]} > 0 )); then
-    echo -e "\n${C_GREEN}Options to APPLY (${#to_apply[@]}):${C_RESET}"
-    for st in "${to_apply[@]}"; do echo "  + $("title_${st}")"; done
-  fi
-  if (( ${#to_revert[@]} > 0 )); then
-    echo -e "\n${C_RED}Options to REVERT (${#to_revert[@]}):${C_RESET}"
-    for st in "${to_revert[@]}"; do echo "  - $("title_${st}")"; done
-  fi
-
-  echo ""
-  local _ans="" _ch=""
-  printf "%s" "Apply and revert options to match this benchmark configuration? [y] Apply / [N/c/Esc] Cancel: "
-  while true; do
-    IFS= read -rsn1 _ch || { echo ""; echo -e "${C_YELLOW}Cancelled. No changes were made.${C_RESET}"; return 2; }
-    if [[ -z "$_ch" ]]; then
-      echo ""
-      break
-    elif [[ "$_ch" == $'\e' ]]; then
-      local _esc=""
-      IFS= read -rsn2 -t 0.01 _esc || true
-      if [[ -z "$_esc" ]]; then
-        echo ""
-        echo -e "${C_YELLOW}Cancelled. No changes were made.${C_RESET}"
-        return 2
-      fi
-    elif [[ "$_ch" == $'\177' || "$_ch" == $'\b' ]]; then
-      if [[ -n "$_ans" ]]; then
-        _ans="${_ans%?}"
-        printf "\b \b"
-      fi
-    else
-      _ans+="$_ch"
-      printf "%s" "$_ch"
-    fi
-  done
-  [[ -z "$_ans" ]] && _ans="N"
-  case "$_ans" in
-    y|Y|yes|YES|Yes) ;;
-    n|N|no|NO|No|c|C|cancel|CANCEL|Cancel|b|B|q|Q)
-      echo -e "${C_YELLOW}Cancelled. No changes were made.${C_RESET}"
-      return 2
-      ;;
-    *)
-      echo -e "${C_RED}Invalid input '${_ans}'. Cancelled.${C_RESET}"
-      return 2
-      ;;
-  esac
-
-  for st in "${to_revert[@]}"; do
-    echo -e "\n${C_BOLD}${C_RED}>>> Reverting: $("title_${st}")${C_RESET}"
-    "revert_${st}" || echo -e "${C_YELLOW}Step '${st}' exited with a warning.${C_RESET}"
-  done
-  for st in "${to_apply[@]}"; do
-    echo -e "\n${C_BOLD}${C_CYAN}>>> Applying: $("title_${st}")${C_RESET}"
-    "apply_${st}" || echo -e "${C_YELLOW}Step '${st}' exited with a warning or was skipped.${C_RESET}"
-  done
-  echo -e "\n${C_GREEN}Finished restoring benchmark configuration.${C_RESET}"
-  prompt_reboot_if_needed
-}
-
-HIST_SELECTED=0
-
-show_benchmark_history() {
-  local -A HIST_EXPANDED=()
-  while true; do
-    print_header none true
-    if ! has_working_python3; then
-      echo -e "${C_BOLD}Strata Benchmark History & Coupled Configurations${C_RESET}"
-      echo -e "${C_DIM}----------------------------------------------------------------------${C_RESET}"
-      echo -e "${C_DIM}python3 is required to parse benchmark results.${C_RESET}"
-      pause_prompt
-      return 0
-    fi
-
-    local -a rows=() _sdirs=()
-    mapfile -t _sdirs < <(_strata_bench_search_dirs)
-    while IFS= read -r line; do
-      [[ -n "$line" ]] && rows+=("$line")
-    done < <(_strata_bench_py history "${_sdirs[@]}" 2>/dev/null || true)
-    if (( ${#rows[@]} == 0 )); then
-      echo -e "${C_DIM}No benchmark results found yet.${C_RESET}"
-      echo -e "${C_DIM}Run a benchmark from Strata Options (Run Strata Benchmark) to record results, power, and active options.${C_RESET}"
-      pause_prompt
-      return 0
-    fi
-
-    (( HIST_SELECTED >= ${#rows[@]} )) && HIST_SELECTED=$(( ${#rows[@]} - 1 ))
-    (( HIST_SELECTED < 0 )) && HIST_SELECTED=0
-
-    local _rule_w=117
-    [[ -t 1 ]] && _rule_w="$(tput cols 2>/dev/null || echo 117)"
-    (( _rule_w > 117 )) && _rule_w=117
-    local tbl_w=$(( _rule_w - 2 ))
-    (( tbl_w < 78 )) && tbl_w=78
-    local hdr_w=$(( tbl_w - 4 ))
-    local val_w=$(( tbl_w - 27 ))
-    local _dashes_top _dashes_val _hdr_rule
-    printf -v _dashes_top "%*s" "$(( tbl_w - 2 ))" ""; _dashes_top="${_dashes_top// /-}"
-    printf -v _dashes_val "%*s" "$(( val_w + 2 ))" ""; _dashes_val="${_dashes_val// /-}"
-    printf -v _hdr_rule "%*s" "$_rule_w" ""; _hdr_rule="${_hdr_rule// /-}"
-    local _tbl_top="  +${_dashes_top}+"
-    local _tbl_rule="  +----------------------+${_dashes_val}+"
-
-    HIST_HDR_LINES=()
-    HIST_HDR_PLAIN=()
-    HIST_HDR_SEL=()
-
-    local body="" r idx ts tag model dec_s pre_s sw gw cw act_n act_csv req_s qual_s has_opts avg_dec_s avg_pre_s dur_s d_pct p_pct is_best
-    local pwr_s dec_cell pre_cell chk_cell diff_cell act_lbl _s
-    local opt_items=()
-    body+="$(echo -e "${C_BOLD}Strata Benchmark Results & Coupled Configurations (${#rows[@]} recorded)${C_RESET}")"$'\n'
-    body+="$(echo -e "${C_DIM}${_hdr_rule}${C_RESET}")"$'\n'
-    for r in "${rows[@]}"; do
-      IFS='|' read -r idx ts tag model dec_s pre_s sw gw cw act_n act_csv req_s qual_s has_opts avg_dec_s avg_pre_s dur_s d_pct p_pct is_best <<< "$r"
-      pwr_s="$(format_avg_power_str "$sw" "$gw" "$cw")"
-      [[ -z "$pwr_s" ]] && pwr_s="n/a (not recorded)"
-
-      dec_cell="${dec_s} tok/s"
-      [[ -n "$avg_dec_s" ]] && dec_cell+=" (Avg: ${avg_dec_s} tok/s)"
-      pre_cell="${pre_s} tok/s"
-      [[ -n "$avg_pre_s" ]] && pre_cell+=" (Avg: ${avg_pre_s} tok/s)"
-
-      chk_cell=""
-      [[ -n "$req_s" ]] && chk_cell="Reqs: ${req_s}"
-      if [[ -n "$qual_s" ]]; then
-        [[ -n "$chk_cell" ]] && chk_cell+=" | "
-        chk_cell+="$qual_s"
-      fi
-      [[ -n "$dur_s" ]] && chk_cell+="${chk_cell:+ | }Dur: ${dur_s}"
-
-      opt_items=()
-      if [[ "$has_opts" != "1" ]]; then
-        opt_items=("Not recorded (CLI run)")
-        act_lbl="Active options not recorded for CLI run"
-      elif [[ -z "$act_csv" ]]; then
-        opt_items=("(none)")
-        act_lbl="Press [Enter] or [$((idx + 1))] to revert all active optimizations"
-      else
-        local _slist=() _stitle
-        IFS=',' read -ra _slist <<< "$act_csv"
-        for _s in "${_slist[@]}"; do
-          if declare -F "title_${_s}" >/dev/null 2>&1; then
-            _stitle="$("title_${_s}")"
-          else
-            _stitle="$_s"
-          fi
-          opt_items+=("- ${_stitle}")
-        done
-        act_lbl="Press [Enter] or [$((idx + 1))] to apply/restore these ${act_n} option(s)"
-      fi
-
-      local is_exp=false exp_tag="[+]"
-      if [[ "${HIST_EXPANDED[$idx]:-0}" == "1" ]]; then
-        is_exp=true
-        exp_tag="[-]"
-      fi
-      diff_cell=""
-      local diff_hdr=""
-      if [[ "$is_best" == "1" ]]; then
-        diff_cell="$(printf "%b[BEST]%b %b(Best overall performance)%b" "${C_BGREEN}" "${C_RESET}" "${C_DIM}" "${C_RESET}")"
-        diff_hdr="$(printf "%b[BEST]%b" "${C_BGREEN}" "${C_RESET}")"
-      else
-        local _dp=()
-        [[ -n "$d_pct" ]] && _dp+=("Decode $(format_pct_delta "$d_pct")")
-        [[ -n "$p_pct" ]] && _dp+=("Prefill $(format_pct_delta "$p_pct")")
-        if (( ${#_dp[@]} > 0 )); then
-          diff_cell="${_dp[0]}"
-          (( ${#_dp[@]} > 1 )) && diff_cell+=" | ${_dp[1]}"
-          diff_hdr="$diff_cell"
-        fi
-      fi
-
-      local _dvis="${diff_hdr//$'\033'\[*([0-9;])m/}"
-      local _dlen=${#_dvis}
-      local left_max=$(( hdr_w - (_dlen > 0 ? _dlen + 2 : 0) ))
-      (( left_max < 10 )) && left_max=10
-      local opts_tag="(${act_n} opts)"
-      [[ "$has_opts" != "1" ]] && opts_tag="(CLI)"
-      local hdr_base="${exp_tag} [$((idx + 1))] ${ts}${tag:+ (${tag})} | ${opts_tag}"
-      local hdr_plain_txt="  ${hdr_base}" hdr_sel_txt="> ${hdr_base}"
-      (( ${#hdr_plain_txt} > left_max )) && hdr_plain_txt="${hdr_plain_txt:0:$((left_max - 3))}..."
-      (( ${#hdr_sel_txt} > left_max )) && hdr_sel_txt="${hdr_sel_txt:0:$((left_max - 3))}..."
-      (( ${#model} > val_w )) && model="${model:0:$((val_w - 3))}..."
-      (( ${#act_lbl} > val_w )) && act_lbl="${act_lbl:0:$((val_w - 3))}..."
-
-      local gap_p=$(( hdr_w - ${#hdr_plain_txt} - _dlen ))
-      local gap_s=$(( hdr_w - ${#hdr_sel_txt} - _dlen ))
-      (( gap_p < 0 )) && gap_p=0
-      (( gap_s < 0 )) && gap_s=0
-      local row_plain row_sel
-      row_plain="$(printf "  | ${C_BOLD}%s${C_RESET}%*s%s |" "$hdr_plain_txt" "$gap_p" "" "$diff_hdr")"
-      row_sel="$(printf "  | ${C_CYAN}${C_BOLD}%s${C_RESET}%*s%s |" "$hdr_sel_txt" "$gap_s" "" "$diff_hdr")"
-      HIST_HDR_PLAIN+=("$row_plain")
-      HIST_HDR_SEL+=("$row_sel")
-
-      body+=$'\n'"${_tbl_top}"$'\n'
-      local cur_line_no
-      cur_line_no="$(printf "%s" "$body" | wc -l | tr -d '[:space:]')"
-      HIST_HDR_LINES+=("$((cur_line_no + 1))")
-      if (( idx == HIST_SELECTED )); then
-        body+="${row_sel}"$'\n'
-      else
-        body+="${row_plain}"$'\n'
-      fi
-      if [[ "$is_exp" == true ]]; then
-        body+="${_tbl_rule}"$'\n'
-        [[ -n "$diff_cell" ]] && body+="$(printf "  | %-20s | %s |" "Diff (vs Best)" "$(pad_ansi_col "$diff_cell" "$val_w")")"$'\n'
-        body+="$(printf "  | %-20s | %-*s |" "Model" "$val_w" "$model")"$'\n'
-        body+="$(printf "  | %-20s | ${C_GREEN}%-*s${C_RESET} |" "Decode (Med / Avg)" "$val_w" "$dec_cell")"$'\n'
-        body+="$(printf "  | %-20s | ${C_CYAN}%-*s${C_RESET} |" "Prefill (Med / Avg)" "$val_w" "$pre_cell")"$'\n'
-        body+="$(printf "  | %-20s | %-*s |" "Average Power" "$val_w" "$pwr_s")"$'\n'
-        [[ -n "$chk_cell" ]] && body+="$(printf "  | %-20s | %-*s |" "Checks" "$val_w" "$chk_cell")"$'\n'
-        local opts_hdr="Active Opts (${act_n})"
-        [[ "$has_opts" != "1" ]] && opts_hdr="Active Opts (CLI)"
-        local first_opt_row=true _opt_line
-        for _opt_line in "${opt_items[@]}"; do
-          (( ${#_opt_line} > val_w )) && _opt_line="${_opt_line:0:$((val_w - 3))}..."
-          if [[ "$first_opt_row" == true ]]; then
-            body+="$(printf "  | %-20s | %-*s |" "$opts_hdr" "$val_w" "$_opt_line")"$'\n'
-            first_opt_row=false
-          else
-            body+="$(printf "  | %-20s | %-*s |" "" "$val_w" "$_opt_line")"$'\n'
-          fi
-        done
-        body+="$(printf "  | %-20s | ${C_BOLD}%-*s${C_RESET} |" "Restore Options" "$val_w" "$act_lbl")"$'\n'
-        body+="${_tbl_rule}"$'\n'
-      else
-        body+="${_tbl_top}"$'\n'
-      fi
-    done
-
-    body+=$'\n'"$(echo -e "  ${C_DIM}Use [↑/↓] select, [e/Space] expand/collapse, [Enter] or [1-${#rows[@]} + Enter] apply active options, [b/q/Esc] back:${C_RESET}")"$'\n'
-    printf "%s" "$body"
-    local body_lines lines_up h_choice hi
-    body_lines="$(printf "%s" "$body" | wc -l | tr -d '[:space:]')"
-    for (( hi = 0; hi < ${#HIST_HDR_LINES[@]}; hi++ )); do
-      HIST_HDR_LINES[$hi]=$(( body_lines - HIST_HDR_LINES[$hi] + 1 ))
-    done
-    lines_up=$(( LIVE_STATS_COUNT + POST_HEADER_LINES + body_lines ))
-    read_line_with_live_stats h_choice "Select action: " "$lines_up" "${#rows[@]}"
-    case "$h_choice" in
-      __refresh__) continue ;;
-      __toggle__)
-        if [[ "${HIST_EXPANDED[$HIST_SELECTED]:-0}" == "1" ]]; then
-          HIST_EXPANDED[$HIST_SELECTED]=0
-        else
-          HIST_EXPANDED[$HIST_SELECTED]=1
-        fi
-        continue
-        ;;
-      __esc__|b|B|q|Q) return 0 ;;
-      *)
-        [[ -z "$h_choice" ]] && h_choice=$(( HIST_SELECTED + 1 ))
-        if ! [[ "$h_choice" =~ ^[0-9]+$ ]] || (( h_choice < 1 || h_choice > ${#rows[@]} )); then
-          echo -e "${C_RED}Invalid selection '${h_choice}'.${C_RESET}"; sleep 1
-          continue
-        fi
-        HIST_SELECTED=$(( h_choice - 1 ))
-        IFS='|' read -r idx ts tag model dec_s pre_s sw gw cw act_n act_csv req_s qual_s has_opts avg_dec_s avg_pre_s dur_s <<< "${rows[$HIST_SELECTED]}"
-        pwr_s="$(format_avg_power_str "$sw" "$gw" "$cw")"
-        [[ -z "$pwr_s" ]] && pwr_s="n/a"
-        echo ""
-        echo -e "${C_BOLD}Benchmark #${h_choice}: ${ts} (${tag})${C_RESET}"
-        echo "  Model:         $model"
-        echo "  Throughput:    Decode ${dec_s} tok/s | Prefill ${pre_s} tok/s"
-        echo "  Avg Power:     $pwr_s"
-        [[ -n "$req_s$qual_s" ]] && echo "  Checks:        ${req_s}${req_s:+${qual_s:+ | }}${qual_s}"
-        if [[ "$has_opts" != "1" ]]; then
-          echo -e "  Active Opts:   ${C_YELLOW}Not recorded (this benchmark was run outside the setup script).${C_RESET}"
-          echo -e "  ${C_DIM}Run future benchmarks via [s4] Run Strata Benchmark to couple active host options and power.${C_RESET}"
-          pause_prompt
-        else
-          echo -e "  Active Opts (${act_n}):"
-          if [[ -z "$act_csv" ]]; then
-            echo "    (none)"
-          else
-            local _s
-            IFS=',' read -ra _slist <<< "$act_csv"
-            for _s in "${_slist[@]}"; do
-              if declare -F "title_${_s}" >/dev/null 2>&1; then
-                echo "    * $("title_${_s}")"
-              else
-                echo "    * $_s"
-              fi
-            done
-          fi
-          local _ab_rc=0
-          apply_bench_history_config "$act_csv" || _ab_rc=$?
-          if (( _ab_rc == 2 )); then
-            sleep 1
-          else
-            pause_prompt
-          fi
-        fi
-        ;;
-    esac
-  done
-}
-
-run_strata_benchmark() {
-  LAST_BENCH_COMPLETED=false
-  refresh_strata_bin
-  refresh_strata_running
-  if [[ -z "$STRATA_BIN" || -z "$STRATA_RUNNING_URL" ]]; then
-    echo -e "${C_YELLOW}Strata must be installed and running to run a benchmark.${C_RESET}"
-    return 1
-  fi
-
-  echo -e "${C_BOLD}Strata Benchmark${C_RESET}"
-  echo -e "${C_DIM}Target: ${STRATA_RUNNING_PRESET:-active} (${STRATA_RUNNING_URL})${C_RESET}"
-  echo "  1) Quick local benchmark (strata bench run --url ${STRATA_RUNNING_URL} --skip-model-hash)"
-  echo "  2) Standard protocol benchmark (strata bench run --url ${STRATA_RUNNING_URL})"
-  echo "  3) Cancel"
-  local b_choice mode="" bench_args=()
-  read -r -p "Choose [1-3]: " b_choice
-  case "$b_choice" in
-    1)
-      mode="quick"
-      bench_args=(bench run --url "$STRATA_RUNNING_URL" --skip-model-hash)
-      ;;
-    2)
-      mode="standard"
-      bench_args=(bench run --url "$STRATA_RUNNING_URL")
-      ;;
-    3|"")
-      echo -e "${C_DIM}Benchmark cancelled.${C_RESET}"
-      return 0
-      ;;
-    *)
-      echo -e "${C_RED}Invalid selection '${b_choice}'. Cancelled.${C_RESET}"
-      return 1
-      ;;
-  esac
-  if [[ -n "${STRATA_API_KEY:-}" ]]; then
-    bench_args+=(--credential-env STRATA_API_KEY --telemetry-credential-env STRATA_API_KEY)
-  fi
-
-  build_active_steps
-  local active_csv="" applicable_csv="" st
-  for st in "${ACTIVE_STEPS[@]}"; do
-    [[ "$st" == "strata_manager" ]] && continue
-    applicable_csv+="${applicable_csv:+,}${st}"
-    if "status_${st}"; then
-      active_csv+="${active_csv:+,}${st}"
-    fi
-  done
-
-  local pwr_file start_epoch rc=0
-  pwr_file="$(mktemp /tmp/strata-bench-pwr.XXXXXX 2>/dev/null || echo "")"
-  BENCH_POWER_TMP_FILE="$pwr_file"
-  start_epoch="$(date +%s)"
-  [[ -n "$pwr_file" ]] && start_bench_power_sampler "$pwr_file"
-
-  echo -e "\n${C_CYAN}Running: ${STRATA_BIN} ${bench_args[*]}${C_RESET}\n"
-  run_as_user_exec "$STRATA_BIN" "${bench_args[@]}" || rc=$?
-
-  stop_bench_power_sampler
-  local avg_sys="" avg_gpu="" avg_cpu="" samples="0"
-  if [[ -n "$pwr_file" && -r "$pwr_file" ]]; then
-    IFS='|' read -r avg_sys avg_gpu avg_cpu samples < "$pwr_file" || true
-    rm -f "$pwr_file" 2>/dev/null || true
-  fi
-  BENCH_POWER_TMP_FILE=""
-
-  local res_file=""
-  res_file="$(find_latest_results_json "$((start_epoch - 2))")"
-  if (( rc != 0 )) && [[ -z "$res_file" ]]; then
-    echo -e "\n${C_RED}Benchmark exited with code ${rc} and produced no results file.${C_RESET}"
-    return "$rc"
-  fi
-
-  save_bench_history_entry "$res_file" "$mode" "$avg_sys" "$avg_gpu" "$avg_cpu" "$samples" "$active_csv" "$applicable_csv"
-  LAST_BENCH_COMPLETED=true
-  STRATA_BENCH_CACHE_KEY=""
-  BENCH_HISTORY_COUNT_KEY=""
-  local pwr_disp
-  pwr_disp="$(format_avg_power_str "$avg_sys" "$avg_gpu" "$avg_cpu")"
-  echo -e "\n${C_GREEN}Benchmark saved to coupled host history.${C_RESET}"
-  [[ -n "$pwr_disp" ]] && echo -e "  Average Power: ${C_YELLOW}${pwr_disp}${C_RESET} (${samples} samples)"
-  return "$rc"
-}
-
-ACTIVE_STRATA_OPTIONS=()
-
-strata_show_build_hip() {
-  [[ "$IS_MACOS" == true ]] && return 1
-  (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )) && return 0
-  _refresh_local_hip_engine_cache
-  [[ -n "$LOCAL_HIP_INFO_CACHE_ANY" ]]
-}
-
-build_strata_options() {
-  if [[ -z "$STRATA_BIN" ]]; then
-    ACTIVE_STRATA_OPTIONS=(install)
-  else
-    ACTIVE_STRATA_OPTIONS=(update remove service benchmark history)
-  fi
-  if strata_show_build_hip; then
-    ACTIVE_STRATA_OPTIONS+=(build_hip)
-  fi
-}
-
-title_strata_install()   { echo "Install Strata (Niko1221/Strata)"; }
-title_strata_update()    { echo "Update Strata (strata update)"; }
-title_strata_remove()    { echo "Remove Strata & Uninstall Service"; }
-title_strata_service()   {
-  if [[ "$HAS_LAUNCHD" == true ]]; then
-    echo "Manage Strata launchd Service (com.strata.server)"
-  else
-    echo "Manage Strata Systemd Service (strata.service)"
-  fi
-}
-title_strata_benchmark() { echo "Run Strata Benchmark (strata bench run)"; }
-title_strata_history()   { echo "View All Benchmark Results & Coupled Options"; }
-title_strata_build_hip() {
-  if (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )); then
-    echo "Build Local Strata HIP Engine (${AMD_MISSING_GFX_SUMMARY})"
-  else
-    echo "Manage Local Strata HIP Engine"
-  fi
-}
-
-badge_strata_install() {
-  [[ -n "$STRATA_BIN" ]] && echo "${C_GREEN}[INSTALLED]    ${C_RESET}" || echo "${C_YELLOW}[NOT INSTALLED]${C_RESET}"
-}
-badge_strata_update() {
-  if [[ -z "$STRATA_BIN" ]]; then
-    echo "${C_DIM}[NOT INSTALLED]${C_RESET}"
-  elif [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
-    echo "${C_UPDATE_BANNER}[UPDATE READY]${C_RESET} "
-  else
-    echo "${C_GREEN}[UP TO DATE]   ${C_RESET}"
-  fi
-}
-badge_strata_remove() {
-  [[ -n "$STRATA_BIN" ]] && echo "${C_GREEN}[INSTALLED]    ${C_RESET}" || echo "${C_DIM}[NOT INSTALLED]${C_RESET}"
-}
-badge_strata_service() {
-  if [[ -z "$STRATA_BIN" ]]; then
-    echo "${C_DIM}[NOT INSTALLED]${C_RESET}"
-  elif strata_service_installed; then
-    unit_active strata.service && echo "${C_GREEN}[ACTIVE]       ${C_RESET}" || echo "${C_YELLOW}[STOPPED]      ${C_RESET}"
-  else
-    echo "${C_YELLOW}[NOT SETUP]    ${C_RESET}"
-  fi
-}
-badge_strata_benchmark() {
-  if [[ -z "$STRATA_BIN" ]]; then
-    echo "${C_DIM}[NOT INSTALLED]${C_RESET}"
-  elif [[ -n "$STRATA_RUNNING_URL" ]]; then
-    echo "${C_GREEN}[READY]        ${C_RESET}"
-  else
-    echo "${C_YELLOW}[NOT RUNNING]  ${C_RESET}"
-  fi
-}
-badge_strata_history() {
-  local cnt
-  cnt="$(count_bench_history)"
-  if (( cnt > 0 )); then
-    printf "${C_CYAN}%-15s${C_RESET}" "[${cnt} SAVED]"
-  else
-    echo "${C_DIM}[NONE SAVED]   ${C_RESET}"
-  fi
-}
-badge_strata_build_hip() {
-  _refresh_local_hip_engine_cache
-  if (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )) && [[ -n "$LOCAL_HIP_INFO_CACHE_MATCH" && "${LOCAL_HIP_INFO_CACHE_MATCH##*|}" == "1" ]]; then
-    echo "${C_GREEN}[BUILT]        ${C_RESET}"
-  elif [[ -n "$LOCAL_HIP_INFO_CACHE_ANY" ]]; then
-    echo "${C_CYAN}[LOCAL BUILD]  ${C_RESET}"
-  else
-    echo "${C_YELLOW}[NOT BUILT]    ${C_RESET}"
-  fi
-}
-
-strata_action_install() {
-  refresh_strata_bin
-  if [[ -n "$STRATA_BIN" ]]; then
-    echo -e "${C_GREEN}Strata is already installed at: ${STRATA_BIN}${C_RESET}"
-    echo -e "${C_DIM}Use [s2] to check for updates.${C_RESET}"
-    return 0
-  fi
-  local hw_warns=""
-  hw_warns="$(format_strata_hw_warnings)"
-  if [[ -n "$hw_warns" ]]; then
-    printf "%s\n\n" "$hw_warns"
-  fi
-  if confirm_yn "Install Strata now? [Y/n]: " "Y"; then
-    command -v curl >/dev/null 2>&1 || prompt_install_deps repo curl || return 0
-    run_as_user_exec sh -c 'curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh | sh'
-    refresh_strata_bin
-    [[ -n "$STRATA_BIN" && -z "$STRATA_POLLER_PID" ]] && start_strata_update_poller
-    if [[ -n "$STRATA_BIN" ]] && (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )) && ! status_strata_build_hip; then
-      echo ""
-      if confirm_yn "Detected AMD GPU (${AMD_MISSING_GFX_SUMMARY}) has no prebuilt Strata engine package. Build and register a local HIP engine from source now? [Y/n]: " "Y"; then
-        strata_action_build_hip || true
-      fi
-    fi
-  fi
-}
-
-strata_action_update() {
-  refresh_strata_bin
-  if [[ -z "$STRATA_BIN" ]]; then
-    if [[ -n "$STRATA_DOCKER_CONTAINER" ]]; then
-      echo -e "${C_YELLOW}Strata is running in Docker (${STRATA_DOCKER_CONTAINER}); manage its lifecycle via Docker/Unraid.${C_RESET}"
-    else
-      echo -e "${C_YELLOW}Strata is not installed. Run [s1] to install Strata first.${C_RESET}"
-    fi
-    return 0
-  fi
-  echo -e "${C_DIM}Checking for Strata updates...${C_RESET}"
-  if check_strata_update_sync; then
-    echo -e "${C_CYAN}An update is available for Strata (${STRATA_UPDATE_SUMMARY})!${C_RESET}"
-    perform_strata_update
-  else
-    echo -e "${C_GREEN}Strata is up to date (${STRATA_VERSION:-installed}).${C_RESET}"
-  fi
-}
-
-strata_action_remove() {
-  refresh_strata_bin
-  if [[ -z "$STRATA_BIN" ]] && ! strata_service_installed; then
-    echo -e "${C_YELLOW}Strata is not installed.${C_RESET}"
-    return 0
-  fi
-  local svc_lbl
-  svc_lbl="$(strata_service_label)"
-  echo -e "${C_YELLOW}This will stop any running Strata instance, uninstall ${svc_lbl} (if installed), and remove ${STRATA_BIN:-the Strata binary}.${C_RESET}"
-  confirm_yn "Remove Strata now? [y/N]: " "N" || return 0
-  stop_strata_update_poller
-  if strata_service_installed; then
-    remove_service strata.service && echo -e "${C_GREEN}${svc_lbl} uninstalled.${C_RESET}"
-  fi
-  if [[ -n "$STRATA_BIN" ]]; then
-    run_as_user_exec "$STRATA_BIN" launch --stop 2>/dev/null || true
-    if [[ -w "$(dirname "$STRATA_BIN")" ]]; then
-      rm -f "$STRATA_BIN"
-    else
-      run_root rm -f "$STRATA_BIN"
-    fi
-    echo -e "${C_GREEN}Removed ${STRATA_BIN}.${C_RESET}"
-  fi
-  STRATA_BIN="" STRATA_VERSION="" STRATA_RUNNING_PRESET="" STRATA_RUNNING_URL=""
-  STRATA_UPDATE_AVAILABLE=false STRATA_UPDATE_SUMMARY=""
-}
-
-strata_action_service() {
-  refresh_strata_bin
-  if [[ -z "$STRATA_BIN" ]]; then
-    if [[ -n "$STRATA_DOCKER_CONTAINER" ]]; then
-      echo -e "${C_YELLOW}Strata is running in Docker (${STRATA_DOCKER_CONTAINER}); manage its lifecycle via Docker/Unraid.${C_RESET}"
-    else
-      echo -e "${C_YELLOW}Strata is not installed. Run [s1] to install Strata first.${C_RESET}"
-    fi
-    return 0
-  fi
-  local svc_lbl log_hint=""
-  svc_lbl="$(strata_service_label)"
-  [[ "$HAS_SYSTEMD" == true ]] && log_hint=" (check 'journalctl -u strata -n 50')"
-  [[ "$HAS_LAUNCHD" == true ]] && log_hint=" (check '${TARGET_HOME}/Library/Logs/strata.err.log')"
-  if strata_service_installed; then
-    echo -e "${C_GREEN}${svc_lbl} is installed ($(unit_active strata.service && echo "active" || echo "inactive")).${C_RESET}"
-    echo "  1) Start / Restart ${svc_lbl}"
-    echo "  2) Stop ${svc_lbl}"
-    echo "  3) Change preset / reinstall ${svc_lbl}"
-    echo "  4) Uninstall ${svc_lbl}"
-    echo "  5) Cancel"
-    local svc_choice
-    read -r -p "Choose [1-5]: " svc_choice
-    case "$svc_choice" in
-      1)
-        if service_ctl restart strata.service; then
-          wait_for_strata_model_live 120
-        else
-          echo -e "${C_RED}Failed to start ${svc_lbl}${log_hint}.${C_RESET}"
-        fi
-        ;;
-      2)
-        service_ctl stop strata.service && echo -e "${C_GREEN}${svc_lbl} stopped.${C_RESET}"
-        ;;
-      3) install_strata_service_fn ;;
-      4) remove_service strata.service && echo -e "${C_GREEN}${svc_lbl} uninstalled.${C_RESET}" ;;
-      5|"") ;;
-      *) echo -e "${C_RED}Invalid selection '${svc_choice}'. Cancelled.${C_RESET}" ;;
-    esac
-  else
-    local preset_count
-    preset_count="$(list_strata_presets | wc -l | tr -d '[:space:]')"
-    if (( preset_count == 0 )); then
-      echo -e "${C_YELLOW}No saved Strata presets found yet.${C_RESET}"
-      if confirm_yn "Launch Strata interactively now ('strata launch') to create a preset? [y/N]: " "N"; then
-        run_as_user_exec "$STRATA_BIN" launch
-        preset_count="$(list_strata_presets | wc -l | tr -d '[:space:]')"
-      fi
-    fi
-    if (( preset_count > 0 )); then
-      confirm_yn "Saved presets detected ($preset_count). Install ${svc_lbl}? [Y/n]: " "Y" && install_strata_service_fn
-    fi
-  fi
-}
-
-strata_action_benchmark() {
-  run_strata_benchmark
-}
-
-explain_strata_install() {
-  cat <<'EOF'
-Impact:
-  Downloads and installs Strata (Niko1221/Strata) using the official installer
-  for the current user, and starts background update checking.
-EOF
-  local hw_warns=""
-  hw_warns="$(format_strata_hw_warnings)"
-  if [[ -n "$hw_warns" ]]; then
-    echo ""
-    printf "%s\n" "$hw_warns"
-  fi
-}
-
-explain_strata_update() {
-  local svc_lbl
-  svc_lbl="$(strata_service_label)"
-  cat <<EOF
-Impact:
-  Checks whether a newer Strata engine/control release is available and runs
-  'strata update --yes'. Stops ${svc_lbl} (if active) or any running
-  'strata launch' instance and waits until Strata is fully stopped before
-  updating, then restarts ${svc_lbl} if it was active.
-EOF
-  if [[ -n "$STRATA_BIN" ]]; then
-    echo -e "\nInstalled: ${STRATA_VERSION:-$STRATA_BIN}"
-    [[ "$STRATA_UPDATE_AVAILABLE" == true ]] && echo -e "${C_BGREEN}Update available: ${STRATA_UPDATE_SUMMARY}${C_RESET}"
-  fi
-}
-
-explain_strata_remove() {
-  local svc_lbl
-  svc_lbl="$(strata_service_label)"
-  cat <<EOF
-Impact:
-  Stops any running Strata instance, uninstalls ${svc_lbl} (if present),
-  and removes the Strata binary from the host. Saved launch presets and
-  coupled benchmark history are preserved.
-EOF
-  [[ -n "$STRATA_BIN" ]] && echo -e "\nBinary: ${STRATA_BIN}"
-}
-
-explain_strata_service() {
-  local svc_lbl
-  svc_lbl="$(strata_service_label)"
-  if [[ "$HAS_LAUNCHD" == true ]]; then
-    cat <<EOF
-Impact:
-  Configures ${svc_lbl} (launchd LaunchAgent) using a saved 'strata launch'
-  preset with AbandonProcessGroup=true and any configured Metal switches.
-  Lets you start, stop, restart, change preset, or uninstall the service.
-EOF
-  else
-    cat <<EOF
-Impact:
-  Configures ${svc_lbl} (systemd) using a saved 'strata launch' preset
-  with LimitMEMLOCK=infinity (and numactl --interleave=all when enabled).
-  Lets you start, stop, restart, change preset, or uninstall the service.
-EOF
-  fi
-  local preset_count
-  preset_count="$(list_strata_presets | wc -l | tr -d '[:space:]')"
-  echo -e "\nSaved presets: ${preset_count}"
-}
-
-explain_strata_benchmark() {
-  local svc_lbl
-  svc_lbl="$(strata_service_label)"
-  cat <<'EOF'
-Impact:
-  Runs Strata's built-in benchmark ('strata bench run') against the currently
-  running Strata instance, measures average GPU/CPU/system power consumption,
-  and stores results + active host optimizations in persistent host history.
-  Tip: After a cold model load, run a warmup pass before A/B comparing host
-  settings—decode throughput can ramp over the first several requests as the
-  engine warms up.
-EOF
-  if [[ -n "$STRATA_RUNNING_URL" ]]; then
-    echo -e "\nActive target: ${STRATA_RUNNING_PRESET:-active} (${STRATA_RUNNING_URL})"
-  else
-    echo -e "\n${C_YELLOW}Strata is not currently serving. Start ${svc_lbl} or 'strata launch' first.${C_RESET}"
-  fi
-}
-
-strata_action_history() {
-  show_benchmark_history
-}
-
-explain_strata_history() {
-  local cnt
-  cnt="$(count_bench_history)"
-  cat <<'EOF'
-Impact:
-  Lists all recorded benchmark runs with decode/prefill throughput and average
-  GPU/CPU/system power consumption. Selecting any result lets you revert/apply
-  the host optimizations to match what was active during that benchmark run.
-EOF
-  echo -e "\nRecorded benchmark results: ${cnt}"
-}
-
-_user_cache_dir() {
-  if [[ -n "${XDG_CACHE_HOME:-}" && ( $EUID -ne 0 || "$TARGET_USER" == "root" ) ]]; then
-    echo "${XDG_CACHE_HOME%/}"
-  else
-    echo "${TARGET_HOME}/.cache"
-  fi
-}
-
-_is_usable_rocm_root() {
-  local r="${1:-}"
-  [[ -n "$r" && -d "$r" ]] || return 1
-  [[ -x "$r/lib/llvm/bin/clang++" || -x "$r/llvm/bin/clang++" ]] || return 1
-  [[ -d "$r/lib/cmake/hipblas" || -d "$r/lib64/cmake/hipblas" ]]
-}
-
-_resolve_rocm_root_in_dir() {
-  local d="$1" sub=""
-  if _is_usable_rocm_root "$d"; then
-    printf '%s\n' "$d"
-    return 0
-  fi
-  for sub in "$d"/*; do
-    if [[ -d "$sub" ]] && _is_usable_rocm_root "$sub"; then
-      printf '%s\n' "$sub"
-      return 0
-    fi
-  done
-  return 1
-}
-
-_detect_rocm_paths() {
-  local sdk="$1" hip_clang="" hip_cc="" bitcode="" sysdeps_lib="" prefix="" ld_path="" d
-  if [[ -x "$sdk/lib/llvm/bin/clang++" ]]; then
-    hip_clang="$sdk/lib/llvm/bin/clang++"
-    hip_cc="$sdk/lib/llvm/bin/clang"
-  elif [[ -x "$sdk/llvm/bin/clang++" ]]; then
-    hip_clang="$sdk/llvm/bin/clang++"
-    hip_cc="$sdk/llvm/bin/clang"
-  fi
-  for d in "$sdk/lib/llvm/amdgcn/bitcode" "$sdk/amdgcn/bitcode" "$sdk/llvm/amdgcn/bitcode"; do
-    if [[ -d "$d" ]]; then
-      bitcode="$d"
-      break
-    fi
-  done
-  [[ -d "$sdk/lib/rocm_sysdeps/lib" ]] && sysdeps_lib="$sdk/lib/rocm_sysdeps/lib"
-  prefix="$sdk"
-  [[ -d "$sdk/lib/rocm_sysdeps" ]] && prefix+=";${sdk}/lib/rocm_sysdeps"
-  [[ -d "$sdk/lib/llvm" ]] && prefix+=";${sdk}/lib/llvm"
-  [[ -d "$sdk/llvm" ]] && prefix+=";${sdk}/llvm"
-  for d in "$sdk/lib" "$sdk/lib64" "$sysdeps_lib" "$sdk/lib/llvm/lib" "$sdk/llvm/lib"; do
-    [[ -n "$d" && -d "$d" ]] && ld_path="${ld_path:+${ld_path}:}${d}"
-  done
-  printf '%s|%s|%s|%s|%s|%s\n' "$hip_clang" "$hip_cc" "$bitcode" "$sysdeps_lib" "$prefix" "$ld_path"
-}
-
-_ensure_hip_build_deps() {
-  local missing_cmds=() pkgs=() cmd pkg
-  for cmd in git cmake ninja patchelf python3 curl tar; do
-    command -v "$cmd" >/dev/null 2>&1 || missing_cmds+=("$cmd")
-  done
-  if ! command -v g++ >/dev/null 2>&1 && ! command -v c++ >/dev/null 2>&1; then
-    missing_cmds+=("g++")
-  fi
-
-  if (( ${#missing_cmds[@]} > 0 )); then
-    case "$DISTRO_FAMILY" in
-      arch|fedora|debian|suse)
-        for cmd in "${missing_cmds[@]}"; do
-          case "${DISTRO_FAMILY}:${cmd}" in
-            arch:python3)   pkg="python" ;;
-            arch:g++)       pkg="gcc" ;;
-            fedora:ninja)   pkg="ninja-build" ;;
-            fedora:g++)     pkg="gcc-c++" ;;
-            debian:ninja)   pkg="ninja-build" ;;
-            suse:g++)       pkg="gcc-c++" ;;
-            *)              pkg="$cmd" ;;
-          esac
-          if (( ${#pkgs[@]} == 0 )) || ! _array_contains_val "$pkg" "${pkgs[@]}"; then
-            pkgs+=("$pkg")
-          fi
-        done
-        prompt_install_deps repo "${pkgs[@]}" || true
-        ;;
-      *)
-        echo -e "${C_YELLOW}Missing build tools (automatic install unavailable on ${DISTRO_FAMILY}): ${missing_cmds[*]}${C_RESET}"
-        ;;
-    esac
-  fi
-
-  local still_missing=()
-  for cmd in git cmake ninja patchelf python3 curl tar; do
-    command -v "$cmd" >/dev/null 2>&1 || still_missing+=("$cmd")
-  done
-  if ! command -v g++ >/dev/null 2>&1 && ! command -v c++ >/dev/null 2>&1; then
-    still_missing+=("g++")
-  fi
-  if (( ${#still_missing[@]} > 0 )); then
-    echo -e "${C_RED}Missing required build tools: ${still_missing[*]}${C_RESET}"
-    return 1
-  fi
-
-  local cm_ver="" cm_maj=0 cm_min=0
-  cm_ver="$(cmake --version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+' | head -n1 || true)"
-  if [[ "$cm_ver" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
-    cm_maj="${BASH_REMATCH[1]}"
-    cm_min="${BASH_REMATCH[2]}"
-    if (( cm_maj < 3 || (cm_maj == 3 && cm_min < 24) )); then
-      echo -e "${C_YELLOW}[WARNING] CMake ${cm_ver} detected (< 3.24); Strata requires CMake >= 3.24 and configuration may fail.${C_RESET}"
-    fi
-  fi
-  return 0
-}
-
-_ACQUIRED_ROCM_SDK=""
-_acquire_therock_sdk() {
-  local family="$1" cache_base="$2"
-  _ACQUIRED_ROCM_SDK=""
-  local sdk_cache="${cache_base}/rocm-therock-${family}"
-  local sdk="${sdk_cache}/sdk"
-  local resolved=""
-
-  resolved="$(_resolve_rocm_root_in_dir "$sdk" || true)"
-  if [[ -n "$resolved" && -f "${resolved}/.strata_extracted" ]]; then
-    echo -e "${C_GREEN}Reusing cached AMD TheRock ROCm SDK (${family}) at ${resolved}.${C_RESET}"
-    _ACQUIRED_ROCM_SDK="$resolved"
-    return 0
-  fi
-
-  run_as_user_exec mkdir -p "$sdk_cache" || return 1
-  local url="https://repo.amd.com/rocm/tarball-multi-arch/therock-dist-linux-${family}-7.14.1.tar.gz"
-  if ! curl -fsIL --connect-timeout 15 "$url" >/dev/null 2>&1; then
-    echo -e "${C_DIM}TheRock 7.14.1 tarball not directly at default URL; checking AMD multi-arch index for ${family}...${C_RESET}"
-    local index_html="" fname=""
-    index_html="$(curl -fsSL --connect-timeout 15 "https://repo.amd.com/rocm/tarball-multi-arch/" 2>/dev/null || true)"
-    if [[ -n "$index_html" ]]; then
-      fname="$(python3 - "$family" <<<"$index_html" <<'PY' 2>/dev/null || true
-import re, sys
-fam = re.escape(sys.argv[1])
-html = sys.stdin.read()
-hits = re.findall(rf'(therock-dist-linux-{fam}-([0-9]+(?:\.[0-9]+)*)\.tar\.gz)', html)
-best = None
-for fname, ver in hits:
-    if "-tests-" in fname:
-        continue
-    key = tuple(int(x) for x in ver.split("."))
-    if best is None or key > best[0]:
-        best = (key, fname)
-if best:
-    print(best[1])
-PY
-)"
-    fi
-    if [[ -z "$fname" ]]; then
-      echo -e "${C_RED}Could not locate an AMD TheRock Linux tarball for family '${family}'.${C_RESET}"
-      return 1
-    fi
-    url="https://repo.amd.com/rocm/tarball-multi-arch/${fname}"
-  fi
-
-  local tarball="${sdk_cache}/$(basename "$url")"
-  echo -e "${C_CYAN}Downloading AMD TheRock ROCm SDK (${family}): ${url}${C_RESET}"
-  echo -e "${C_DIM}This archive is ~1.7 GB and extracts to ~8 GB; downloads resume automatically if interrupted.${C_RESET}"
-  if ! run_as_user_exec curl -fL --connect-timeout 15 --retry 3 -C - -o "$tarball" "$url"; then
-    run_as_user_exec rm -f "$tarball"
-    run_as_user_exec curl -fL --connect-timeout 15 --retry 3 -o "$tarball" "$url" || {
-      echo -e "${C_RED}Failed to download ${url}.${C_RESET}"
-      return 1
-    }
-  fi
-
-  echo -e "${C_CYAN}Extracting TheRock ROCm SDK into ${sdk}...${C_RESET}"
-  run_as_user_exec rm -rf "$sdk"
-  run_as_user_exec mkdir -p "$sdk"
-  if ! run_as_user_exec tar -xzf "$tarball" -C "$sdk"; then
-    echo -e "${C_RED}Failed to extract ${tarball} (corrupt or incomplete archive); cleaning up cached files.${C_RESET}"
-    run_as_user_exec rm -rf "$tarball" "$sdk"
-    return 1
-  fi
-
-  resolved="$(_resolve_rocm_root_in_dir "$sdk" || true)"
-  if [[ -n "$resolved" ]]; then
-    sdk="$resolved"
-  else
-    echo -e "${C_RED}Extracted ROCm directory at ${sdk} does not appear to contain clang++ and hipblas.${C_RESET}"
-    run_as_user_exec rm -rf "$sdk"
-    return 1
-  fi
-
-  run_as_user_exec touch "${sdk}/.strata_extracted"
-  _ACQUIRED_ROCM_SDK="$sdk"
-  return 0
-}
-
-_PREPARED_STRATA_COMMIT=""
-_prepare_strata_source() {
-  local src_dir="$1" is_wave32="$2"; shift 2
-  local targets=("$@")
-  _PREPARED_STRATA_COMMIT="unknown"
-
-  if [[ -d "${src_dir}/.git" ]]; then
-    echo -e "${C_CYAN}Updating Strata source checkout at ${src_dir}...${C_RESET}"
-    if ! ( run_as_user_exec git -C "$src_dir" fetch --depth 1 origin main && run_as_user_exec git -C "$src_dir" reset --hard origin/main ); then
-      echo -e "${C_YELLOW}Existing checkout update failed; re-cloning cleanly...${C_RESET}"
-      run_as_user_exec rm -rf "$src_dir"
-    fi
-  fi
-
-  if [[ ! -d "${src_dir}/.git" ]]; then
-    echo -e "${C_CYAN}Cloning https://github.com/Niko1221/Strata.git (shallow) into ${src_dir}...${C_RESET}"
-    run_as_user_exec mkdir -p "$(dirname "$src_dir")"
-    run_as_user_exec git clone --depth 1 https://github.com/Niko1221/Strata.git "$src_dir" || return 1
-  fi
-
-  _PREPARED_STRATA_COMMIT="$(run_as_user_exec git -C "$src_dir" rev-parse --short=9 HEAD 2>/dev/null || echo "unknown")"
-
-  if [[ "$is_wave32" == true ]]; then
-    local hip_cmake=""
-    if [[ -f "${src_dir}/engine/cmake/hip_backend.cmake" ]]; then
-      hip_cmake="${src_dir}/engine/cmake/hip_backend.cmake"
-    elif [[ -f "${src_dir}/cmake/hip_backend.cmake" ]]; then
-      hip_cmake="${src_dir}/cmake/hip_backend.cmake"
-    fi
-    if [[ -n "$hip_cmake" ]]; then
-      local patch_msg=""
-      patch_msg="$(run_as_user_exec python3 - "$hip_cmake" "${targets[@]}" <<'PY'
-import re, sys
-
-path = sys.argv[1]
-targets = sys.argv[2:]
-with open(path, encoding="utf-8") as f:
-    text = f.read()
-
-present = set()
-for var in ("_strata_hip_validated", "_strata_hip_community", "_strata_hip_unvalidated"):
-    m = re.search(rf'set\({var}\s+([^\)]+)\)', text, re.DOTALL)
-    if m:
-        present.update(re.findall(r'\bgfx[0-9a-f]+\b', m.group(1).lower()))
-
-missing = [t for t in targets if t not in present]
-if not missing:
-    sys.exit(0)
-
-m = re.search(r'(set\(_strata_hip_unvalidated\s+)([^\)]+)(\))', text, re.DOTALL)
-if not m:
-    print("WARN: could not locate _strata_hip_unvalidated in " + path)
-    sys.exit(0)
-
-suffix = "\n" if "\n" in m.group(2) else ""
-updated = text[:m.start(2)] + m.group(2).rstrip() + " " + " ".join(missing) + suffix + text[m.end(2):]
-with open(path, "w", encoding="utf-8") as f:
-    f.write(updated)
-print("PATCHED:" + ",".join(missing))
-PY
-)"
-      if [[ "$patch_msg" == PATCHED:* ]]; then
-        echo -e "${C_CYAN}Applied Issue #1217-style CMake patch in ${hip_cmake}: added ${patch_msg#PATCHED:} to _strata_hip_unvalidated.${C_RESET}"
-      elif [[ -n "$patch_msg" ]]; then
-        echo -e "${C_YELLOW}${patch_msg}${C_RESET}"
-      fi
-    fi
-  fi
-  return 0
-}
-
-_STRATA_WAS_ACTIVE=false
-_STRATA_WAS_LAUNCH=false
-_stop_strata_if_running() {
-  _STRATA_WAS_ACTIVE=false
-  _STRATA_WAS_LAUNCH=false
-  unit_active strata.service && _STRATA_WAS_ACTIVE=true
-  if [[ "$_STRATA_WAS_ACTIVE" == true ]]; then
-    echo -e "${C_CYAN}Stopping strata.service before updating component files...${C_RESET}"
-    service_ctl stop strata.service || true
-    wait_for_strata_stopped 60 || return 1
-  else
-    refresh_strata_running
-    if [[ -n "$STRATA_RUNNING_PRESET" && -n "$STRATA_BIN" ]]; then
-      _STRATA_WAS_LAUNCH=true
-      echo -e "${C_CYAN}Stopping Strata ('strata launch --stop') before updating component files...${C_RESET}"
-      run_as_user_exec "$STRATA_BIN" launch --stop || true
-      wait_for_strata_stopped 60 || return 1
-    fi
-  fi
-  return 0
-}
-
-_print_local_hip_post_install_notes() {
-  local comma_archs="$1" installed_path="$2" has_tuning="$3" noted=false
-  echo -e "\n${C_BOLD}Next Steps & Hardware Notes:${C_RESET}"
-  echo -e "  Installed component: ${C_CYAN}${installed_path}${C_RESET}"
-  if [[ ",${comma_archs}," == *",gfx1150,"* ]]; then
-    noted=true
-    echo -e "  - Launch Strata with: ${C_BOLD}STRATA_EXPERIMENTAL_GFX1150=1 strata launch${C_RESET}"
-    echo -e "    (Note: strata.service & wizard CLI calls automatically export STRATA_EXPERIMENTAL_GFX1150=1.)"
-    echo -e "  - Apply ${C_BOLD}amd_apu_memory${C_RESET} (ttm.pages_limit) & ${C_BOLD}gpu_groups${C_RESET} (render/video) from the main index."
-    if [[ "$has_tuning" == true ]]; then
-      echo -e "  - Optional prompt speedup: set ${C_BOLD}STRATA_HIPBLASLT_TABLE=on${C_RESET} (matching gfx1150 table was staged)."
-    fi
-  fi
-  if [[ ",${comma_archs}," == *",gfx1103,"* ]]; then
-    noted=true
-    echo -e "  - Launch Strata with: ${C_BOLD}STRATA_EXPERIMENTAL_GFX1103=1 strata launch${C_RESET}"
-    echo -e "    (Note: strata.service & wizard CLI calls automatically export STRATA_EXPERIMENTAL_GFX1103=1.)"
-    echo -e "  - Apply ${C_BOLD}amd_apu_memory${C_RESET}, ${C_BOLD}amd_cwsr_disable${C_RESET} (amdgpu.cwsr_enable=0, stops MES GPU resets), and ${C_BOLD}gpu_groups${C_RESET}."
-    if [[ "$has_tuning" == true ]]; then
-      echo -e "  - Optional prompt speedup: set ${C_BOLD}STRATA_HIPBLASLT_TABLE=on${C_RESET} (matching gfx1103 table was staged)."
-    fi
-  fi
-  if [[ "$noted" == false ]]; then
-    echo -e "  - Verify registered engine with: ${C_BOLD}strata components engines${C_RESET}"
-    echo -e "  - Upstream setup.py does not yet list ${comma_archs} in AMD_ARCHS; you can also invoke"
-    echo -e "    ${installed_path}/strata directly or via terminal/serve/server.py (see Strata docs/AMD_HIP.md & docs/OLDER_GPUS.md)."
-  fi
-}
-
-explain_strata_build_hip() {
-  cat <<'EOF'
-Impact:
-  Builds and registers a self-contained local Strata HIP engine package for AMD
-  architectures that lack an official prebuilt Linux release (such as gfx1150
-  Strix Point / Radeon 890M, gfx1103 Radeon 780M, gfx1152 Krackan, gfx1153,
-  RDNA1 gfx1010/1011/1012, gfx1034, or wave64 Instinct MI50/MI60/MI100/MI210/
-  MI250X/MI300X/MI350X).
-
-  Workflow:
-    1. Acquires AMD's TheRock ROCm SDK (or uses a compatible system /opt/rocm)
-    2. Clones/updates Niko1221/Strata and patches cmake/hip_backend.cmake if needed
-    3. Compiles strata (and best-effort vision readers) with Ninja & clang++
-    4. Bundles ROCm runtime libraries + matching hipBLASLt tuning tables,
-       verifies package integrity, installs under Strata's components folder,
-       and activates it with 'strata components use'
-EOF
-  local info=""
-  info="$(strata_local_hip_engine_info --any-local)"
-  if [[ -n "$info" ]]; then
-    local fn ver archs
-    IFS='|' read -r fn ver archs _ <<< "$info"
-    echo -e "\nInstalled local/matching HIP engine: ${C_GREEN}${fn}${C_RESET} (v${ver}, archs: ${archs})"
-  fi
-  if amd_missing_has_gfx "gfx1150"; then
-    echo -e "Opt-in wiring: ${C_DIM}STRATA_EXPERIMENTAL_GFX1150=1 will be set automatically for wizard/service runs.${C_RESET}"
-  fi
-  if amd_missing_has_gfx "gfx1103"; then
-    echo -e "Opt-in wiring: ${C_DIM}STRATA_EXPERIMENTAL_GFX1103=1 will be set automatically for wizard/service runs.${C_RESET}"
-  fi
-}
-
-strata_action_build_hip() {
-  refresh_strata_bin
-  local arch_m=""
-  arch_m="$(uname -m 2>/dev/null || echo unknown)"
-  if [[ "$arch_m" != "x86_64" && "$arch_m" != "amd64" ]]; then
-    echo -e "${C_RED}Local AMD HIP builds require Linux x86_64 (detected: ${arch_m}).${C_RESET}"
-    return 1
-  fi
-
-  local existing=""
-  existing="$(strata_local_hip_engine_info --any-local)"
-  if [[ -n "$existing" ]]; then
-    local ex_folder ex_ver ex_archs ex_cov
-    IFS='|' read -r ex_folder ex_ver ex_archs ex_cov <<< "$existing"
-    echo -e "${C_GREEN}Found local/matching HIP engine package: ${C_BOLD}${ex_folder}${C_RESET} (v${ex_ver}, archs: ${ex_archs})"
-    echo "  1) Rebuild / update local HIP engine from latest Niko1221/Strata source"
-    echo "  2) Activate / pin this local HIP engine (strata components use)"
-    echo "  3) Remove this local HIP engine package"
-    echo "  4) Cancel"
-    local mchoice=""
-    read -r -p "Choose [1-4]: " mchoice
-    case "$mchoice" in
-      1) ;;
-      2)
-        if [[ -z "$STRATA_BIN" ]]; then
-          echo -e "${C_YELLOW}Strata CLI is not installed yet; install Strata first via [s1].${C_RESET}"
-          return 1
-        fi
-        run_as_user_exec "$STRATA_BIN" components use "$ex_folder" && echo -e "${C_GREEN}Activated ${ex_folder}.${C_RESET}"
-        return $?
-        ;;
-      3)
-        confirm_yn "Remove local HIP engine package '${ex_folder}'? [y/N]: " "N" || return 0
-        stop_strata_update_poller
-        _stop_strata_if_running || { start_strata_update_poller; return 1; }
-        if [[ -n "$STRATA_BIN" ]]; then
-          run_as_user_exec "$STRATA_BIN" components use newest >/dev/null 2>&1 || true
-          run_as_user_exec "$STRATA_BIN" components remove "$ex_folder" >/dev/null 2>&1 || true
-        fi
-        local target_rm=""
-        if [[ -n "$ex_folder" && "$ex_folder" != */* && "$ex_folder" != "." && "$ex_folder" != ".." ]]; then
-          target_rm="$(strata_components_engine_dir)/${ex_folder}"
-          if [[ -d "$target_rm" ]]; then
-            run_as_user_exec rm -rf "$target_rm" 2>/dev/null || run_root rm -rf "$target_rm"
-          fi
-        fi
-        invalidate_local_hip_engine_cache
-        echo -e "${C_GREEN}Removed ${ex_folder}.${C_RESET}"
-        start_strata_update_poller
-        return 0
-        ;;
-      4|"") return 0 ;;
-      *) echo -e "${C_RED}Invalid selection '${mchoice}'. Cancelled.${C_RESET}"; return 1 ;;
-    esac
-  fi
-
-  local -a targets=("${AMD_MISSING_GFX_ARCHS[@]+"${AMD_MISSING_GFX_ARCHS[@]}"}")
-  if (( ${#targets[@]} == 0 )); then
-    local raw_arch="" tok=""
-    read -r -p "Enter target AMD gfx architecture(s) (e.g. gfx1150 or gfx1150;gfx1103): " raw_arch
-    for tok in ${raw_arch//[;,]/ }; do
-      tok="${tok,,}"
-      if [[ "$tok" =~ ^gfx[0-9a-f]+$ ]]; then
-        if (( ${#targets[@]} == 0 )) || ! _array_contains_val "$tok" "${targets[@]}"; then
-          targets+=("$tok")
-        fi
-      elif [[ -n "$tok" ]]; then
-        echo -e "${C_RED}Invalid gfx target '${tok}'.${C_RESET}"
-        return 1
-      fi
-    done
-    (( ${#targets[@]} > 0 )) || { echo -e "${C_YELLOW}No target architecture specified. Cancelled.${C_RESET}"; return 0; }
-  fi
-
-  local -a wave64_tgts=() wave32_tgts=()
-  local _wt=""
-  for _wt in "${targets[@]}"; do
-    if amd_gfx_is_wave64 "$_wt"; then
-      wave64_tgts+=("$_wt")
-    else
-      wave32_tgts+=("$_wt")
-    fi
-  done
-  if (( ${#wave64_tgts[@]} > 0 && ${#wave32_tgts[@]} > 0 )); then
-    echo -e "${C_YELLOW}Wave64 targets (${wave64_tgts[*]}) cannot be combined with wave32 targets (${wave32_tgts[*]}) in one Strata binary.${C_RESET}"
-    echo "  1) Build for wave32 targets only (${wave32_tgts[*]})"
-    echo "  2) Build for wave64 targets only (${wave64_tgts[*]})"
-    local wchoice=""
-    read -r -p "Choose [1-2]: " wchoice
-    case "$wchoice" in
-      1) targets=("${wave32_tgts[@]}") ;;
-      2) targets=("${wave64_tgts[@]}") ;;
-      *) echo -e "${C_YELLOW}Cancelled.${C_RESET}"; return 0 ;;
-    esac
-  fi
-  if _array_contains_val "gfx906" "${targets[@]}" && (( ${#targets[@]} > 1 )); then
-    echo -e "${C_YELLOW}gfx906 uses dedicated -DSTRATA_HIP_GFX906=ON flags and cannot combine with other wave64 targets.${C_RESET}"
-    local -a non906=()
-    for _wt in "${targets[@]}"; do [[ "$_wt" != "gfx906" ]] && non906+=("$_wt"); done
-    echo "  1) Build for gfx906 only"
-    echo "  2) Build for ${non906[*]} only"
-    local g9choice=""
-    read -r -p "Choose [1-2]: " g9choice
-    case "$g9choice" in
-      1) targets=("gfx906") ;;
-      2) targets=("${non906[@]}") ;;
-      *) echo -e "${C_YELLOW}Cancelled.${C_RESET}"; return 0 ;;
-    esac
-  fi
-
-  local is_gfx906=false is_wave32=true
-  [[ "${targets[0]}" == "gfx906" ]] && is_gfx906=true
-  amd_gfx_is_wave64 "${targets[0]}" && is_wave32=false
-
-  if [[ -z "$existing" ]]; then
-    local tgt_desc="" t=""
-    for t in "${targets[@]}"; do
-      tgt_desc="${tgt_desc:+${tgt_desc}, }${t} ($(amd_gfx_label "$t"))"
-    done
-    echo -e "${C_BOLD}Local Strata HIP Engine Build Summary:${C_RESET}"
-    echo -e "  Target(s):       ${C_CYAN}${tgt_desc}${C_RESET}"
-    echo -e "  Disk space:      ${C_DIM}~10-15 GB temporary build/ROCm cache; ~150-400 MB installed package${C_RESET}"
-    confirm_yn "Proceed with building local Strata HIP engine for ${targets[*]}? [Y/n]: " "Y" || return 0
-  fi
-
-  if [[ -z "$STRATA_BIN" ]]; then
-    echo -e "${C_YELLOW}Strata CLI is not installed yet.${C_RESET}"
-    if confirm_yn "Install Strata Terminal first before building the local HIP engine? [Y/n]: " "Y"; then
-      command -v curl >/dev/null 2>&1 || prompt_install_deps repo curl || return 1
-      run_as_user_exec sh -c 'curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh | sh'
-      refresh_strata_bin
-      [[ -n "$STRATA_BIN" && -z "$STRATA_POLLER_PID" ]] && start_strata_update_poller
-    fi
-  fi
-
-  _ensure_hip_build_deps || return 1
-
-  local cache_base sdk="" sys_rocm="${ROCM_PATH:-/opt/rocm}"
-  local -a extra_sdks=() therock_cache_dirs=()
-  cache_base="$(_user_cache_dir)/strata-performance-setup"
-  run_as_user_exec mkdir -p "$cache_base" || return 1
-
-  if [[ "$is_gfx906" == true ]]; then
-    if _is_usable_rocm_root "$sys_rocm"; then
-      echo -e "${C_GREEN}Using ROCm toolchain at ${sys_rocm} for gfx906.${C_RESET}"
-      sdk="$sys_rocm"
-    else
-      echo -e "${C_YELLOW}AMD's TheRock 7.x tarballs do not support gfx906 (wave64).${C_RESET}"
-      echo -e "Please build inside a ROCm 6.x / community gfx906 environment (e.g. ${C_BOLD}mixa3607/rocm-gfx906:7.14-complete${C_RESET}),"
-      echo -e "or set ${C_BOLD}ROCM_PATH${C_RESET} to a compatible gfx906 ROCm root (see Strata's ${C_DIM}docs/AMD_HIP.md${C_RESET})."
-      return 1
-    fi
-  else
-    local -a therock_families=()
-    local fam="" t="" use_therock=false
-    for t in "${targets[@]}"; do
-      fam="$(amd_gfx_therock_family "$t" || true)"
-      if [[ -n "$fam" ]] && { (( ${#therock_families[@]} == 0 )) || ! _array_contains_val "$fam" "${therock_families[@]}"; }; then
-        therock_families+=("$fam")
-      fi
-    done
-
-    if (( ${#therock_families[@]} == 0 )); then
-      if _is_usable_rocm_root "$sys_rocm"; then
-        echo -e "${C_GREEN}Using system ROCm toolchain at ${sys_rocm} for ${targets[*]}.${C_RESET}"
-        sdk="$sys_rocm"
-      else
-        echo -e "${C_RED}No AMD TheRock tarball family known for '${targets[0]}' and no usable ROCm at ${sys_rocm}.${C_RESET}"
-        echo -e "Install ROCm (or set ${C_BOLD}ROCM_PATH${C_RESET} to your ROCm root) and re-run."
-        return 1
-      fi
-    elif _is_usable_rocm_root "$sys_rocm"; then
-      echo -e "\n${C_BOLD}Select ROCm toolchain for building (${targets[*]}):${C_RESET}"
-      echo "  1) AMD TheRock 7.14.1 tarball (Recommended — matches shipped hipBLASLt 100401 tuning tables)"
-      echo "  2) Existing system ROCm at ${sys_rocm}"
-      local rchoice=""
-      read -r -p "Choose [1-2, default 1]: " rchoice
-      if [[ "$rchoice" == "2" ]]; then
-        sdk="$sys_rocm"
-      else
-        use_therock=true
-      fi
-    else
-      use_therock=true
-    fi
-
-    if [[ "$use_therock" == true ]]; then
-      _acquire_therock_sdk "${therock_families[0]}" "$cache_base" || return 1
-      sdk="$_ACQUIRED_ROCM_SDK"
-      therock_cache_dirs+=("${cache_base}/rocm-therock-${therock_families[0]}")
-      local fi_idx
-      for (( fi_idx = 1; fi_idx < ${#therock_families[@]}; fi_idx++ )); do
-        fam="${therock_families[$fi_idx]}"
-        _acquire_therock_sdk "$fam" "$cache_base" || return 1
-        extra_sdks+=("$_ACQUIRED_ROCM_SDK")
-        therock_cache_dirs+=("${cache_base}/rocm-therock-${fam}")
-      done
-    fi
-  fi
-
-  local hip_clang="" hip_cc="" bitcode="" sysdeps_lib="" prefix_path="" sdk_ld_path=""
-  IFS='|' read -r hip_clang hip_cc bitcode sysdeps_lib prefix_path sdk_ld_path <<< "$(_detect_rocm_paths "$sdk")"
-  if [[ -z "$hip_clang" || ! -x "$hip_clang" ]]; then
-    echo -e "${C_RED}HIP clang++ compiler not found under ${sdk}.${C_RESET}"
-    return 1
-  fi
-
-  local src_dir="${cache_base}/Strata-src"
-  local patch_hip_cmake=true
-  [[ "$is_gfx906" == true ]] && patch_hip_cmake=false
-  _prepare_strata_source "$src_dir" "$patch_hip_cmake" "${targets[@]}" || return 1
-  local commit="$_PREPARED_STRATA_COMMIT"
-
-  local jobs=4 ram_cap=4
-  jobs="$(nproc 2>/dev/null || echo 4)"
-  if [[ "$RAM_GB" =~ ^[0-9]+$ ]] && (( RAM_GB > 0 )); then
-    ram_cap=$(( RAM_GB / 3 ))
-    (( ram_cap < 2 )) && ram_cap=2
-    (( jobs > ram_cap )) && jobs="$ram_cap"
-  fi
-
-  local cmake_archs="" data_archs="" space_archs=""
-  {
-    local IFS=';'
-    cmake_archs="${targets[*]}"
-  }
-  {
-    local IFS=','
-    data_archs="${targets[*]}"
-  }
-  space_archs="${targets[*]}"
-
-  local bdir="${cache_base}/build-hip-${targets[0]}"
-  local stage="${bdir}/stage"
-  local pkg_out="${bdir}/pkg_out"
-  run_as_user_exec rm -rf "$bdir"
-  run_as_user_exec mkdir -p "$bdir/engine" "$stage" "$pkg_out"
-
-  local llvm_bin_dir
-  llvm_bin_dir="$(dirname "$hip_clang")"
-  local -a build_env=(
-    "ROCM_PATH=${sdk}"
-    "HIP_PATH=${sdk}"
-    "HIP_PLATFORM=amd"
-    "HIP_COMPILER=clang"
-    "HIP_RUNTIME=rocclr"
-    "PATH=${sdk}/bin:${llvm_bin_dir}:${PATH}"
-    "LD_LIBRARY_PATH=${sdk_ld_path}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-  )
-  local hip_flag_str="-isystem ${sdk}/include --rocm-path=${sdk}"
-  [[ -n "$bitcode" ]] && hip_flag_str+=" --rocm-device-lib-path=${bitcode}"
-
-  echo -e "\n${C_CYAN}Configuring Strata engine for ${cmake_archs} (jobs=${jobs})...${C_RESET}"
-  if [[ "$is_gfx906" == false ]]; then
-    run_as_user_exec env "${build_env[@]}" cmake -G Ninja -S "${src_dir}/engine" -B "${bdir}/engine" \
-      -DCMAKE_BUILD_TYPE=Release \
-      -DSTRATA_ENABLE_HIP=ON \
-      -DSTRATA_ENABLE_CUDA=OFF \
-      -DSTRATA_BUILD_TESTS=OFF \
-      -DSTRATA_PORTABLE=ON \
-      "-DCMAKE_HIP_ARCHITECTURES=${cmake_archs}" \
-      "-DCMAKE_HIP_COMPILER=${hip_clang}" \
-      "-DCMAKE_HIP_COMPILER_ROCM_ROOT=${sdk}" \
-      "-DCMAKE_PREFIX_PATH=${prefix_path}" \
-      "-DCMAKE_HIP_FLAGS=${hip_flag_str}" \
-      "-DCMAKE_EXE_LINKER_FLAGS=-Wl,-rpath,'\$ORIGIN' -Wl,--enable-new-dtags" || {
-      echo -e "${C_RED}CMake configuration failed for Strata HIP engine.${C_RESET}"
-      return 1
-    }
-  else
-    run_as_user_exec env "${build_env[@]}" cmake -G Ninja -S "${src_dir}/engine" -B "${bdir}/engine" \
-      -DCMAKE_BUILD_TYPE=Release \
-      -DSTRATA_HIP_GFX906=ON \
-      -DCMAKE_HIP_ARCHITECTURES=gfx906 \
-      -DSTRATA_BUILD_TESTS=OFF \
-      -DSTRATA_PORTABLE=ON \
-      "-DCMAKE_C_COMPILER=${hip_cc}" \
-      "-DCMAKE_CXX_COMPILER=${hip_clang}" \
-      "-DCMAKE_PREFIX_PATH=${prefix_path}" \
-      "-DCMAKE_EXE_LINKER_FLAGS=-Wl,-rpath,'\$ORIGIN' -Wl,--enable-new-dtags" || {
-      echo -e "${C_RED}CMake configuration failed for Strata gfx906 engine.${C_RESET}"
-      return 1
-    }
-  fi
-
-  echo -e "${C_CYAN}Compiling Strata engine (this may take 10-20 minutes)...${C_RESET}"
-  run_as_user_exec env "${build_env[@]}" cmake --build "${bdir}/engine" --target strata -j "$jobs" || {
-    echo -e "${C_RED}Strata engine build failed.${C_RESET}"
-    return 1
-  }
-  [[ -x "${bdir}/engine/strata" ]] || { echo -e "${C_RED}Built binary missing at ${bdir}/engine/strata.${C_RESET}"; return 1; }
-
-  # Best-effort picture readers (failures never abort engine registration)
-  local has_cpu_vis=false has_gpu_vis=false
-  if [[ -f "${src_dir}/terminal/tools/vision/CMakeLists.txt" ]]; then
-    echo -e "${C_CYAN}Building optional CPU picture reader (strata-vision)...${C_RESET}"
-    if run_as_user_exec env "${build_env[@]}" cmake -G Ninja -S "${src_dir}/terminal/tools/vision" -B "${bdir}/bv" \
-         -DCMAKE_BUILD_TYPE=Release -DSTRATA_VISION_CUDA=OFF -DSTRATA_PORTABLE=ON >/dev/null 2>&1 && \
-       run_as_user_exec env "${build_env[@]}" cmake --build "${bdir}/bv" --target strata-vision -j "$jobs" >/dev/null 2>&1 && \
-       [[ -x "${bdir}/bv/bin/strata-vision" ]]; then
-      has_cpu_vis=true
-    else
-      echo -e "${C_YELLOW}Note: CPU picture reader build skipped/failed (text inference unaffected).${C_RESET}"
-    fi
-    if [[ "$is_wave32" == true ]]; then
-      echo -e "${C_CYAN}Building optional HIP GPU picture reader (strata-vision-hip)...${C_RESET}"
-      if run_as_user_exec env "${build_env[@]}" cmake -G Ninja -S "${src_dir}/terminal/tools/vision" -B "${bdir}/bh" \
-           -DCMAKE_BUILD_TYPE=Release -DSTRATA_VISION_HIP=ON \
-           "-DSTRATA_VISION_HIP_ARCHS=${cmake_archs}" -DSTRATA_PORTABLE=ON \
-           "-DCMAKE_HIP_COMPILER=${hip_clang}" \
-           "-DCMAKE_HIP_COMPILER_ROCM_ROOT=${sdk}" \
-           "-DCMAKE_PREFIX_PATH=${prefix_path}" \
-           "-DCMAKE_HIP_FLAGS=${hip_flag_str}" >/dev/null 2>&1 && \
-         run_as_user_exec env "${build_env[@]}" cmake --build "${bdir}/bh" --target strata-vision -j "$jobs" >/dev/null 2>&1 && \
-         [[ -x "${bdir}/bh/bin/strata-vision-hip" ]]; then
-        has_gpu_vis=true
-      else
-        echo -e "${C_YELLOW}Note: GPU picture reader build skipped/failed (CPU reader / text unaffected).${C_RESET}"
-      fi
-    fi
-  fi
-
-  local eng_ver="" raw_ver=""
-  raw_ver="$(run_as_user_exec env "LD_LIBRARY_PATH=${sdk_ld_path}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" "${bdir}/engine/strata" --version 2>/dev/null || true)"
-  eng_ver="$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?' <<<"$raw_ver" | head -n1 || true)"
-  if [[ -z "$eng_ver" && -f "${src_dir}/engine/CMakeLists.txt" ]]; then
-    eng_ver="$(sed -nE 's/^[[:space:]]*project\(strata[[:space:]]+VERSION[[:space:]]+([0-9]+\.[0-9]+(\.[0-9]+)*).*/\1/p' "${src_dir}/engine/CMakeLists.txt" | head -n1 || true)"
-  fi
-  [[ -n "$eng_ver" ]] || eng_ver="0.1.0"
-
-  local variant="local-${targets[0]}"
-  local vision_mode="none"
-  [[ "$has_cpu_vis" == true ]] && vision_mode="cpu"
-  [[ "$has_gpu_vis" == true ]] && vision_mode="gpu"
-
-  run_as_user_exec python3 - "${stage}/BUILD.json" "$eng_ver" "$commit" "$variant" "$vision_mode" "${targets[@]}" <<'PY'
-import json, sys
-out, ver, commit, variant, vis, *archs = sys.argv[1:]
-d = {"version": ver, "source": f"local-hip {commit}", "backend": "hip", "variant": variant,
-     "archs": archs, "portable": True, "vision": vis}
-if vis in ("cpu", "gpu"):
-    d["vision_cpu"] = "strata-vision"
-if vis == "gpu":
-    d["vision_gpu"] = "strata-vision-hip"
-    d["vision_archs"] = archs
-with open(out, "w", encoding="utf-8") as f:
-    json.dump(d, f, indent=1)
-    f.write("\n")
-PY
-
-  # Collect shared libraries and ROCm kernel data
-  echo -e "${C_CYAN}Collecting ROCm runtime libraries & kernel data...${C_RESET}"
-  local -a collect_search=() collect_data=() data_sdks=("$sdk")
-  (( ${#extra_sdks[@]} > 0 )) && data_sdks+=("${extra_sdks[@]}")
-  local sdir sdk_item=""
-  for sdir in "$sdk/lib" "$sdk/lib64" "$sysdeps_lib" "$sdk/lib/llvm/lib" "$sdk/llvm/lib"; do
-    [[ -n "$sdir" && -d "$sdir" ]] && collect_search+=(--search "$sdir")
-  done
-  for sdk_item in "${data_sdks[@]}"; do
-    for sdir in "$sdk_item/lib/rocblas/library" "$sdk_item/lib64/rocblas/library" "$sdk_item/rocblas/lib/library"; do
-      if [[ -d "$sdir" ]]; then
-        collect_data+=(--data "${sdir}=rocblas/library")
-        break
-      fi
-    done
-    for sdir in "$sdk_item/lib/hipblaslt/library" "$sdk_item/lib64/hipblaslt/library" "$sdk_item/hipblaslt/lib/library"; do
-      if [[ -d "$sdir" ]]; then
-        collect_data+=(--data "${sdir}=hipblaslt/library")
-        break
-      fi
-    done
-  done
-
-  run_as_user_exec python3 "${src_dir}/tools/packaging/collect_libs.py" \
-    --binary "${bdir}/engine/strata" \
-    "${collect_search[@]}" \
-    --also 'libamd_comgr.so*' --also 'libhiprtc*.so*' \
-    --out "$stage" \
-    ${collect_data[@]+"${collect_data[@]}"} --data-arch "$data_archs" || {
-    echo -e "${C_RED}collect_libs.py failed.${C_RESET}"
-    return 1
-  }
-
-  if [[ "$has_gpu_vis" == true ]]; then
-    run_as_user_exec python3 "${src_dir}/tools/packaging/collect_libs.py" \
-      --binary "${bdir}/bh/bin/strata-vision-hip" \
-      "${collect_search[@]}" \
-      --also 'libamd_comgr.so*' --also 'libhiprtc*.so*' \
-      --out "$stage" || true
-  fi
-
-  # ROCm 10.x kpack archives if present
-  local ka="" kpack_made=false
-  for sdk_item in "${data_sdks[@]}"; do
-    if [[ -d "${sdk_item}/.kpack" ]]; then
-      if [[ "$kpack_made" == false ]]; then
-        run_as_user_exec mkdir -p "${stage}/kpack"
-        kpack_made=true
-      fi
-      for ka in "${targets[@]}"; do
-        [[ -f "${sdk_item}/.kpack/blas_lib_${ka}.kpack" ]] && run_as_user_exec cp "${sdk_item}/.kpack/blas_lib_${ka}.kpack" "${stage}/kpack/"
-      done
-    fi
-  done
-
-  run_as_user_exec cp "${bdir}/engine/strata" "${stage}/strata"
-  [[ "$has_cpu_vis" == true ]] && run_as_user_exec cp "${bdir}/bv/bin/strata-vision" "${stage}/strata-vision"
-  [[ "$has_gpu_vis" == true ]] && run_as_user_exec cp "${bdir}/bh/bin/strata-vision-hip" "${stage}/strata-vision-hip"
-
-  run_as_user_exec sh -c 'for f in "$1"/*.so "$1"/*.so.* "$1/strata" "$1/strata-vision" "$1/strata-vision-hip"; do [ -f "$f" ] && [ ! -L "$f" ] && patchelf --set-rpath '\''$ORIGIN'\'' "$f" 2>/dev/null || true; done' _ "$stage"
-
-  # Stage matching hipBLASLt tuning tables or set fallback hipblaslt_version
-  local hbl_ver="" has_tuning=false
-  if [[ -f "${sdk}/include/hipblaslt/hipblaslt-version.h" ]]; then
-    run_as_user_exec python3 "${src_dir}/tools/packaging/stage_tuning.py" \
-      --stage "$stage" --archs "$space_archs" --rocm "$sdk" || true
-  elif [[ -f "${sdk}/hipblaslt/include/hipblaslt/hipblaslt-version.h" ]]; then
-    hbl_ver="$(python3 - "${sdk}/hipblaslt/include/hipblaslt/hipblaslt-version.h" <<'PY' 2>/dev/null || true
-import re, sys
-with open(sys.argv[1], encoding="utf-8") as f:
-    t = f.read()
-vals = []
-for k in ("MAJOR", "MINOR", "PATCH"):
-    m = re.search(rf"#define\s+HIPBLASLT_VERSION_{k}\s+(\d+)", t)
-    if not m:
-        sys.exit(0)
-    vals.append(int(m.group(1)))
-print(vals[0]*100000 + vals[1]*100 + vals[2])
-PY
-)"
-    if [[ "$hbl_ver" =~ ^[0-9]+$ ]]; then
-      run_as_user_exec python3 "${src_dir}/tools/packaging/stage_tuning.py" \
-        --stage "$stage" --archs "$space_archs" --version "$hbl_ver" || true
-    fi
-  fi
-  if ! grep -q '"hipblaslt_version"' "${stage}/BUILD.json" 2>/dev/null; then
-    run_as_user_exec python3 - "${stage}/BUILD.json" <<'PY'
-import json, sys
-p = sys.argv[1]
-with open(p, encoding="utf-8") as f:
-    d = json.load(f)
-d["hipblaslt_version"] = 1
-with open(p, "w", encoding="utf-8") as f:
-    json.dump(d, f, indent=1)
-    f.write("\n")
-PY
-  fi
-  compgen -G "${stage}/tuning/*.txt" >/dev/null 2>&1 && has_tuning=true
-
-  # Package and verify component
-  local -a pkg_args=(
-    --src "$stage"
-    --backend hip
-    --version "$eng_ver"
-    --out "$pkg_out"
-    --variant "$variant"
-    --build-id "${commit}+local-rocm"
-    --notes "Local HIP build for ${data_archs} via strata-performance-setup"
-    --tree
-  )
-  local t=""
-  for t in "${targets[@]}"; do pkg_args+=(--arch "$t"); done
-  if [[ -r "${stage}/SYSTEM-LIBS.txt" ]]; then
-    local slib=""
-    while IFS= read -r slib; do
-      [[ -n "$slib" ]] && pkg_args+=(--allow-lib "$slib")
-    done < "${stage}/SYSTEM-LIBS.txt"
-  fi
-
-  echo -e "${C_CYAN}Packaging and verifying Strata HIP engine component...${C_RESET}"
-  run_as_user_exec python3 "${src_dir}/tools/packaging/package_engine.py" "${pkg_args[@]}" || {
-    echo -e "${C_RED}package_engine.py failed.${C_RESET}"
-    return 1
-  }
-
-  local pkg_dir="" pkg_folder_name=""
-  pkg_dir="$(find "$pkg_out" -mindepth 1 -maxdepth 1 -type d | head -n1 || true)"
-  [[ -n "$pkg_dir" && -f "${pkg_dir}/engine-component.json" ]] || {
-    echo -e "${C_RED}Packaged folder not found in ${pkg_out}.${C_RESET}"
-    return 1
-  }
-  pkg_folder_name="$(basename "$pkg_dir")"
-
-  run_as_user_exec python3 - "${src_dir}/terminal" "$pkg_dir" <<'PY' || { echo -e "${C_RED}Package integrity verification failed for ${pkg_dir}.${C_RESET}"; return 1; }
-import sys
-from pathlib import Path
-sys.path.insert(0, sys.argv[1])
-from strata_control import engine_component as ec
-c = ec.read_manifest_any(Path(sys.argv[2]))
-ec.verify(c, full=True)
-print(f"Verified manifest integrity: {c.root.name} ({len(c.files)} files)")
-PY
-  if ! run_as_user_exec python3 "${src_dir}/tools/packaging/package_engine.py" --verify "$pkg_dir" >/dev/null 2>&1; then
-    echo -e "${C_DIM}Note: standalone binary_deps check flagged host system libraries listed in SYSTEM-LIBS.txt (allowed for local-host install).${C_RESET}"
-  fi
-
-  # Install into Strata components/engine atomically
-  local comp_eng_dir="" dest_dir=""
-  comp_eng_dir="$(strata_components_engine_dir)"
-  dest_dir="${comp_eng_dir}/${pkg_folder_name}"
-
-  stop_strata_update_poller
-  if [[ -d "$dest_dir" ]]; then
-    _stop_strata_if_running || { start_strata_update_poller; return 1; }
-    run_as_user_exec rm -rf "$dest_dir"
-  fi
-  run_as_user_exec mkdir -p "$comp_eng_dir"
-  run_as_user_exec mv "$pkg_dir" "$dest_dir" || {
-    echo -e "${C_RED}Failed to install package into ${dest_dir}.${C_RESET}"
-    start_strata_update_poller
-    return 1
-  }
-  invalidate_local_hip_engine_cache
-
-  echo -e "\n${C_BGREEN}Installed local Strata HIP engine: ${dest_dir}${C_RESET}"
-  if [[ -n "$STRATA_BIN" ]]; then
-    if run_as_user_exec "$STRATA_BIN" components use "$pkg_folder_name"; then
-      echo -e "${C_GREEN}Activated ${pkg_folder_name} via 'strata components use'.${C_RESET}"
-    else
-      echo -e "${C_YELLOW}Note: could not auto-pin via 'strata components use ${pkg_folder_name}'.${C_RESET}"
-    fi
-  fi
-
-  if [[ "${_STRATA_WAS_ACTIVE:-false}" == true ]]; then
-    if confirm_yn "Restart strata.service with the newly built HIP engine? [Y/n]: " "Y"; then
-      service_ctl start strata.service && wait_for_strata_model_live 120 || true
-    fi
-  fi
-
-  _print_local_hip_post_install_notes "$data_archs" "$dest_dir" "$has_tuning"
-
-  echo ""
-  if confirm_yn "Clean up temporary build files at ${bdir} (installed engine is self-contained)? [Y/n]: " "Y"; then
-    run_as_user_exec rm -rf "$bdir"
-  fi
-  if (( ${#therock_cache_dirs[@]} > 0 )) && confirm_yn "Also remove cached TheRock ROCm SDK(s) at ${therock_cache_dirs[*]}? [y/N]: " "N"; then
-    run_as_user_exec rm -rf "${therock_cache_dirs[@]}"
-  fi
-
-  refresh_strata_bin
-  start_strata_update_poller
-  return 0
-}
-
-run_strata_option() {
-  local target_opt="$1" auto_run="${2:-false}" s_idx=0 total="${#ACTIVE_STRATA_OPTIONS[@]}" i opt action action_label
-  (( total > 0 )) || return 0
-  for (( i = 0; i < total; i++ )); do
-    [[ "${ACTIVE_STRATA_OPTIONS[$i]}" == "$target_opt" ]] && { s_idx=$i; break; }
-  done
-
-  while true; do
-    refresh_strata_bin
-    refresh_strata_running
-    build_strata_options
-    total="${#ACTIVE_STRATA_OPTIONS[@]}"
-    (( s_idx >= total )) && s_idx=$(( total - 1 ))
-    opt="${ACTIVE_STRATA_OPTIONS[$s_idx]}"
-    if [[ "$opt" == "history" ]]; then
-      show_benchmark_history
-      return 0
-    fi
-    print_header
-
-    local body=""
-    body+="$(echo -e "${C_BOLD}Strata Option s$((s_idx + 1)) of ${total}: $("title_strata_${opt}")${C_RESET}")"$'\n'
-    body+="$(echo -e "Status: $("badge_strata_${opt}")")"$'\n'
-    body+="$(echo -e "${C_DIM}----------------------------------------------------------------------${C_RESET}")"$'\n'
-    body+="$("explain_strata_${opt}")"$'\n'
-    body+="$(echo -e "${C_DIM}----------------------------------------------------------------------${C_RESET}")"$'\n\n'
-
-    case "$opt" in
-      install)   action_label="Install Strata" ;;
-      update)    action_label="Check & install Strata update" ;;
-      remove)    action_label="Remove Strata & uninstall service" ;;
-      service)   action_label="Manage strata.service" ;;
-      benchmark) action_label="Run Strata benchmark" ;;
-      history)   action_label="View all benchmark results" ;;
-      build_hip) action_label="Build / manage local Strata HIP engine" ;;
-      *)         action_label="Run action" ;;
-    esac
-
-    if [[ "$opt" == "remove" ]]; then
-      body+="$(echo -e "  ${C_RED}[a]${C_RESET} ${action_label}")"$'\n'
-    else
-      body+="$(echo -e "  ${C_GREEN}[a]${C_RESET} ${action_label}")"$'\n'
-    fi
-    if [[ "$opt" == "benchmark" ]] || (( $(count_bench_history) > 0 )); then
-      body+="$(echo -e "  ${C_CYAN}[h]${C_RESET} Benchmark history & restore coupled options")"$'\n'
-    fi
-    body+="$(echo -e "  ${C_DIM}[n]${C_RESET} Next option   ${C_DIM}[b]${C_RESET} Previous option   ${C_DIM}[i/Esc]${C_RESET} Back to Index   ${C_DIM}[q]${C_RESET} Quit")"$'\n\n'
-
-    printf "%s" "$body"
-    if [[ "$auto_run" == true ]]; then
-      auto_run=false
-      echo ""
-      if [[ "$opt" == "update" ]]; then
-        perform_strata_update || true
-      else
-        "strata_action_${opt}" || true
-      fi
-      pause_prompt
-      continue
-    fi
-    local body_lines lines_up
-    body_lines="$(printf "%s" "$body" | wc -l | tr -d '[:space:]')"
-    lines_up=$(( LIVE_STATS_COUNT + POST_HEADER_LINES + body_lines ))
-    read_step_action action "$lines_up"
-    case "$action" in
-      __refresh__) ;;
-      __esc__|i|I) return 0 ;;
-      a|A)
-        echo ""
-        "strata_action_${opt}" || true
-        if [[ "$opt" == "benchmark" && "${LAST_BENCH_COMPLETED:-false}" == true ]]; then
-          return 0
-        fi
-        [[ "$opt" != "history" ]] && pause_prompt
-        ;;
-      h|H)
-        if [[ "$opt" == "benchmark" ]] || (( $(count_bench_history) > 0 )); then
-          show_benchmark_history
-        else
-          echo -e "${C_RED}Invalid action '${action}'.${C_RESET}"; sleep 1
-        fi
-        ;;
-      n|N|"")
-        (( s_idx + 1 < total )) && ((s_idx++)) || return 0
-        ;;
-      b|B)
-        (( s_idx > 0 )) && ((s_idx--))
-        ;;
-      q|Q) exit 0 ;;
-      *) echo -e "${C_RED}Invalid action '${action}'.${C_RESET}"; sleep 1 ;;
-    esac
-  done
-}
 
 # ------------------------------------------------------------------------------
 # TUI Wizard Engine
@@ -10281,199 +4286,6 @@ truncate_ansi_col() {
   }' <<< "$str"
 }
 
-collect_strata_stats_lines() {
-  STRATA_STAT_LINES=()
-  STRATA_STAT_LINES+=("$(printf "%bStrata:%b" "${C_BOLD}" "${C_RESET}")")
-  local ver_disp="${STRATA_VERSION:-Not installed}"
-  [[ -z "$STRATA_BIN" && -n "$STRATA_DOCKER_CONTAINER" ]] && ver_disp="Docker (${STRATA_DOCKER_CONTAINER}, host-tuning mode)"
-  STRATA_STAT_LINES+=("$(printf "  %-8s %b%s%b" "Version:" "${C_DIM}" "$ver_disp" "${C_RESET}")")
-  local svc_str=""
-  if strata_service_installed; then
-    if unit_active strata.service; then
-      svc_str="${C_GREEN}Installed (running via service)${C_RESET}"
-    elif [[ -n "$STRATA_RUNNING_PRESET" ]]; then
-      svc_str="${C_YELLOW}Installed (not running via service)${C_RESET}"
-    else
-      svc_str="${C_YELLOW}Installed (inactive)${C_RESET}"
-    fi
-  elif [[ -n "$STRATA_BIN" ]]; then
-    svc_str="${C_DIM}Not installed${C_RESET}"
-  fi
-
-  if [[ -z "$STRATA_RUNNING_PRESET" ]]; then
-    LIVE_COMPACT_STRATA=""
-    [[ -n "$STRATA_BIN" ]] && LIVE_COMPACT_STRATA="Strata: idle"
-    [[ -n "$STRATA_BIN" ]] && STRATA_STAT_LINES+=("$(printf "  %-8s %bNot serving%b" "Status:" "${C_DIM}" "${C_RESET}")")
-    [[ -n "$svc_str" ]] && STRATA_STAT_LINES+=("$(printf "  %-8s %b" "Service:" "$svc_str")")
-    return 0
-  fi
-
-  local model="" live_str="0.0 tok/s (idle)" avg_str="—"
-  if [[ -n "$STRATA_RUNNING_URL" ]] && command -v curl >/dev/null 2>&1 && has_working_python3; then
-    local m_json curl_args=(-fsS --max-time 1)
-    [[ -n "${STRATA_API_KEY:-}" ]] && curl_args+=(-H "Authorization: Bearer ${STRATA_API_KEY}" -H "X-API-Key: ${STRATA_API_KEY}")
-    m_json="$(curl "${curl_args[@]}" "${STRATA_RUNNING_URL}/metrics" 2>/dev/null || true)"
-    if [[ -n "$m_json" ]]; then
-      local parsed=""
-      parsed="$(python3 -c '
-import json, sys
-try:
-    d = json.loads(sys.stdin.read())
-except Exception:
-    sys.exit(0)
-model = (d.get("engine") or {}).get("model") or ""
-live = d.get("live") or {}
-state = live.get("state") or "idle"
-ltok = live.get("tok_s")
-if ltok is not None and isinstance(ltok, (int, float)):
-    live_s = f"{ltok:.1f} tok/s ({state})"
-else:
-    live_s = f"0.0 tok/s ({state})"
-tot = d.get("totals") or {}
-out_tok = tot.get("output_tokens") or 0
-dec_ms = tot.get("decode_ms") or 0
-reqs = tot.get("requests") or 0
-if out_tok > 0 and dec_ms > 0:
-    avg_s = f"{out_tok / (dec_ms / 1000.0):.1f} tok/s ({reqs} reqs, {out_tok} tok)"
-else:
-    avg_s = "0.0 tok/s (no reqs)"
-model = str(model).replace("|", "/").replace("\n", " ")
-live_s = str(live_s).replace("|", "/").replace("\n", " ")
-print(f"{model}|{live_s}|{avg_s}")
-' <<< "$m_json" 2>/dev/null || true)"
-      if [[ -n "$parsed" ]]; then
-        IFS='|' read -r model live_str avg_str <<< "$parsed"
-      fi
-    fi
-  fi
-  local preset_disp="$STRATA_RUNNING_PRESET"
-  [[ -n "$model" ]] && preset_disp+=" ($model)"
-  STRATA_STAT_LINES+=("$(printf "  %-8s %s" "Preset:" "$preset_disp")")
-  STRATA_STAT_LINES+=("$(printf "  %-8s %b%s%b" "Live:" "${C_CYAN}" "$live_str" "${C_RESET}")")
-  STRATA_STAT_LINES+=("$(printf "  %-8s %b%s%b" "Avg:" "${C_GREEN}" "$avg_str" "${C_RESET}")")
-  [[ -n "$svc_str" ]] && STRATA_STAT_LINES+=("$(printf "  %-8s %b" "Service:" "$svc_str")")
-  LIVE_COMPACT_STRATA="Strata: ${live_str}"
-}
-
-format_pct_delta() {
-  local pct="$1"
-  [[ -n "$pct" ]] || return 1
-  if [[ "$pct" == "0.0" || "$pct" == "-0.0" ]]; then
-    printf "%b0.0%%%b" "${C_DIM}" "${C_RESET}"
-  elif [[ "$pct" == -* ]]; then
-    printf "%b%s%%%b" "${C_RED}" "$pct" "${C_RESET}"
-  else
-    printf "%b+%s%%%b" "${C_BGREEN}" "$pct" "${C_RESET}"
-  fi
-}
-
-collect_strata_bench_lines() {
-  local newest="" hist_mtime="0"
-  newest="$(find_latest_results_json 0)"
-  [[ -r "$STRATA_BENCH_HISTORY_FILE" ]] && hist_mtime="$(file_mtime "$STRATA_BENCH_HISTORY_FILE")"
-
-  if [[ -z "$newest" && "$hist_mtime" == "0" ]]; then
-    STRATA_BENCH_CACHE_KEY=""
-    STRATA_BENCH_LINES=()
-    STRATA_BENCH_LINES+=("$(printf "%bLatest Benchmark:%b" "${C_BOLD}" "${C_RESET}")")
-    STRATA_BENCH_LINES+=("$(printf "  %-8s %bNo benchmark history found%b" "Status:" "${C_DIM}" "${C_RESET}")")
-    if [[ -n "$STRATA_BIN" ]]; then
-      STRATA_BENCH_LINES+=("$(printf "  %-8s %b'strata bench run' (or [s4])%b" "Run:" "${C_DIM}" "${C_RESET}")")
-    fi
-    return 0
-  fi
-
-  local mtime="0" cache_key
-  [[ -n "$newest" ]] && mtime="$(file_mtime "$newest")"
-  cache_key="${newest}:${mtime}:${hist_mtime}"
-  if [[ "$cache_key" == "$STRATA_BENCH_CACHE_KEY" && ${#STRATA_BENCH_LINES[@]} -gt 0 ]]; then
-    return 0
-  fi
-
-  local parsed=""
-  if has_working_python3; then
-    local -a _sdirs=()
-    mapfile -t _sdirs < <(_strata_bench_search_dirs)
-    parsed="$(_strata_bench_py summary "${_sdirs[@]}" 2>/dev/null || true)"
-  fi
-
-  STRATA_BENCH_CACHE_KEY="$cache_key"
-  STRATA_BENCH_LINES=()
-  if [[ -z "$parsed" ]]; then
-    STRATA_BENCH_LINES+=("$(printf "%bLatest Benchmark:%b" "${C_BOLD}" "${C_RESET}")")
-    STRATA_BENCH_LINES+=("$(printf "  %-8s %bNo readable benchmark data%b" "Status:" "${C_DIM}" "${C_RESET}")")
-    return 0
-  fi
-
-  local line kind b_ts b_tag b_model b_dec b_pre b_req b_qual b_sw b_gw b_cw b_dpct b_ppct b_avg_dec b_avg_pre b_pdpct b_pppct
-  while IFS='|' read -r kind b_ts b_tag b_model b_dec b_pre b_req b_qual b_sw b_gw b_cw b_dpct b_ppct b_avg_dec b_avg_pre b_pdpct b_pppct; do
-    [[ -n "$kind" ]] || continue
-    if [[ "$kind" == "CUR" ]]; then
-      STRATA_BENCH_LINES+=("$(printf "%bLatest Benchmark:%b" "${C_BOLD}" "${C_RESET}")")
-    elif [[ "$kind" == "PREV" ]]; then
-      STRATA_BENCH_LINES+=("$(printf "%bPrevious Benchmark:%b" "${C_BOLD}" "${C_RESET}")")
-    else
-      STRATA_BENCH_LINES+=("$(printf "%bBest Benchmark:%b" "${C_BOLD}" "${C_RESET}")")
-    fi
-    local date_disp="${b_ts:-Unknown}"
-    [[ -n "$b_tag" ]] && date_disp+=" (${b_tag})"
-    STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b" "Date:" "${C_DIM}" "$date_disp" "${C_RESET}")")
-    STRATA_BENCH_LINES+=("$(printf "  %-8s %s" "Model:" "$b_model")")
-    if [[ -n "$b_avg_dec" || -n "$b_avg_pre" ]]; then
-      local avg_parts=()
-      [[ -n "$b_avg_dec" ]] && avg_parts+=("${b_avg_dec} decode")
-      [[ -n "$b_avg_pre" ]] && avg_parts+=("${b_avg_pre} prefill")
-      local avg_str="${avg_parts[0]}"
-      (( ${#avg_parts[@]} > 1 )) && avg_str+=" | ${avg_parts[1]}"
-      STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b" "Avg:" "${C_CYAN}" "$avg_str" "${C_RESET}")")
-    fi
-    local b_pwr
-    b_pwr="$(format_avg_power_str "$b_sw" "$b_gw" "$b_cw")"
-    if [[ -n "$b_pwr" ]]; then
-      STRATA_BENCH_LINES+=("$(printf "  %-8s %s" "Power:" "$b_pwr")")
-    else
-      STRATA_BENCH_LINES+=("$(printf "  %-8s %bn/a (not recorded)%b" "Power:" "${C_DIM}" "${C_RESET}")")
-    fi
-    STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b | Prefill: %b%s%b" "Decode:" "${C_CYAN}" "$b_dec" "${C_RESET}" "${C_CYAN}" "$b_pre" "${C_RESET}")")
-    if [[ "$kind" == "CUR" ]]; then
-      local pdiff_parts=()
-      [[ -n "$b_pdpct" ]] && pdiff_parts+=("Decode $(format_pct_delta "$b_pdpct")")
-      [[ -n "$b_pppct" ]] && pdiff_parts+=("Prefill $(format_pct_delta "$b_pppct")")
-      if (( ${#pdiff_parts[@]} > 0 )); then
-        local pdiff_str="" pdi=0
-        for ((pdi=0; pdi<${#pdiff_parts[@]}; pdi++)); do
-          (( pdi > 0 )) && pdiff_str+=" | "
-          pdiff_str+="${pdiff_parts[$pdi]}"
-        done
-        pdiff_str+=" ${C_DIM}(vs prev)${C_RESET}"
-        STRATA_BENCH_LINES+=("$(printf "  %-8s %b" "Diff:" "$pdiff_str")")
-      fi
-    fi
-    if [[ "$kind" == "CUR" || "$kind" == "PREV" ]]; then
-      local diff_parts=()
-      [[ -n "$b_dpct" ]] && diff_parts+=("Decode $(format_pct_delta "$b_dpct")")
-      [[ -n "$b_ppct" ]] && diff_parts+=("Prefill $(format_pct_delta "$b_ppct")")
-      if (( ${#diff_parts[@]} > 0 )); then
-        local diff_str="" di=0
-        for ((di=0; di<${#diff_parts[@]}; di++)); do
-          (( di > 0 )) && diff_str+=" | "
-          diff_str+="${diff_parts[$di]}"
-        done
-        diff_str+=" ${C_DIM}(vs best)${C_RESET}"
-        STRATA_BENCH_LINES+=("$(printf "  %-8s %b" "Diff:" "$diff_str")")
-      fi
-    fi
-    local summary_tail=""
-    [[ -n "$b_req" ]] && summary_tail="Reqs: ${b_req}"
-    if [[ -n "$b_qual" ]]; then
-      [[ -n "$summary_tail" ]] && summary_tail+=" | "
-      summary_tail+="$b_qual"
-    fi
-    [[ -n "$summary_tail" ]] && STRATA_BENCH_LINES+=("$(printf "  %-8s %b%s%b" "Checks:" "${C_DIM}" "$summary_tail" "${C_RESET}")")
-    STRATA_BENCH_LINES+=("")
-  done <<< "$parsed"
-}
-
 print_stats_and_info_grid() {
   local inplace="${1:-false}" eol=""
   [[ "$inplace" == true ]] && eol=$'\033[K'
@@ -10500,7 +4312,7 @@ print_stats_and_info_grid() {
       total_lines=$((total_lines + 1))
     done
   }
-  collect_strata_stats_lines
+  run_host_hook live_stats
   _append_grid_section "${SYS_INFO_LINES[@]}"
   _append_grid_section "${LIVE_STAT_LINES[@]}"
   _append_grid_section "${STRATA_STAT_LINES[@]}"
@@ -10520,40 +4332,22 @@ format_stats_toggle_row() {
   fi
 }
 
-format_strata_toggle_row() {
-  local selected="${1:-false}"
-  local ptr=" " tag="[STRATA]" title="Strata Options & Management" sub="(Install / Update / Service / Benchmark / History)"
+format_host_plugin_row() {
+  local pid="$1" selected="${2:-false}"
+  if [[ -n "${HOST_PLUGIN_LOADED[$pid]:-}" ]] && declare -F "${pid}_menu_row" >/dev/null 2>&1; then
+    "${pid}_menu_row" "$selected"
+    return 0
+  fi
+  local pname="${HOST_PLUGIN_NAMES[$pid]:-$pid}"
+  local pdesc="${HOST_PLUGIN_DESCS[$pid]:-LLM host plugin}"
+  local tag_upper="${pid^^}"
+  local prefix="  "
+  [[ "$selected" == true ]] && prefix="▶ "
   if [[ "$selected" == true ]]; then
-    ptr="${C_CYAN}>${C_RESET}"
-    printf "%b %b%s%b %b%s%b  %b%s%b" "$ptr" "${C_BGREEN}${C_BOLD}" "$tag" "${C_RESET}" "${C_CYAN}${C_BOLD}" "$title" "${C_RESET}" "${C_CYAN}" "$sub" "${C_RESET}"
+    printf "%b%s[%s]  %s — %s (not loaded — press Enter to load)%b" "${C_BOLD}${C_CYAN}" "$prefix" "$tag_upper" "$pname" "$pdesc" "$C_RESET"
   else
-    printf "%b %b%s%b %b%s%b  %b%s%b" "$ptr" "${C_YELLOW}${C_BOLD}" "$tag" "${C_RESET}" "${C_BOLD}" "$title" "${C_RESET}" "${C_DIM}" "$sub" "${C_RESET}"
+    printf "%s%b[%s]%b  %b%s — %s (not loaded)%b" "$prefix" "${C_MAGENTA}" "$tag_upper" "${C_RESET}" "${C_DIM}" "$pname" "$pdesc" "${C_RESET}"
   fi
-}
-
-format_strata_update_banner() {
-  local rule_w="${1:-117}"
-  [[ "$STRATA_UPDATE_AVAILABLE" == true ]] || return 0
-  local msg=" [UPDATE AVAILABLE] Strata update ready — Press [u] to install & restart service "
-  if (( rule_w > 10 && ${#msg} > rule_w )); then
-    msg="${msg:0:$((rule_w - 3))}..."
-  fi
-  local pad=$(( rule_w - ${#msg} ))
-  local spaces=""
-  (( pad > 0 )) && printf -v spaces "%*s" "$pad" ""
-  printf "%b%s%s%b" "${C_UPDATE_BANNER}" "$msg" "$spaces" "${C_RESET}"
-}
-
-_render_update_banner_inplace() {
-  local banner_up="$1" term_lines="${2:-40}"
-  (( banner_up > 0 && banner_up < term_lines )) || return 1
-  local rule_w=120
-  [[ -t 1 ]] && rule_w="$(tput cols 2>/dev/null || echo 117)"
-  (( rule_w > 117 )) && rule_w=117
-  local banner_line
-  banner_line="$(format_strata_update_banner "$rule_w")"
-  printf "\033[?2026h\033[?25l\033[s\033[%dA\r\033[2K%s\033[u\033[?25h\033[?2026l" "$banner_up" "$banner_line"
-  return 0
 }
 
 print_header() {
@@ -10571,22 +4365,31 @@ print_header() {
   echo -e "${C_BOLD}${C_CYAN}${_hdr_eq}${C_RESET}"
   printf "${C_BOLD}${C_CYAN}%*s%s${C_RESET}\n" "$_title_pad" "" "$_title"
   echo -e "${C_BOLD}${C_CYAN}${_hdr_eq}${C_RESET}"
-  load_strata_update_state
+  declare -F load_strata_update_state >/dev/null 2>&1 && load_strata_update_state
   if [[ "$hdr_mode" == "toggle" ]]; then
     LIVE_STATS_COUNT=0
     LIVE_STAT_LINES=()
     echo ""
-    local _tgl_sel=false _str_sel=false
+    local _tgl_sel=false
     (( INDEX_SELECTED == 0 )) && _tgl_sel=true
-    (( INDEX_SELECTED == 1 )) && _str_sel=true
     printf "%s\n" "$(format_stats_toggle_row "$_tgl_sel")"
     echo ""
-    printf "%s\n" "$(format_strata_toggle_row "$_str_sel")"
-    echo ""
-    POST_HEADER_LINES=5
-    UPDATE_BANNER_OFFSET=5
+    local _hdr_lines=3
+    if [[ "$NO_PLUGINS" != true ]]; then
+      local _hi _pid _hsel
+      for (( _hi = 0; _hi < ${#AVAILABLE_HOST_PLUGINS[@]}; _hi++ )); do
+        _pid="${AVAILABLE_HOST_PLUGINS[$_hi]}"
+        _hsel=false
+        (( INDEX_SELECTED == _hi + 1 )) && _hsel=true
+        printf "%s\n" "$(format_host_plugin_row "$_pid" "$_hsel")"
+        echo ""
+        (( _hdr_lines += 2 ))
+      done
+    fi
+    POST_HEADER_LINES=$_hdr_lines
+    UPDATE_BANNER_OFFSET=$_hdr_lines
   elif [[ "$hdr_mode" == "stats" ]]; then
-    refresh_strata_running
+    declare -F refresh_strata_running >/dev/null 2>&1 && refresh_strata_running
     build_sys_info_lines
     print_stats_and_info_grid false
     POST_HEADER_LINES=2
@@ -10604,7 +4407,7 @@ print_header() {
     POST_HEADER_LINES=$((POST_HEADER_LINES - 1))
     UPDATE_BANNER_OFFSET=$((UPDATE_BANNER_OFFSET - 1))
   fi
-  if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
+  if [[ "$STRATA_UPDATE_AVAILABLE" == true ]] && declare -F format_strata_update_banner >/dev/null 2>&1; then
     printf "%s\n" "$(format_strata_update_banner "$_rule_w")"
   else
     echo ""
@@ -10670,7 +4473,7 @@ _tui_start_live_stats_sampler() {
     while true; do
       sleep 1 &
       wait $! 2>/dev/null || exit 0
-      refresh_strata_running
+      declare -F refresh_strata_running >/dev/null 2>&1 && refresh_strata_running
       if print_stats_and_info_grid true > "${_tmp_ref}.tmp" 2>/dev/null; then
         format_compact_live_bar > "${_tmp_ref}.bar.tmp" 2>/dev/null || true
         mv -f "${_tmp_ref}.bar.tmp" "${_tmp_ref}.bar" 2>/dev/null || true
@@ -10733,7 +4536,7 @@ _tui_prepare_compact_bar() {
 _tui_poll_live_stats_tick() {
   local lines_up="$1" term_lines="$2" compact_bar="$3" tmp_file="$4" buf="$5"
   local prev_upd="$STRATA_UPDATE_AVAILABLE" new_lines stats_block
-  load_strata_update_state
+  declare -F load_strata_update_state >/dev/null 2>&1 && load_strata_update_state
   if [[ "$prev_upd" == false && "$STRATA_UPDATE_AVAILABLE" == true ]]; then
     local _b_up=$(( lines_up - LIVE_STATS_COUNT - UPDATE_BANNER_OFFSET ))
     if ! _render_update_banner_inplace "$_b_up" "$term_lines" && [[ -z "$buf" ]]; then
@@ -10970,6 +4773,36 @@ run_step_view() {
   done
 }
 
+render_any_index_row() {
+  local idx="$1" selected="${2:-false}"
+  local host_rows=0
+  [[ "$NO_PLUGINS" != true ]] && host_rows=${#AVAILABLE_HOST_PLUGINS[@]}
+  local top_rows=$(( 1 + host_rows ))
+  if (( idx == 0 )); then
+    format_stats_toggle_row "$selected"
+  elif (( idx >= 1 && idx < top_rows )); then
+    format_host_plugin_row "${AVAILABLE_HOST_PLUGINS[$((idx - 1))]}" "$selected"
+  else
+    format_index_row "$((idx - top_rows))" "$selected"
+  fi
+}
+
+index_row_up_offset() {
+  local idx="$1" n_opt="$2" _unused="$3" footer_menu_lines="$4" toggle_up="${5:-0}"
+  local host_rows=0
+  [[ "$NO_PLUGINS" != true ]] && host_rows=${#AVAILABLE_HOST_PLUGINS[@]}
+  local top_rows=$(( 1 + host_rows ))
+  if (( idx == 0 )); then
+    echo "$toggle_up"
+  elif (( idx >= 1 && idx < top_rows )); then
+    echo $(( toggle_up - (2 * idx) ))
+  else
+    local o_idx=$(( idx - top_rows ))
+    local leg_lines=$(( INDEX_LEGEND_LINES > 0 ? INDEX_LEGEND_LINES + 1 : 0 ))
+    echo $(( (n_opt - o_idx) + leg_lines + footer_menu_lines ))
+  fi
+}
+
 read_choice_with_live_stats() {
   local -n _out_var="$1"
   local footer_lines="${2:-0}"
@@ -11017,7 +4850,9 @@ read_choice_with_live_stats() {
           continue
         fi
         local n_opt="${#ACTIVE_STEPS[@]}"
-        local total_rows=$(( 2 + n_opt ))
+        local host_rows=0
+        [[ "$NO_PLUGINS" != true ]] && host_rows=${#AVAILABLE_HOST_PLUGINS[@]}
+        local total_rows=$(( 1 + host_rows + n_opt ))
         if (( footer_lines > 0 && total_rows > 0 )); then
           local old_idx="$INDEX_SELECTED" new_idx="$INDEX_SELECTED"
           if [[ "$esc_seq" == "[A" || "$esc_seq" == "OA" ]]; then
@@ -11061,7 +4896,7 @@ read_choice_with_live_stats() {
         fi
       fi
     elif (( rc > 128 )); then
-      load_strata_update_state
+      declare -F load_strata_update_state >/dev/null 2>&1 && load_strata_update_state
       if [[ "$init_upd" == false && "$STRATA_UPDATE_AVAILABLE" == true ]]; then
         local _b_up=$(( toggle_up - UPDATE_BANNER_OFFSET ))
         if _render_update_banner_inplace "$_b_up" "$term_lines"; then
@@ -11084,67 +4919,6 @@ read_choice_with_live_stats() {
 }
 
 INDEX_SELECTED=0
-
-# Relative performance/utility rating per step on a 5-point scale (0 = no rating/stars, 1 = 1 star, 5 = 5 stars).
-declare -A STEP_GAIN_PTS=(
-  [nvidia_fabricmanager]=5
-  [gpu_unlock]=5
-  [amd_apu_memory]=5
-  [macos_wired_limit]=5
-  [amd_cwsr_disable]=4
-  [nvidia_mig_disable]=4
-  [nvidia_sm70_table]=4
-  [nvidia_pstate]=4
-  [gpu_groups]=4
-  [intel_compute_stack]=4
-  [lact_overclock]=4
-  [jetson_perf]=4
-  [macos_power_mode]=4
-  [macos_spotlight_exclude]=4
-  [macos_metal_tuning]=4
-  [nvidia_power_limit]=2
-  [nvidia_power_cap]=3
-  [pcie_acs_disable]=3
-  [amd_instinct_partition]=3
-  [amd_gpu_perf]=4
-  [intel_gpu_perf]=4
-  [ryzenadj_tdp]=4
-  [nvidia_ecc]=4
-  [nvidia_compute_mode]=3
-  [headless_target]=4
-  [numactl_interleave]=3
-  [amd_x3d_mode]=4
-  [intel_rapl]=4
-  [msi_cooling]=4
-  [lenovo_legion]=4
-  [jetson_fan]=3
-  [asus_perf]=3
-  [dell_thermal]=3
-  [system76_perf]=3
-  [tuxedo_perf]=3
-  [apple_smc_cooling]=3
-  [acpi_platform_profile]=3
-  [intel_pcore_pinning]=3
-  [zram_swap]=3
-  [numa_balancing]=2
-  [sysctl_tuning]=3
-  [memlock_realtime]=3
-  [nvme_tuning]=3
-  [nvidia_persistenced]=2
-  [nvidia_powerd]=2
-  [intel_thermald]=2
-  [iommu_pt]=2
-  [scx_scheduler]=2
-  [net_tuning]=2
-  [irq_balance]=2
-  [prevent_sleep]=1
-  [hugepages_1g]=1
-  [cpu_performance]=1
-  [cstate_limit]=1
-  [pcie_aspm]=1
-  [nvidia_clock_lock]=1
-  [tuned_profile]=1
-)
 
 render_gain_stars() {
   local pts="${1:-0}"
@@ -11189,47 +4963,6 @@ format_index_row() {
   printf "%b %b  | %b | %b | %b | %b" "$ptr" "$row_num" "$badge" "$title_txt" "$gain_txt" "$note_txt"
 }
 
-format_strata_row() {
-  local s_idx="$1" selected="${2:-false}"
-  local opt="${ACTIVE_STRATA_OPTIONS[$s_idx]}"
-  local badge title_txt ptr row_tag
-  badge="$("badge_strata_${opt}")"
-  title_txt="$("title_strata_${opt}")"
-  if [[ "$selected" == true ]]; then
-    ptr="${C_CYAN}>${C_RESET}"
-    row_tag="${C_CYAN}${C_BOLD}s$((s_idx + 1))${C_RESET}"
-    title_txt="${C_CYAN}${C_BOLD}${title_txt}${C_RESET}"
-  else
-    ptr=" "
-    row_tag="s$((s_idx + 1))"
-  fi
-  printf "%b %b  | %b | %b" "$ptr" "$row_tag" "$badge" "$title_txt"
-}
-
-render_any_index_row() {
-  local idx="$1" selected="${2:-false}"
-  if (( idx == 0 )); then
-    format_stats_toggle_row "$selected"
-  elif (( idx == 1 )); then
-    format_strata_toggle_row "$selected"
-  else
-    format_index_row "$((idx - 2))" "$selected"
-  fi
-}
-
-index_row_up_offset() {
-  local idx="$1" n_opt="$2" n_str="$3" footer_menu_lines="$4" toggle_up="${5:-0}"
-  if (( idx == 0 )); then
-    echo "$toggle_up"
-  elif (( idx == 1 )); then
-    echo $(( toggle_up - 2 ))
-  else
-    local o_idx=$(( idx - 2 ))
-    local leg_lines=$(( INDEX_LEGEND_LINES > 0 ? INDEX_LEGEND_LINES + 1 : 0 ))
-    echo $(( (n_opt - o_idx) + leg_lines + footer_menu_lines ))
-  fi
-}
-
 show_stats_page() {
   while true; do
     print_header stats
@@ -11245,7 +4978,7 @@ show_stats_page() {
       __esc__|""|b|B|i|I) return 0 ;;
       q|Q) exit 0 ;;
       u|U)
-        if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
+        if [[ "$STRATA_UPDATE_AVAILABLE" == true ]] && declare -F run_strata_option >/dev/null 2>&1; then
           run_strata_option "update" true
         fi
         ;;
@@ -11256,266 +4989,15 @@ show_stats_page() {
 
 STRATA_PAGE_SELECTED=0
 
-read_strata_page_choice() {
-  local -n _out_var="$1"
-  local footer_lines="${2:-0}"
-  local n_str="${#ACTIVE_STRATA_OPTIONS[@]}"
-  if [[ ! -t 1 || ! -t 0 ]]; then
-    read -r -p "Select action: " _out_var || exit 0
-    return 0
-  fi
-
-  local term_lines=40
-  term_lines="$(tput lines 2>/dev/null || echo 40)"
-
-  local init_upd="$STRATA_UPDATE_AVAILABLE"
-  local cur_running_url="$STRATA_RUNNING_URL" cur_running_preset="$STRATA_RUNNING_PRESET" cur_svc_active="0"
-  unit_active strata.service && cur_svc_active="1"
-
-  local tmp_file="" poller_pid=""
-  tmp_file="$(mktemp /tmp/strata-page.XXXXXX 2>/dev/null || echo "")"
-  if [[ -n "$tmp_file" ]]; then
-    (
-      trap 'exit 0' TERM INT
-      while true; do
-        sleep 2 &
-        wait $! 2>/dev/null || exit 0
-        refresh_strata_running
-        local _svc="0"
-        unit_active strata.service && _svc="1"
-        printf '%s|%s|%s\n' "$STRATA_RUNNING_URL" "$STRATA_RUNNING_PRESET" "$_svc" > "${tmp_file}.tmp" 2>/dev/null || true
-        mv -f "${tmp_file}.tmp" "$tmp_file" 2>/dev/null || true
-      done
-    ) &
-    poller_pid=$!
-    ACTIVE_SAMPLER_PID="$poller_pid"
-    ACTIVE_SAMPLER_TMP="$tmp_file"
-  fi
-
-  local saved_tty=""
-  saved_tty="$(stty -g 2>/dev/null || true)"
-  stty -echo 2>/dev/null || true
-
-  _cleanup_strata_tty() {
-    _tui_stop_live_stats_sampler "$poller_pid" "$tmp_file"
-    poller_pid="" tmp_file=""
-    _tui_restore_tty "$saved_tty"
-  }
-  trap '_cleanup_strata_tty; exit 0' INT TERM
-
-  local buf="" ch="" rc=0
-  printf "Select action: "
-  while true; do
-    rc=0
-    IFS= read -rsn1 -t 1 ch || rc=$?
-    if (( rc == 0 )); then
-      if [[ -z "$ch" ]]; then
-        _cleanup_strata_tty
-        trap - INT TERM
-        printf "\n"
-        _out_var="$buf"
-        return 0
-      elif [[ "$ch" == $'\177' || "$ch" == $'\b' ]]; then
-        if [[ -n "$buf" ]]; then
-          buf="${buf%?}"
-          printf "\b \b"
-        fi
-      elif [[ "$ch" == $'\e' ]]; then
-        local esc_seq=""
-        _tui_read_esc_seq esc_seq
-        if [[ -z "$esc_seq" ]]; then
-          if [[ -n "$buf" ]]; then
-            while [[ -n "$buf" ]]; do
-              buf="${buf%?}"
-              printf "\b \b"
-            done
-            continue
-          fi
-          _cleanup_strata_tty
-          trap - INT TERM
-          printf "\n"
-          _out_var="__esc__"
-          return 0
-        fi
-        if (( footer_lines > 0 && n_str > 0 )); then
-          local old_idx="$STRATA_PAGE_SELECTED" new_idx="$STRATA_PAGE_SELECTED"
-          if [[ "$esc_seq" == "[A" || "$esc_seq" == "OA" ]]; then
-            new_idx=$(( (old_idx - 1 + n_str) % n_str ))
-          elif [[ "$esc_seq" == "[B" || "$esc_seq" == "OB" ]]; then
-            new_idx=$(( (old_idx + 1) % n_str ))
-          fi
-          if (( new_idx != old_idx )); then
-            STRATA_PAGE_SELECTED="$new_idx"
-            local old_up=$(( (n_str - old_idx) + footer_lines ))
-            local new_up=$(( (n_str - new_idx) + footer_lines ))
-            if (( old_up < term_lines && new_up < term_lines )); then
-              local old_row new_row
-              old_row="$(format_strata_row "$old_idx" false)"
-              new_row="$(format_strata_row "$new_idx" true)"
-              printf "\033[?2026h\033[?25l\033[s\033[%dA\r\033[2K%s\033[u\033[s\033[%dA\r\033[2K%s\033[u\033[?25h\033[?2026l" \
-                "$old_up" "$old_row" "$new_up" "$new_row"
-            else
-              _cleanup_strata_tty
-              trap - INT TERM
-              printf "\n"
-              _out_var="__refresh__"
-              return 0
-            fi
-          fi
-        fi
-      else
-        local accept=false
-        if [[ -z "$buf" ]]; then
-          if [[ "$ch" =~ ^[uUhHiIbBqQsS]$ ]] || { [[ "$ch" =~ ^[1-9]$ ]] && (( 10#$ch <= n_str )); }; then
-            accept=true
-          fi
-        elif [[ "$buf" =~ ^[sS]$ ]]; then
-          if [[ "$ch" =~ ^[1-9]$ ]] && (( 10#$ch <= n_str )); then
-            accept=true
-          fi
-        fi
-        if [[ "$accept" == true ]]; then
-          buf+="$ch"
-          printf "%s" "$ch"
-        fi
-      fi
-    elif (( rc > 128 )); then
-      load_strata_update_state
-      if [[ "$init_upd" == false && "$STRATA_UPDATE_AVAILABLE" == true ]] && [[ -z "$buf" ]]; then
-        _cleanup_strata_tty
-        trap - INT TERM
-        printf "\n"
-        _out_var="__refresh__"
-        return 0
-      fi
-      if [[ -n "$tmp_file" && -s "$tmp_file" ]]; then
-        local new_running_url="$cur_running_url" new_running_preset="$cur_running_preset" new_svc_active="$cur_svc_active"
-        IFS='|' read -r new_running_url new_running_preset new_svc_active < "$tmp_file" || true
-        if [[ "$new_running_url" != "$cur_running_url" || "$new_running_preset" != "$cur_running_preset" || "$new_svc_active" != "$cur_svc_active" ]]; then
-          cur_running_url="$new_running_url"
-          cur_running_preset="$new_running_preset"
-          cur_svc_active="$new_svc_active"
-          STRATA_RUNNING_URL="$new_running_url"
-          STRATA_RUNNING_PRESET="$new_running_preset"
-          local s_i row_up row_str is_sel
-          for (( s_i = 0; s_i < n_str; s_i++ )); do
-            if [[ "${ACTIVE_STRATA_OPTIONS[$s_i]}" == "service" || "${ACTIVE_STRATA_OPTIONS[$s_i]}" == "benchmark" ]]; then
-              row_up=$(( (n_str - s_i) + footer_lines ))
-              if (( row_up > 0 && row_up < term_lines )); then
-                is_sel=false
-                (( s_i == STRATA_PAGE_SELECTED )) && is_sel=true
-                row_str="$(format_strata_row "$s_i" "$is_sel")"
-                printf "\033[?2026h\033[?25l\033[s\033[%dA\r\033[2K%s\033[u\033[?25h\033[?2026l" "$row_up" "$row_str"
-              fi
-            fi
-          done
-        fi
-      fi
-    else
-      _cleanup_strata_tty
-      trap - INT TERM
-      printf "\n"
-      exit 0
-    fi
-  done
-}
-
-show_strata_options_page() {
-  while true; do
-    refresh_strata_bin
-    refresh_strata_running
-    build_strata_options
-    local n_str="${#ACTIVE_STRATA_OPTIONS[@]}"
-    if (( n_str == 0 )); then
-      STRATA_PAGE_SELECTED=0
-    elif (( STRATA_PAGE_SELECTED >= n_str )); then
-      STRATA_PAGE_SELECTED=$(( n_str - 1 ))
-    elif (( STRATA_PAGE_SELECTED < 0 )); then
-      STRATA_PAGE_SELECTED=0
-    fi
-    print_header
-
-    collect_strata_bench_lines
-    local body="" _sl
-    for _sl in "${STRATA_BENCH_LINES[@]}"; do
-      body+="${_sl}"$'\n'
-    done
-    if (( ${#STRATA_BENCH_LINES[@]} > 0 )) && [[ -n "${STRATA_BENCH_LINES[-1]}" ]]; then
-      body+=$'\n'
-    fi
-    body+="$(echo -e "${C_BOLD}Strata Options:${C_RESET}")"$'\n\n'
-    body+="$(printf "  ${C_BOLD}%-3s | %-15s | %s${C_RESET}" "#" "Status" "Option")"$'\n'
-    body+="$(printf "  %s" "----+-----------------+-------------------------------------------------------")"$'\n'
-    local s_idx
-    for (( s_idx = 0; s_idx < n_str; s_idx++ )); do
-      if (( s_idx == STRATA_PAGE_SELECTED )); then
-        body+="$(format_strata_row "$s_idx" true)"$'\n'
-      else
-        body+="$(format_strata_row "$s_idx" false)"$'\n'
-      fi
-    done
-
-    local footer_lines=5 hist_count s_range="s1" num_range="1"
-    (( n_str > 1 )) && { s_range="s1-${n_str}"; num_range="1-${n_str}"; }
-    hist_count="$(count_bench_history)"
-    body+=$'\n'"$(echo -e "  ${C_BOLD}[${s_range} / ${num_range} / ↑↓+Enter]${C_RESET} Select an option")"$'\n'
-    if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
-      body+="$(echo -e "  ${C_BGREEN}[u]${C_RESET} Install Strata update (${STRATA_UPDATE_SUMMARY})")"$'\n'
-      ((footer_lines++))
-    fi
-    if (( hist_count > 0 )); then
-      body+="$(echo -e "  ${C_CYAN}[h]${C_RESET} Benchmark history & restore coupled options (${hist_count})")"$'\n'
-      ((footer_lines++))
-    fi
-    body+="$(echo -e "  ${C_DIM}[i / b / Esc]${C_RESET} Back to Index")"$'\n'
-    body+="$(echo -e "  ${C_BOLD}[q]${C_RESET} Quit")"$'\n\n'
-
-    printf "%s" "$body"
-    local choice=""
-    read_strata_page_choice choice "$footer_lines"
-    case "$choice" in
-      __refresh__) ;;
-      __esc__|i|I|b|B) return 0 ;;
-      "")
-        (( STRATA_PAGE_SELECTED >= 0 && STRATA_PAGE_SELECTED < n_str )) && run_strata_option "${ACTIVE_STRATA_OPTIONS[$STRATA_PAGE_SELECTED]}"
-        ;;
-      u|U)
-        if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
-          run_strata_option "update" true
-        else
-          echo -e "${C_YELLOW}No Strata update available.${C_RESET}"; sleep 1
-        fi
-        ;;
-      h|H) show_benchmark_history ;;
-      q|Q) exit 0 ;;
-      s[1-9]|S[1-9])
-        local sn=$(( 10#${choice:1} - 1 ))
-        if (( sn >= 0 && sn < n_str )); then
-          run_strata_option "${ACTIVE_STRATA_OPTIONS[$sn]}"
-        else
-          echo -e "${C_RED}Invalid choice '${choice}'. Cancelled.${C_RESET}"; sleep 1
-        fi
-        ;;
-      [1-9])
-        local sn=$(( 10#$choice - 1 ))
-        if (( sn >= 0 && sn < n_str )); then
-          run_strata_option "${ACTIVE_STRATA_OPTIONS[$sn]}"
-        else
-          echo -e "${C_RED}Invalid choice '${choice}'. Cancelled.${C_RESET}"; sleep 1
-        fi
-        ;;
-      *)
-        echo -e "${C_RED}Invalid choice '${choice}'. Cancelled.${C_RESET}"; sleep 1
-        ;;
-    esac
-  done
-}
-
 show_index() {
+  discover_host_plugins
   while true; do
-    refresh_strata_bin
+    declare -F refresh_strata_bin >/dev/null 2>&1 && refresh_strata_bin
     build_active_steps
-    local total_rows=$(( 2 + ${#ACTIVE_STEPS[@]} ))
+    local host_rows=0
+    [[ "$NO_PLUGINS" != true ]] && host_rows=${#AVAILABLE_HOST_PLUGINS[@]}
+    local top_rows=$(( 1 + host_rows ))
+    local total_rows=$(( top_rows + ${#ACTIVE_STEPS[@]} ))
     if (( total_rows == 0 )); then
       INDEX_SELECTED=0
     elif (( INDEX_SELECTED >= total_rows )); then
@@ -11526,7 +5008,7 @@ show_index() {
     print_header toggle
 
     local body="" hw_warns=""
-    hw_warns="$(format_strata_hw_warnings)"
+    hw_warns="$(run_host_hook hw_warnings)"
     if [[ -n "$hw_warns" ]]; then
       body+="${hw_warns}"$'\n'
       body+="$(echo -e "${C_DIM}          You can still apply any host optimizations applicable to this machine below.${C_RESET}")"$'\n\n'
@@ -11537,7 +5019,7 @@ show_index() {
     body+="$(printf "  %s" "----+---------------+----------------------------------------------------------------------------+-----------+-----")"$'\n'
     local idx
     for (( idx = 0; idx < ${#ACTIVE_STEPS[@]}; idx++ )); do
-      if (( idx + 2 == INDEX_SELECTED )); then
+      if (( idx + top_rows == INDEX_SELECTED )); then
         body+="$(format_index_row "$idx" true)"$'\n'
       else
         body+="$(format_index_row "$idx" false)"$'\n'
@@ -11580,8 +5062,8 @@ show_index() {
       fi
     fi
 
-    local footer_lines=9 hist_count
-    hist_count="$(count_bench_history)"
+    local footer_lines=9 hist_count=0
+    declare -F count_bench_history >/dev/null 2>&1 && hist_count="$(count_bench_history)"
     body+=$'\n'"$(echo -e "  ${C_BOLD}[w]${C_RESET} Start guided wizard from Step 1")"$'\n'
     body+="$(echo -e "  ${C_CYAN}[c]${C_RESET} Check / detection summary (read-only)")"$'\n'
     if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
@@ -11625,21 +5107,41 @@ show_index() {
       "")
         if (( INDEX_SELECTED == 0 )); then
           show_stats_page
-        elif (( INDEX_SELECTED == 1 )); then
-          show_strata_options_page
+        elif (( INDEX_SELECTED >= 1 && INDEX_SELECTED < top_rows )); then
+          local _sel_pid="${AVAILABLE_HOST_PLUGINS[$(( INDEX_SELECTED - 1 ))]}"
+          if [[ -z "${HOST_PLUGIN_LOADED[$_sel_pid]:-}" ]]; then
+            echo -e "\n${C_CYAN}Loading ${_sel_pid} plugin...${C_RESET}"
+            if ! load_plugin hosts "$_sel_pid"; then
+              echo -e "${C_RED}Failed to load plugin '${_sel_pid}'.${C_RESET}"
+              sleep 2
+              continue
+            fi
+          fi
+          if declare -F "${_sel_pid}_open" >/dev/null 2>&1; then
+            "${_sel_pid}_open"
+          else
+            echo -e "${C_RED}Plugin '${_sel_pid}' does not define ${_sel_pid}_open.${C_RESET}"
+            sleep 2
+          fi
         else
-          run_step_view $(( INDEX_SELECTED - 2 )) "single"
+          run_step_view $(( INDEX_SELECTED - top_rows )) "single"
         fi
         ;;
       c|C) show_check_page ;;
       u|U)
-        if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
+        if [[ "$STRATA_UPDATE_AVAILABLE" == true ]] && declare -F run_strata_option >/dev/null 2>&1; then
           run_strata_option "update" true
         else
           echo -e "${C_YELLOW}No Strata update available.${C_RESET}"; sleep 1
         fi
         ;;
-      h|H) show_benchmark_history ;;
+      h|H)
+        if declare -F show_benchmark_history >/dev/null 2>&1; then
+          show_benchmark_history
+        else
+          echo -e "${C_YELLOW}Load the Strata plugin first to view benchmark history.${C_RESET}"; sleep 1
+        fi
+        ;;
       w|W) run_step_view 0 "wizard" ;;
       a|A) run_recommended_batch "apply" ;;
       l|L)
@@ -11667,7 +5169,7 @@ show_index() {
 }
 
 cleanup_all_on_exit() {
-  stop_strata_update_poller
+  run_host_hook cleanup
   stop_bench_power_sampler
   [[ -n "$BENCH_POWER_TMP_FILE" ]] && rm -f "$BENCH_POWER_TMP_FILE" 2>/dev/null || true
   if [[ -n "$ACTIVE_SAMPLER_PID" ]]; then
@@ -11690,21 +5192,26 @@ usage() {
 Usage: $(basename "$0") [OPTIONS]
 
 Interactive TUI wizard to inspect, apply, and revert host-level performance
-optimizations for running Strata LLM inference.
+optimizations for LLM inference, with lazy-loaded host & hardware plugins.
 
 Options:
-  --check                 Run hardware, OS, Strata, and step-applicability
-                          detection in read-only mode, print a summary, and exit
-                          without modifying the system or prompting for sudo.
+  --check                 Run hardware, OS, and step-applicability detection in
+                          read-only mode, print a summary, and exit without
+                          modifying the system or prompting for sudo.
+  --plugin, --with LIST   Pre-load one or more comma-separated LLM host plugins
+                          on startup (e.g. --plugin strata).
+  --no-plugins            Run in pure host-tuning mode without loading plugins.
+  --list-plugins          List available host and tweak plugins and exit.
+  --download-plugins      Pre-download all plugins from the registry into cache
+                          for offline use and exit.
   --strata-api-key KEY    API key used for all requests to Strata (live /metrics
                           polling, 'strata bench run' benchmarking, and Strata
-                          CLI calls); overrides the STRATA_API_KEY environment
-                          variable if set.
+                          CLI calls); overrides STRATA_API_KEY if set.
   -h, --help              Show this help message and exit.
 
 Environment:
-  STRATA_API_KEY          Fallback API key used for all Strata requests when
-                          --strata-api-key is not provided.
+  STRATA_API_KEY          Fallback API key used for Strata requests.
+  STRATA_PLUGIN_BASE_URL  Override base URL for remote plugin downloads.
 EOF
 }
 
@@ -11757,17 +5264,6 @@ print_check_summary() {
     tag_str=" (${_tag_joined:2})"
   fi
 
-  local strata_desc="not detected"
-  if [[ -n "$STRATA_BIN" ]]; then
-    strata_desc="installed (${STRATA_VERSION:-unknown} at ${STRATA_BIN})"
-  elif [[ -n "$STRATA_DOCKER_CONTAINER" ]]; then
-    local memlock_st="not set (pass --ulimit memlock=-1:-1)"
-    status_memlock_realtime && memlock_st="unlimited (-1:-1)"
-    local img_part=""
-    [[ -n "$STRATA_DOCKER_IMAGE" ]] && img_part=", image: ${STRATA_DOCKER_IMAGE}"
-    strata_desc="Docker container (${STRATA_DOCKER_CONTAINER}${img_part}, memlock: ${memlock_st})"
-  fi
-
   echo -e "${C_BOLD}System:${C_RESET}"
   echo "  OS:       ${OS_PRETTY:-Unknown} (family: ${DISTRO_FAMILY}, kernel: ${KERNEL_VER:-unknown})"
   echo "  Init:     ${init_desc}${tag_str}"
@@ -11813,7 +5309,7 @@ print_check_summary() {
       if amd_gfx_has_prebuilt "$_ag"; then
         _ast="official prebuilt Strata engine"
       elif amd_gfx_is_missing_target "$_ag"; then
-        if _amd_gfx_covered_by_local_hip "$_ag"; then
+        if declare -F _amd_gfx_covered_by_local_hip >/dev/null 2>&1 && _amd_gfx_covered_by_local_hip "$_ag"; then
           _ast="local Strata HIP engine installed"
         else
           _ast="no prebuilt Strata Linux engine — build locally via [STRATA]"
@@ -11829,9 +5325,15 @@ print_check_summary() {
   for _hl in "${RAM_HEALTH_LINES[@]}" "${GPU_TOPO_LINES[@]}"; do
     [[ -n "$_hl" ]] && printf "  %s\n" "$_hl"
   done
-  echo "  Strata:   ${strata_desc}"
+  if (( ${#LOADED_HOST_PLUGINS[@]} > 0 )); then
+    run_host_hook check_summary
+  elif [[ "$NO_PLUGINS" == true ]]; then
+    echo "  Plugins:  disabled (--no-plugins)"
+  else
+    echo "  Plugins:  none pre-loaded (lazy-loaded on demand, or pass --plugin strata)"
+  fi
   local _hw_warns _hw_line
-  _hw_warns="$(format_strata_hw_warnings)"
+  _hw_warns="$(run_host_hook hw_warnings)"
   if [[ -n "$_hw_warns" ]]; then
     while IFS= read -r _hw_line; do
       [[ -n "$_hw_line" ]] && echo "  ${_hw_line}"
@@ -11887,7 +5389,9 @@ run_check_mode() {
 
 show_check_page() {
   while true; do
+  if declare -F refresh_strata_bin >/dev/null 2>&1; then
     refresh_strata_bin
+  fi
     print_header
     local body=""
     body+="$(echo -e "${C_BOLD}Read-Only Detection & Applicability Summary${C_RESET}")"$'\n\n'
@@ -11903,7 +5407,7 @@ show_check_page() {
       __esc__|""|b|B|i|I) return 0 ;;
       q|Q) exit 0 ;;
       u|U)
-        if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
+        if [[ "$STRATA_UPDATE_AVAILABLE" == true ]] && declare -F run_strata_option >/dev/null 2>&1; then
           run_strata_option "update" true
         fi
         ;;
@@ -11913,9 +5417,38 @@ show_check_page() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  LIST_PLUGINS=false
+  DOWNLOAD_PLUGINS=false
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --check) CHECK_ONLY=true ;;
+      --no-plugins) NO_PLUGINS=true ;;
+      --list-plugins) LIST_PLUGINS=true ;;
+      --download-plugins) DOWNLOAD_PLUGINS=true ;;
+      --plugin|--with)
+        if [[ $# -lt 2 || -z "${2:-}" ]]; then
+          echo "Error: $1 requires a plugin name." >&2
+          usage >&2
+          exit 2
+        fi
+        IFS=',' read -ra _p_list <<< "$2"
+        for _p_item in "${_p_list[@]}"; do
+          [[ -n "$_p_item" ]] && REQUESTED_HOST_PLUGINS+=("$_p_item")
+        done
+        shift
+        ;;
+      --plugin=*|--with=*)
+        _p_val="${1#*=}"
+        if [[ -z "$_p_val" ]]; then
+          echo "Error: ${1%%=*} requires a plugin name." >&2
+          usage >&2
+          exit 2
+        fi
+        IFS=',' read -ra _p_list <<< "$_p_val"
+        for _p_item in "${_p_list[@]}"; do
+          [[ -n "$_p_item" ]] && REQUESTED_HOST_PLUGINS+=("$_p_item")
+        done
+        ;;
       --strata-api-key)
         if [[ $# -lt 2 || -z "${2:-}" ]]; then
           echo "Error: --strata-api-key requires a non-empty value." >&2
@@ -11945,9 +5478,43 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     shift
   done
 
+  if [[ "$LIST_PLUGINS" == true ]]; then
+    discover_host_plugins
+    echo "Host plugins:"
+    for _pid in "${AVAILABLE_HOST_PLUGINS[@]}"; do
+      printf "  %-16s %s\n" "$_pid" "${HOST_PLUGIN_DESCS[$_pid]:-}"
+    done
+    _reg="$(_registry_file || true)"
+    if [[ -n "$_reg" && -f "$_reg" ]]; then
+      echo ""
+      echo "Tweak packs:"
+      awk -F'\t' '$1=="tweaks" {printf "  %-16s %s\n", $2, $4}' "$_reg"
+    fi
+    exit 0
+  fi
+
+  if [[ "$DOWNLOAD_PLUGINS" == true ]]; then
+    _reg="$(_registry_file || true)"
+    if [[ -z "$_reg" || ! -f "$_reg" ]]; then
+      echo "Error: could not locate or download plugins/registry.tsv." >&2
+      exit 1
+    fi
+    while IFS=$'\t' read -r _rcat _rid _rname _rdesc _rfile _rsha; do
+      [[ -n "$_rcat" && -n "$_rid" ]] || continue
+      echo "Caching ${_rcat}/${_rid}.sh..."
+      load_plugin "$_rcat" "$_rid" || exit 1
+    done < "$_reg"
+    echo "All plugins cached in ${PLUGIN_CACHE_DIR}."
+    exit 0
+  fi
+
   trap 'cleanup_all_on_exit' EXIT
   if [[ "$CHECK_ONLY" == true ]]; then
     detect_environment
+    load_applicable_tweak_packs
+    for _req_p in "${REQUESTED_HOST_PLUGINS[@]}"; do
+      load_plugin hosts "$_req_p" || exit 1
+    done
     run_check_mode
     exit 0
   fi
@@ -11963,6 +5530,9 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   detect_platform_basics
   ensure_script_tools
   detect_environment
-  start_strata_update_poller
+  load_applicable_tweak_packs
+  for _req_p in "${REQUESTED_HOST_PLUGINS[@]}"; do
+    load_plugin hosts "$_req_p" || true
+  done
   show_index
 fi
