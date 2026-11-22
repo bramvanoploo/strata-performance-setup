@@ -42,9 +42,19 @@ assert_not_contains() {
 TMP_DIR_UNUSED=""
 
 # 1. Syntax & CLI flags
-bash -n "$SCRIPT" && pass "bash -n syntax check" || fail "bash -n syntax check"
+bash -n "$SCRIPT" && pass "bash -n syntax check (core)" || fail "bash -n syntax check (core)"
+for pf in "${REPO_ROOT}/plugins/hosts/"*.sh "${REPO_ROOT}/plugins/tweaks/"*.sh; do
+  [[ -f "$pf" ]] || continue
+  bash -n "$pf" && pass "bash -n syntax check ($(basename "$(dirname "$pf")")/$(basename "$pf"))" || fail "bash -n syntax check ($(basename "$pf"))"
+done
+
 "$SCRIPT" --help >/dev/null && pass "--help exits 0" || fail "--help exits 0"
 "$SCRIPT" --check >/dev/null && pass "--check exits 0" || fail "--check exits 0"
+"$SCRIPT" --no-plugins --check >/dev/null && pass "--no-plugins --check exits 0" || fail "--no-plugins --check exits 0"
+"$SCRIPT" --plugin strata --check >/dev/null && pass "--plugin strata --check exits 0" || fail "--plugin strata --check exits 0"
+list_out="$("$SCRIPT" --list-plugins)"
+assert_contains "$list_out" "strata" "--list-plugins lists strata host plugin"
+assert_contains "$list_out" "linux-core" "--list-plugins lists linux-core tweak pack"
 
 rc=0; "$SCRIPT" --unknown-flag >/dev/null 2>&1 || rc=$?
 assert_eq "$rc" "2" "unknown CLI option exits 2"
@@ -52,14 +62,47 @@ assert_eq "$rc" "2" "unknown CLI option exits 2"
 rc=0; "$SCRIPT" --strata-api-key "" >/dev/null 2>&1 || rc=$?
 assert_eq "$rc" "2" "empty --strata-api-key exits 2"
 
+# Standalone cache & checksum-verified plugin load via file:// base URL
+if command -v curl >/dev/null 2>&1; then
+  standalone_dir="${TMP_DIR}/standalone"
+  mkdir -p "$standalone_dir" "${TMP_DIR}/pcache"
+  cp "$SCRIPT" "${standalone_dir}/strata-performance-setup.sh"
+  chmod +x "${standalone_dir}/strata-performance-setup.sh"
+  chk_out="$(STRATA_PLUGIN_BASE_URL="file://${REPO_ROOT}" STRATA_PLUGIN_CACHE_DIR="${TMP_DIR}/pcache" "${standalone_dir}/strata-performance-setup.sh" --plugin strata --check)"
+  assert_contains "$chk_out" "Strata:" "standalone script fetches & loads strata plugin via registry"
+  [[ -f "${TMP_DIR}/pcache/hosts/strata.sh" ]] && pass "standalone script caches fetched host plugin" || fail "standalone script caches fetched host plugin"
+fi
+
 # Source the script for unit tests (never runs main because BASH_SOURCE != $0)
 # shellcheck source=/dev/null
 source "$SCRIPT"
 
+# Core-only checks before plugins are loaded
+(
+  NO_PLUGINS=false
+  AVAILABLE_HOST_PLUGINS=("strata")
+  row0="$(render_any_index_row 0 true)"
+  row1="$(render_any_index_row 1 true)"
+  assert_contains "$row0" "[STATS]" "core render_any_index_row renders STATS without strata plugin"
+  assert_contains "$row1" "[STRATA]" "core render_any_index_row renders unloaded host plugin row"
+  assert_eq "$(index_row_up_offset 1 5 0 9 30)" "28" "core index_row_up_offset computes host row offset"
+
+  NO_PLUGINS=true
+  assert_eq "$(index_row_up_offset 1 5 0 9 30)" "16" "core index_row_up_offset skips host rows when NO_PLUGINS=true"
+
+  HAS_AMD=true AMD_GFX_ARCHS=(gfx1150) HAS_AMD_APU=false AMD_GTT_TOTAL_MB=0
+  HAS_NVIDIA=false HAS_INTEL_GPU=false IS_MACOS=false IS_DGX_SPARK=false
+  RAM_HEALTH_LINES=() GPU_TOPO_LINES=()
+  amd_chk="$(print_check_summary)"
+  assert_contains "$amd_chk" "AMD[gfx1150]" "print_check_summary handles missing-target AMD gfx without strata plugin"
+)
+
+load_all_local_plugins
+
 # Override run_root so tests run unprivileged without sudo
 run_root() { "$@"; }
 
-# 2. Step registry integrity
+# 2. Step & host plugin registry integrity
 reg_ok=true
 for s in "${ALL_STEPS[@]}"; do
   for fn in applicable title status explain apply revert; do
@@ -68,6 +111,14 @@ for s in "${ALL_STEPS[@]}"; do
   [[ -n "${STEP_GAIN_PTS[$s]:-}" ]] || { fail "missing STEP_GAIN_PTS[$s]"; reg_ok=false; }
 done
 [[ "$reg_ok" == true ]] && pass "all ${#ALL_STEPS[@]} steps have handlers and STEP_GAIN_PTS"
+
+host_ok=true
+for hp in "${LOADED_HOST_PLUGINS[@]}"; do
+  for fn in init menu_row open; do
+    declare -F "${hp}_${fn}" >/dev/null || { fail "missing ${hp}_${fn}"; host_ok=false; }
+  done
+done
+[[ "$host_ok" == true ]] && pass "all ${#LOADED_HOST_PLUGINS[@]} host plugins have required hooks"
 
 # 3. Non-systemd install_service preserves User, WorkingDirectory, LimitMEMLOCK
 (

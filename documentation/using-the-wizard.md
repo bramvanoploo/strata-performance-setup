@@ -1,8 +1,8 @@
 # Using the Wizard
 
-To inspect detected hardware, OS/init, Strata or Docker container status, and which steps would apply without launching the TUI or making changes, run `./strata-performance-setup.sh --check`. For API-key-protected Strata instances, pass `--strata-api-key <key>` (overrides `STRATA_API_KEY`) or export `STRATA_API_KEY` so live `/metrics` telemetry, `strata bench run` benchmarks, and Strata CLI requests authenticate automatically (see `--help` for CLI options).
+To inspect detected hardware, OS/init, or Docker container status, and which steps would apply without launching the TUI or making changes, run `./strata-performance-setup.sh --check` (or `./strata-performance-setup.sh --plugin strata --check` to include Strata status). For API-key-protected Strata instances, pass `--strata-api-key <key>` (overrides `STRATA_API_KEY`) or export `STRATA_API_KEY` so live `/metrics` telemetry, `strata bench run` benchmarks, and Strata CLI requests authenticate automatically (see `--help` for `--plugin`, `--no-plugins`, `--list-plugins`, and `--download-plugins`).
 
-Once launched, the main index lists `[STATS]` (live system & Strata metrics), `[STRATA]` (Strata options & benchmark summaries), and every optimization applicable to your machine along with its live `[APPLIED]` / `[NOT APPLIED]` status:
+Once launched, the main index lists `[STATS]` (live system metrics, plus host metrics once a host plugin is loaded), LLM host plugin rows such as `[STRATA]` (lazy-loaded on demand when you press `Enter`), and every optimization applicable to your machine along with its live `[APPLIED]` / `[NOT APPLIED]` status:
 
 - Navigate the index with **`↑` / `↓`** and press **`Enter`** (or type a **step number**) to open `[STATS]`, `[STRATA]`, or an optimization step, or press `w` to walk through the **guided wizard** step by step
 - Press `c` on the index to view the read-only **Check / detection summary** inside the TUI (same OS, hardware, Strata, and step-applicability summary as `--check`)

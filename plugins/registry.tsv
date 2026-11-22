@@ -1,0 +1,9 @@
+hosts	strata	Strata	Install, update, launch, and benchmark Strata LLM server	plugins/hosts/strata.sh	df4a56c2f5abdb03f134c8eadb11c45b46b471459f56d5c822bd73c36cdde5d8
+tweaks	amd	amd	AMD GPU/APU, Instinct, Ryzen TDP, and X3D tweaks	plugins/tweaks/amd.sh	1d93cd63c84e454be783b11b8120f91172b344f05c8cefbd71b0a1c6b569944c
+tweaks	common	common	Cross-platform host tweaks (Linux & macOS)	plugins/tweaks/common.sh	e43d914b60768f564a5d7be0b36f118f713220dd251c62061490b9e504e4cf47
+tweaks	intel	intel	Intel GPU, RAPL, thermald, and P-core pinning tweaks	plugins/tweaks/intel.sh	dae87d0c2abb10fd5b3e135ff6a4ad1fc23f23325daf03ca85e846adf939503e
+tweaks	jetson	jetson	NVIDIA Jetson nvpmodel and fan tweaks	plugins/tweaks/jetson.sh	346b950919f20ad07402a8e5291811713cac8b0b38ac7ea5418e0e2e3f984f2f
+tweaks	linux-core	linux-core	Core Linux kernel, memory, CPU, PCIe, and storage tweaks	plugins/tweaks/linux-core.sh	617487d8850c974e692f10ceaf95ec0a75095e3d07e51c23c02b124923a4f003
+tweaks	linux-laptop	linux-laptop	Linux laptop OEM thermal & fan profile tweaks	plugins/tweaks/linux-laptop.sh	da27e53be2a68595f6af05870b81d4d79e9e4b63f232a1e88f28b91af6557e4b
+tweaks	macos	macos	macOS Apple Silicon wired memory, power mode, Spotlight, and Metal tweaks	plugins/tweaks/macos.sh	b7302110be79924de85bcfc79a6d2e87274c52d0bc1cedd718eaea61ac247e81
+tweaks	nvidia	nvidia	NVIDIA GPU driver, power, clock, ECC, and datacenter tweaks	plugins/tweaks/nvidia.sh	d06d51ba4d1093397aa1bcfb96cad4e0e391d9d5fee3dcde702b90e44974e740
