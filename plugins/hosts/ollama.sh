@@ -98,7 +98,7 @@ _ollama_install_or_update() {
       run_as_user_exec brew install ollama
     fi
   elif [[ "$IS_MACOS" == false ]]; then
-    if [[ -z "$OLLAMA_BIN" ]] && pkg_available ollama 2>/dev/null; then
+    if [[ -z "$OLLAMA_BIN" ]] && pkg_available repo ollama 2>/dev/null; then
       pkg_install ollama || true
     else
       echo -e "${C_CYAN}Running official Ollama installer...${C_RESET}"

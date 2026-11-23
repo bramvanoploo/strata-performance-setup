@@ -81,12 +81,12 @@ _llamacpp_install_or_update() {
     else
       run_as_user_exec brew install llama.cpp
     fi
-  elif pkg_available llama.cpp 2>/dev/null; then
+  elif pkg_available repo llama.cpp 2>/dev/null; then
     pkg_install llama.cpp
-  elif command -v yay >/dev/null 2>&1 || command -v paru >/dev/null 2>&1; then
+  elif [[ "$DISTRO_FAMILY" == "arch" ]] && pkg_available aur llama.cpp 2>/dev/null; then
     aur_install llama.cpp
   else
-    echo -e "${C_YELLOW}No native package found. Install via Homebrew, your distro/AUR, or build from https://github.com/ggml-org/llama.cpp${C_RESET}"
+    echo -e "${C_YELLOW}No repo/AUR package 'llama.cpp' found${LLAMACPP_BIN:+ (binary at ${LLAMACPP_BIN})}. Update your local build or install from https://github.com/ggml-org/llama.cpp${C_RESET}"
     return 1
   fi
   _llamacpp_refresh
