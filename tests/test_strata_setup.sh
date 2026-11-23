@@ -71,6 +71,9 @@ if command -v curl >/dev/null 2>&1; then
   chk_out="$(STRATA_PLUGIN_BASE_URL="file://${REPO_ROOT}" STRATA_PLUGIN_CACHE_DIR="${TMP_DIR}/pcache" "${standalone_dir}/strata-performance-setup.sh" --plugin strata --check)"
   assert_contains "$chk_out" "Strata:" "standalone script fetches & loads strata plugin via registry"
   [[ -f "${TMP_DIR}/pcache/hosts/strata.sh" ]] && pass "standalone script caches fetched host plugin" || fail "standalone script caches fetched host plugin"
+  chk_ollama="$(STRATA_PLUGIN_BASE_URL="file://${REPO_ROOT}" STRATA_PLUGIN_CACHE_DIR="${TMP_DIR}/pcache" "${standalone_dir}/strata-performance-setup.sh" --plugin ollama --check)"
+  assert_contains "$chk_ollama" "Ollama:" "standalone script fetches & loads ollama plugin with _common.sh"
+  [[ -f "${TMP_DIR}/pcache/hosts/_common.sh" ]] && pass "standalone script caches hosts/_common.sh" || fail "standalone script caches hosts/_common.sh"
 fi
 
 # Source the script for unit tests (never runs main because BASH_SOURCE != $0)
@@ -84,7 +87,7 @@ source "$SCRIPT"
   row0="$(render_any_index_row 0 true)"
   row1="$(render_any_index_row 1 true)"
   assert_contains "$row0" "[STATS]" "core render_any_index_row renders STATS without strata plugin"
-  assert_contains "$row1" "[STRATA]" "core render_any_index_row renders unloaded host plugin row"
+  assert_contains "$row1" "[SERVERS]" "core render_any_index_row renders SERVERS link below STATS"
   assert_eq "$(index_row_up_offset 1 5 0 9 30)" "28" "core index_row_up_offset computes host row offset"
 
   NO_PLUGINS=true
@@ -407,6 +410,98 @@ EOF
   assert_contains "$w_low" "System RAM is 31 GiB (<= 31 GiB)" "warns when RAM <= 31 GiB"
   assert_contains "$w_low" "NVIDIA GPU VRAM is 5 GiB (<= 5 GiB)" "warns when VRAM <= 5 GiB"
 )
+
+# 13. Host plugin platform filtering (Linux vs Intel macOS vs Apple Silicon macOS)
+(
+  # Linux: ollama, llamacpp, localai, vllm, sglang shown; mlx-lm hidden
+  IS_MACOS=false IS_APPLE_SILICON=false
+  AVAILABLE_HOST_PLUGINS=("strata")
+  discover_host_plugins
+  linux_hosts="${AVAILABLE_HOST_PLUGINS[*]}"
+  assert_contains "$linux_hosts" "ollama" "Linux shows ollama host plugin"
+  assert_contains "$linux_hosts" "llamacpp" "Linux shows llamacpp host plugin"
+  assert_contains "$linux_hosts" "localai" "Linux shows localai host plugin"
+  assert_contains "$linux_hosts" "vllm" "Linux shows vllm host plugin"
+  assert_contains "$linux_hosts" "sglang" "Linux shows sglang host plugin"
+  assert_not_contains "$linux_hosts" "mlx-lm" "Linux hides mlx-lm host plugin"
+
+  # Intel macOS: ollama, llamacpp, localai shown; vllm, sglang, mlx-lm hidden
+  IS_MACOS=true IS_APPLE_SILICON=false
+  AVAILABLE_HOST_PLUGINS=("strata")
+  discover_host_plugins
+  intel_mac_hosts="${AVAILABLE_HOST_PLUGINS[*]}"
+  assert_contains "$intel_mac_hosts" "ollama" "Intel macOS shows ollama host plugin"
+  assert_not_contains "$intel_mac_hosts" "vllm" "Intel macOS hides vllm host plugin"
+  assert_not_contains "$intel_mac_hosts" "sglang" "Intel macOS hides sglang host plugin"
+  assert_not_contains "$intel_mac_hosts" "mlx-lm" "Intel macOS hides mlx-lm host plugin"
+
+  # Apple Silicon macOS: ollama, llamacpp, localai, mlx-lm shown; vllm, sglang hidden
+  IS_MACOS=true IS_APPLE_SILICON=true
+  AVAILABLE_HOST_PLUGINS=("strata")
+  discover_host_plugins
+  arm_mac_hosts="${AVAILABLE_HOST_PLUGINS[*]}"
+  assert_contains "$arm_mac_hosts" "mlx-lm" "Apple Silicon macOS shows mlx-lm host plugin"
+  assert_not_contains "$arm_mac_hosts" "vllm" "Apple Silicon macOS hides vllm host plugin"
+  assert_not_contains "$arm_mac_hosts" "sglang" "Apple Silicon macOS hides sglang host plugin"
+)
+
+# 14. Shared host plugin helpers (_common.sh) and --download-plugins
+(
+  _host_http_get() { echo '{"data":[{"id":"qwen3-8b"},{"id":"llama-3"}]}'; }
+  models_csv="$(_host_openai_models "http://127.0.0.1:8080")"
+  assert_eq "$models_csv" "qwen3-8b,llama-3" "_host_openai_models parses OpenAI /v1/models JSON"
+
+  quoted_arg="$(_host_shell_quote $'/tmp/my "model"\n$HOME')"
+  assert_eq "$quoted_arg" "'/tmp/my \"model\"\$HOME'" "_host_shell_quote strips newlines and single-quotes safely"
+
+  HAS_SYSTEMD=true CHECK_ONLY=false
+  unit_capture="${TMP_DIR}/captured.service"
+  run_root() {
+    if [[ "$1" == "tee" ]]; then
+      cat > "$unit_capture"
+    fi
+  }
+  refresh_unit_files_cache() { :; }
+  _host_install_systemd_unit "test-llm.service" "Test LLM" "/usr/bin/llm --model '/tmp/a b'"
+  unit_body="$(cat "$unit_capture")"
+  assert_contains "$unit_body" "ExecStart=/usr/bin/llm --model '/tmp/a b'" "_host_install_systemd_unit writes ExecStart"
+
+  AVAILABLE_HOST_PLUGINS=("ollama")
+  OLLAMA_BIN="" OLLAMA_DOCKER=""
+  srv_uninst="$(format_server_row 0 false)"
+  assert_contains "$srv_uninst" "[NOT INSTALLED]" "format_server_row shows NOT INSTALLED when absent"
+  OLLAMA_BIN="/usr/bin/ollama"
+  service_installed() { return 0; }
+  unit_active() { return 0; }
+  srv_inst="$(format_server_row 0 true)"
+  assert_contains "$srv_inst" "[INSTALLED]" "format_server_row shows INSTALLED when present"
+  assert_contains "$srv_inst" "active (service)" "format_server_row shows active service status"
+  assert_contains "$srv_inst" "✓" "format_server_row shows checkmarks for supported capabilities"
+  HOST_PLUGIN_CAPS[ollama]="install,stats"
+  srv_partial="$(format_server_row 0 false)"
+  assert_contains "$srv_partial" "-" "format_server_row shows - for unsupported capabilities"
+
+  opts_uninst="$(_host_build_options_list false)"
+  assert_eq "$opts_uninst" "install" "uninstalled server only shows install option"
+  opts_inst="$(_host_build_options_list true false)"
+  assert_eq "$opts_inst" "update service bench latest" "installed server hides install and shows update/service/bench/latest"
+  opts_docker="$(_host_build_options_list false true)"
+  assert_eq "$opts_docker" "bench latest" "Docker-only server shows bench and latest options"
+  opt_row="$(_host_option_row 0 "install" "Ollama" "ollama.service" "" false true)"
+  assert_contains "$opt_row" "Install Ollama" "_host_option_row formats install option"
+)
+
+if command -v curl >/dev/null 2>&1; then
+  dl_cache="${TMP_DIR}/dl_cache"
+  mkdir -p "$dl_cache"
+  standalone_dl="${TMP_DIR}/standalone/strata-performance-setup.sh"
+  if [[ -x "$standalone_dl" ]]; then
+    dl_out="$(STRATA_PLUGIN_BASE_URL="file://${REPO_ROOT}" STRATA_PLUGIN_CACHE_DIR="$dl_cache" "$standalone_dl" --download-plugins)"
+    assert_contains "$dl_out" "All plugins cached" "--download-plugins succeeds in standalone mode"
+    [[ -f "${dl_cache}/hosts/_common.sh" ]] && pass "--download-plugins caches hosts/_common.sh" || fail "--download-plugins caches hosts/_common.sh"
+    [[ -f "${dl_cache}/hosts/mlx-lm.sh" ]] && pass "--download-plugins caches hosts/mlx-lm.sh" || fail "--download-plugins caches hosts/mlx-lm.sh"
+  fi
+fi
 
 PASS="$(grep -c '^P$' "$RESULTS_FILE" || true)"
 FAIL="$(grep -c '^F$' "$RESULTS_FILE" || true)"

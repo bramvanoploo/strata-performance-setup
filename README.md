@@ -50,17 +50,17 @@ Inspect detected OS/init, hardware, Strata installation or Docker container, and
 ./strata-performance-setup.sh --check
 ```
 
-### Modular Plugin Modes
+### Modular Plugin Modes (Experimental)
 
-The core script works standalone via the one-liner above and lazy-loads plugins on demand (with SHA-256 verification against `plugins/registry.tsv` and local caching in `~/.cache/strata-performance-setup/plugins`):
+The core script works standalone via the one-liner above and lazy-loads plugins on demand (with SHA-256 verification against `plugins/registry.tsv` and local caching in `~/.cache/strata-performance-setup/plugins`). The plugin system and non-Strata inference server plugins are **experimental** — see [Supported Inference Servers](documentation/supported-inference-servers.md).
 
-- **System-tuning-only by default**: Host plugins (such as `[STRATA]`) are lazy-loaded only when selected on the Index page or passed via `--plugin`
-- **Pre-load an LLM host plugin**: `./strata-performance-setup.sh --plugin strata`
+- **System-tuning-only by default**: Host plugins (`strata`, `ollama`, `llamacpp`, `localai`, `vllm`, `sglang`, `mlx-lm`) are lazy-loaded only when selected on the Index page or passed via `--plugin`, and are automatically filtered by detected OS/hardware (e.g., `mlx-lm` is only shown on Apple Silicon macOS; `vllm` and `sglang` are only shown on Linux)
+- **Pre-load an LLM host plugin**: `./strata-performance-setup.sh --plugin strata` (or `ollama`, `llamacpp`, `localai`, `vllm`, `sglang`, `mlx-lm`)
 - **Disable all plugins** (including tweak packs): `./strata-performance-setup.sh --no-plugins`
 - **List available plugins**: `./strata-performance-setup.sh --list-plugins`
 - **Pre-cache all plugins for offline use**: `./strata-performance-setup.sh --download-plugins`
 
-Want to add support for another LLM host (e.g. Ollama, vLLM) or a new hardware tweak? See [Contributing Plugins](documentation/contributing-plugins.md).
+Want to contribute? You can now submit both **performance tweak plugins** (`plugins/tweaks/<pack>.sh`) and **inference server plugins** (`plugins/hosts/<id>.sh`) via the modular plugin system—see [Contributing Plugins](documentation/contributing-plugins.md) for the template, helpers, and registry workflow.
 
 > **API-key-protected Strata instances:** Pass `--strata-api-key <key>` (overrides `STRATA_API_KEY` in the environment) or export `STRATA_API_KEY` so live `/metrics` telemetry polling, `strata bench run` benchmarks, and Strata CLI calls authenticate against your running instance.
 
@@ -70,6 +70,7 @@ Want to add support for another LLM host (e.g. Ollama, vLLM) or a new hardware t
 
 - [Supported Platforms & Distributions](documentation/supported-distributions.md) — Supported Linux families, macOS (Apple Silicon), package managers, and bootloaders
 - [Supported Hardware](documentation/supported-hardware.md) — GPU (including Apple Silicon Metal & AMD `gfx` / local HIP builds), laptop/OEM (including Apple `applesmc`), and system-wide optimizations
+- [Supported Inference Servers](documentation/supported-inference-servers.md) — Inference server plugins (experimental) and platform/capability matrix
 - [Live Dashboard & Strata Monitoring](documentation/live-dashboard-and-strata-monitoring.md) — Real-time system metrics, Strata status, and update polling
 - [Using the Wizard](documentation/using-the-wizard.md) — Navigation, shortcuts, and benchmark configuration restore
 - [Contributing Plugins](documentation/contributing-plugins.md) — Adding LLM host plugins and performance tweak packs

@@ -1,9 +1,16 @@
-hosts	strata	Strata	Install, update, launch, and benchmark Strata LLM server	plugins/hosts/strata.sh	df4a56c2f5abdb03f134c8eadb11c45b46b471459f56d5c822bd73c36cdde5d8
-tweaks	amd	amd	AMD GPU/APU, Instinct, Ryzen TDP, and X3D tweaks	plugins/tweaks/amd.sh	1d93cd63c84e454be783b11b8120f91172b344f05c8cefbd71b0a1c6b569944c
-tweaks	common	common	Cross-platform host tweaks (Linux & macOS)	plugins/tweaks/common.sh	e43d914b60768f564a5d7be0b36f118f713220dd251c62061490b9e504e4cf47
-tweaks	intel	intel	Intel GPU, RAPL, thermald, and P-core pinning tweaks	plugins/tweaks/intel.sh	dae87d0c2abb10fd5b3e135ff6a4ad1fc23f23325daf03ca85e846adf939503e
-tweaks	jetson	jetson	NVIDIA Jetson nvpmodel and fan tweaks	plugins/tweaks/jetson.sh	346b950919f20ad07402a8e5291811713cac8b0b38ac7ea5418e0e2e3f984f2f
-tweaks	linux-core	linux-core	Core Linux kernel, memory, CPU, PCIe, and storage tweaks	plugins/tweaks/linux-core.sh	617487d8850c974e692f10ceaf95ec0a75095e3d07e51c23c02b124923a4f003
-tweaks	linux-laptop	linux-laptop	Linux laptop OEM thermal & fan profile tweaks	plugins/tweaks/linux-laptop.sh	da27e53be2a68595f6af05870b81d4d79e9e4b63f232a1e88f28b91af6557e4b
-tweaks	macos	macos	macOS Apple Silicon wired memory, power mode, Spotlight, and Metal tweaks	plugins/tweaks/macos.sh	b7302110be79924de85bcfc79a6d2e87274c52d0bc1cedd718eaea61ac247e81
-tweaks	nvidia	nvidia	NVIDIA GPU driver, power, clock, ECC, and datacenter tweaks	plugins/tweaks/nvidia.sh	d06d51ba4d1093397aa1bcfb96cad4e0e391d9d5fee3dcde702b90e44974e740
+hosts	_common	_common		plugins/hosts/_common.sh	9d080ecc251801ec8b0925aa5baff98ef554e0041db078876dedb7a3f624ab14	all
+hosts	llamacpp	llama.cpp	Install, update, manage service, and benchmark llama.cpp (llama-server)	plugins/hosts/llamacpp.sh	e636e2148a6e6f27840bcc57e88ba4255b05222d30f2bd774ce02985d86050d3	all
+hosts	localai	LocalAI	Install, update, manage service, and benchmark LocalAI server	plugins/hosts/localai.sh	75291a0062e2b1f306efea86eb390fa23fe865bc988341aaba51e2b513aa6230	all
+hosts	mlx-lm	MLX LM	Install, update, manage service, and benchmark MLX LM on Apple Silicon	plugins/hosts/mlx-lm.sh	6d86ae21b4fd2d7c5d9bc892d14a4addbd3544c3308a82d07fee8ab78620370d	macos-arm64
+hosts	ollama	Ollama	Install, update, manage service, and benchmark Ollama LLM server	plugins/hosts/ollama.sh	8ce98822bce5616b66c475e36f080c86c85d9627aa40be9bc0d7fbb42491ccd4	all
+hosts	sglang	SGLang	Install, update, manage service, and benchmark SGLang inference server	plugins/hosts/sglang.sh	5aa4887087563248a27c6f2df4690dee85581294f4f4a861fd72c15ee5f6051e	linux
+hosts	strata	Strata	Install, update, launch, and benchmark Strata LLM server	plugins/hosts/strata.sh	2dda0b891725f77b3375f52d4c334de128fd006d07b22df2e096892f843d2f78	all
+hosts	vllm	vLLM	Install, update, manage service, and benchmark vLLM inference server	plugins/hosts/vllm.sh	1e515f676e74cf5d2fa4887c25b61cc2fe08b8dc5ccc7e3e317538e3e8d237a5	linux
+tweaks	amd	amd	AMD GPU/APU, Instinct, Ryzen TDP, and X3D tweaks	plugins/tweaks/amd.sh	1d93cd63c84e454be783b11b8120f91172b344f05c8cefbd71b0a1c6b569944c	all
+tweaks	common	common	Cross-platform host tweaks (Linux & macOS)	plugins/tweaks/common.sh	e43d914b60768f564a5d7be0b36f118f713220dd251c62061490b9e504e4cf47	all
+tweaks	intel	intel	Intel GPU, RAPL, thermald, and P-core pinning tweaks	plugins/tweaks/intel.sh	dae87d0c2abb10fd5b3e135ff6a4ad1fc23f23325daf03ca85e846adf939503e	all
+tweaks	jetson	jetson	NVIDIA Jetson nvpmodel and fan tweaks	plugins/tweaks/jetson.sh	346b950919f20ad07402a8e5291811713cac8b0b38ac7ea5418e0e2e3f984f2f	all
+tweaks	linux-core	linux-core	Core Linux kernel, memory, CPU, PCIe, and storage tweaks	plugins/tweaks/linux-core.sh	617487d8850c974e692f10ceaf95ec0a75095e3d07e51c23c02b124923a4f003	all
+tweaks	linux-laptop	linux-laptop	Linux laptop OEM thermal & fan profile tweaks	plugins/tweaks/linux-laptop.sh	da27e53be2a68595f6af05870b81d4d79e9e4b63f232a1e88f28b91af6557e4b	all
+tweaks	macos	macos	macOS Apple Silicon wired memory, power mode, Spotlight, and Metal tweaks	plugins/tweaks/macos.sh	b7302110be79924de85bcfc79a6d2e87274c52d0bc1cedd718eaea61ac247e81	all
+tweaks	nvidia	nvidia	NVIDIA GPU driver, power, clock, ECC, and datacenter tweaks	plugins/tweaks/nvidia.sh	531273a0909e2f9b805b3971ff259b76fcb7f47cc3b32c6893f9d90b23fef0c7	all

@@ -28,6 +28,29 @@ strata_live_stats() {
   collect_strata_stats_lines
 }
 
+strata_table_status() {
+  local inst=false svc="not installed"
+  if [[ -n "$STRATA_BIN" || -n "$STRATA_DOCKER_CONTAINER" ]]; then
+    inst=true
+    if [[ -n "$STRATA_DOCKER_CONTAINER" && -z "$STRATA_BIN" ]]; then
+      svc="${C_GREEN}running (docker)${C_RESET}"
+    elif strata_service_installed; then
+      if unit_active strata.service; then
+        svc="${C_GREEN}active (service)${C_RESET}"
+      elif [[ -n "$STRATA_RUNNING_PRESET" ]]; then
+        svc="${C_YELLOW}running (manual)${C_RESET}"
+      else
+        svc="${C_YELLOW}inactive (service)${C_RESET}"
+      fi
+    elif [[ -n "$STRATA_RUNNING_PRESET" ]]; then
+      svc="${C_GREEN}running (manual)${C_RESET}"
+    else
+      svc="${C_DIM}no service${C_RESET}"
+    fi
+  fi
+  printf "%s|%s" "$inst" "$svc"
+}
+
 strata_bench_stats() {
   collect_strata_bench_lines
 }
@@ -1600,6 +1623,14 @@ badge_strata_build_hip() {
   fi
 }
 
+_strata_run_installer() {
+  command -v curl >/dev/null 2>&1 || prompt_install_deps repo curl || return 1
+  run_as_user_exec sh -c 'curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh | sh'
+  refresh_strata_bin
+  [[ -n "$STRATA_BIN" && -z "$STRATA_POLLER_PID" ]] && start_strata_update_poller
+  return 0
+}
+
 strata_action_install() {
   refresh_strata_bin
   if [[ -n "$STRATA_BIN" ]]; then
@@ -1613,10 +1644,7 @@ strata_action_install() {
     printf "%s\n\n" "$hw_warns"
   fi
   if confirm_yn "Install Strata now? [Y/n]: " "Y"; then
-    command -v curl >/dev/null 2>&1 || prompt_install_deps repo curl || return 0
-    run_as_user_exec sh -c 'curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh | sh'
-    refresh_strata_bin
-    [[ -n "$STRATA_BIN" && -z "$STRATA_POLLER_PID" ]] && start_strata_update_poller
+    _strata_run_installer || return 0
     if [[ -n "$STRATA_BIN" ]] && (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )) && ! status_strata_build_hip; then
       echo ""
       if confirm_yn "Detected AMD GPU (${AMD_MISSING_GFX_SUMMARY}) has no prebuilt Strata engine package. Build and register a local HIP engine from source now? [Y/n]: " "Y"; then
@@ -2307,10 +2335,7 @@ strata_action_build_hip() {
   if [[ -z "$STRATA_BIN" ]]; then
     echo -e "${C_YELLOW}Strata CLI is not installed yet.${C_RESET}"
     if confirm_yn "Install Strata Terminal first before building the local HIP engine? [Y/n]: " "Y"; then
-      command -v curl >/dev/null 2>&1 || prompt_install_deps repo curl || return 1
-      run_as_user_exec sh -c 'curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh | sh'
-      refresh_strata_bin
-      [[ -n "$STRATA_BIN" && -z "$STRATA_POLLER_PID" ]] && start_strata_update_poller
+      _strata_run_installer || return 1
     fi
   fi
 
