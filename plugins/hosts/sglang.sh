@@ -75,6 +75,14 @@ sglang_table_status() {
   _host_std_table_status "$SGLANG_VERSION" "$SGLANG_DOCKER" "$running" "sglang.service"
 }
 
+sglang_check_update() {
+  [[ -n "$SGLANG_VERSION" ]] && _host_check_update_cached "sglang" "$SGLANG_VERSION" "sgl-project/sglang"
+}
+
+sglang_update() {
+  _sglang_dispatch update
+}
+
 _sglang_dispatch() {
   case "$1" in
     install|update)
@@ -82,6 +90,7 @@ _sglang_dispatch() {
       [[ -n "$SGLANG_VERSION" ]] && upgrade=true
       _host_venv_install_or_upgrade "sglang" "sglang[all]" "$upgrade"
       _sglang_refresh
+      _host_clear_update_cache "sglang"
       ;;
     latest)
       local latest

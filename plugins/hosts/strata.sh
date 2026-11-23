@@ -11,7 +11,7 @@ register_host_plugin \
 strata_init() {
   refresh_strata_bin
   refresh_strata_running
-  start_strata_update_poller
+  [[ "${_IN_SERVER_UPDATE_POLLER:-false}" != true ]] && start_strata_update_poller
 }
 
 strata_menu_row() {
@@ -75,6 +75,14 @@ strata_hw_warnings() {
 
 strata_cleanup() {
   stop_strata_update_poller
+}
+
+strata_check_update() {
+  load_strata_update_state
+}
+
+strata_update() {
+  perform_strata_update
 }
 
 refresh_strata_bin() {

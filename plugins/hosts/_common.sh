@@ -81,6 +81,78 @@ _host_github_latest_tag() {
   sed -nE 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' <<< "$body" | head -n1
 }
 
+_host_update_cache_dir() {
+  echo "${STRATA_UPDATE_CACHE_DIR:-${TARGET_HOME:-$HOME}/.cache/strata-performance-setup/updates}"
+}
+
+_host_norm_ver() {
+  local v="${1:-}"
+  v="${v#v}"
+  v="${v#V}"
+  echo "${v%%[[:space:]]*}"
+}
+
+_host_ver_older() {
+  local inst="$1" lat="$2"
+  [[ -n "$inst" && -n "$lat" && "$inst" != "$lat" ]] || return 1
+  if printf '1\n2\n' | sort -V >/dev/null 2>&1; then
+    [[ "$(printf '%s\n%s\n' "$inst" "$lat" | sort -V | head -n1)" == "$inst" ]]
+  else
+    return 0
+  fi
+}
+
+_host_check_update_cached() {
+  local id="$1" inst_ver="$2" repo="$3" ttl="${4:-7200}"
+  HOST_UPDATE_AVAIL[$id]="false"
+  HOST_UPDATE_LATEST[$id]=""
+  [[ -n "$inst_ver" && "$inst_ver" != "installed" && "$inst_ver" != "n/a" ]] || return 0
+
+  local cdir cfile now ts="" latest=""
+  cdir="$(_host_update_cache_dir)"
+  cfile="${cdir}/${id}.cache"
+  now="$(date +%s 2>/dev/null || echo 0)"
+  if [[ -r "$cfile" ]]; then
+    IFS='|' read -r ts latest < "$cfile" || true
+    if [[ "$ts" =~ ^[0-9]+$ ]] && (( now - ts < ttl )) && [[ -n "$latest" ]]; then
+      :
+    else
+      latest=""
+    fi
+  fi
+  if [[ -z "$latest" ]]; then
+    latest="$(_host_github_latest_tag "$repo" || true)"
+    if [[ -n "$latest" ]]; then
+      mkdir -p "$cdir" 2>/dev/null || true
+      printf "%s|%s\n" "$now" "$latest" > "$cfile" 2>/dev/null || true
+      [[ $EUID -eq 0 && "${TARGET_USER:-root}" != "root" ]] && chown "$TARGET_USER" "$cdir" "$cfile" 2>/dev/null || true
+    fi
+  fi
+  [[ -n "$latest" ]] || return 0
+  HOST_UPDATE_LATEST[$id]="$latest"
+  local norm_inst norm_lat
+  norm_inst="$(_host_norm_ver "$inst_ver")"
+  norm_lat="$(_host_norm_ver "$latest")"
+  if _host_ver_older "$norm_inst" "$norm_lat"; then
+    HOST_UPDATE_AVAIL[$id]="true"
+  fi
+}
+
+_host_clear_update_cache() {
+  local id="$1" cdir sfile tmp_sfile
+  cdir="$(_host_update_cache_dir)"
+  HOST_UPDATE_AVAIL[$id]="false"
+  HOST_UPDATE_LATEST[$id]=""
+  rm -f "${cdir}/${id}.cache" 2>/dev/null || true
+  sfile="${cdir}/summary.state"
+  if [[ -f "$sfile" ]]; then
+    tmp_sfile="${sfile}.tmp.$$"
+    awk -F'|' -v id="$id" '$1 != id' "$sfile" > "$tmp_sfile" 2>/dev/null || true
+    mv -f "$tmp_sfile" "$sfile" 2>/dev/null || rm -f "$tmp_sfile" 2>/dev/null || true
+    [[ $EUID -eq 0 && "${TARGET_USER:-root}" != "root" ]] && chown "$TARGET_USER" "$sfile" 2>/dev/null || true
+  fi
+}
+
 _host_format_menu_row() {
   local tag="$1" name="$2" status_text="$3" installed="$4" running="$5" selected="$6"
   local prefix="  "
