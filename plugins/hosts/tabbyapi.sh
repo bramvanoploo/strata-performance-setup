@@ -11,7 +11,8 @@ register_host_plugin \
   --id "tabbyapi" \
   --name "TabbyAPI" \
   --description "Install, update, manage service, and benchmark TabbyAPI (ExLlamaV2/V3)" \
-  --platforms "linux-gpu"
+  --platforms "linux-gpu" \
+  --url "https://github.com/theroyallab/tabbyAPI"
 
 TABBYAPI_BIN=""
 TABBYAPI_VERSION=""

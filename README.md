@@ -12,6 +12,10 @@ The script automatically detects your OS/distribution, CPU/SoC, RAM/unified memo
   <img src="assets/tui-screenshot.png" alt="Strata Performance Setup TUI" width="880">
 </p>
 
+<p align="center">
+  <img src="assets/servers-screenshot.png" alt="Strata Performance Setup — Inference Servers" width="880">
+</p>
+
 ---
 
 ## Quick Start (Recommended)
@@ -62,7 +66,7 @@ The core script works standalone via the one-liner above and lazy-loads plugins 
 
 Want to contribute? You can now submit both **performance tweak plugins** (`plugins/tweaks/<pack>.sh`) and **inference server plugins** (`plugins/hosts/<id>.sh`) via the modular plugin system—see [Contributing Plugins](documentation/contributing-plugins.md) for the template, helpers, and registry workflow.
 
-> **API-key-protected Strata instances:** Pass `--strata-api-key <key>` (overrides `STRATA_API_KEY` in the environment) or export `STRATA_API_KEY` so live `/metrics` telemetry polling, `strata bench run` benchmarks, and Strata CLI calls authenticate against your running instance.
+> **API-key-protected Strata instances:** Export `STRATA_API_KEY` (preferred — keeps the key out of shell history), or pass `--strata-api-key -` to be prompted silently, or `--strata-api-key <key>` (overrides `STRATA_API_KEY` in the environment) so live `/metrics` telemetry polling, `strata bench run` benchmarks, and Strata CLI calls authenticate against your running instance.
 
 ---
 

@@ -22,6 +22,7 @@ applicable_nvidia_persistenced() {
   [[ "$HAS_NVIDIA" == true ]] && { unit_exists nvidia-persistenced.service || service_installed strata-nvidia-persistenced.service || command -v nvidia-persistenced >/dev/null 2>&1 || command -v nvidia-smi >/dev/null 2>&1; }
 }
 title_nvidia_persistenced() { echo "NVIDIA Persistence Mode (nvidia-persistenced)"; }
+nvidia_persistenced_managed() { unit_exists nvidia-persistenced.service || service_installed strata-nvidia-persistenced.service; }
 status_nvidia_persistenced() {
   if unit_exists nvidia-persistenced.service && unit_enabled nvidia-persistenced.service && unit_active nvidia-persistenced.service; then
     return 0

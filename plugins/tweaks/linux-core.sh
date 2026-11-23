@@ -31,6 +31,7 @@ register_tweak --id "vm_overcommit" --stars 2 --tier "opt_in" --os "linux" --lap
 applicable_cpu_performance() { [[ -d /sys/devices/system/cpu/cpu0/cpufreq ]] || command -v powerprofilesctl >/dev/null 2>&1; }
 title_cpu_performance() { echo "CPU Performance Profile & Governor (performance)"; }
 note_cpu_performance() { echo -e "${C_YELLOW}[!]${C_RESET}"; }
+cpu_performance_managed() { service_installed strata-cpu-perf.service; }
 status_cpu_performance() {
   local gov ppd
   gov="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || true)"
@@ -98,6 +99,7 @@ revert_cpu_performance() {
 # 5. Memlock & Realtime
 applicable_memlock_realtime() { [[ "$IS_MACOS" == false ]]; }
 title_memlock_realtime() { echo "Unlimited Memory Lock & Realtime Privileges (memlock=unlimited)"; }
+memlock_realtime_managed() { [[ -n "$STRATA_DOCKER_CONTAINER" || -f /etc/security/limits.d/99-strata-memlock.conf || -f /etc/security/limits.d/99-realtime-privileges.conf ]]; }
 status_memlock_realtime() {
   if [[ -n "$STRATA_DOCKER_CONTAINER" ]]; then
     _docker_ro inspect --format '{{range .HostConfig.Ulimits}}{{.Name}}={{.Soft}}:{{.Hard}} {{end}}' "$STRATA_DOCKER_CONTAINER" | grep -qE '(^|[[:space:]])memlock=-1:-1([[:space:]]|$)'
@@ -138,6 +140,7 @@ revert_memlock_realtime() { run_root rm -f /etc/security/limits.d/99-strata-meml
 applicable_pcie_aspm() { [[ "$HAS_ASPM" == true ]] && grep -q "performance" /sys/module/pcie_aspm/parameters/policy 2>/dev/null; }
 title_pcie_aspm() { echo "PCIe ASPM Performance Policy (Low-Latency GPU Transfers)"; }
 note_pcie_aspm() { echo -e "${C_YELLOW}[!]${C_RESET}"; }
+pcie_aspm_managed() { service_installed strata-pcie-aspm.service || has_kernel_param "pcie_aspm.policy=performance"; }
 status_pcie_aspm() { grep -q "\[performance\]" /sys/module/pcie_aspm/parameters/policy 2>/dev/null || has_kernel_param "pcie_aspm.policy=performance"; }
 explain_pcie_aspm() {
   cat <<'EOF'
@@ -427,17 +430,21 @@ revert_lact_overclock() {
 applicable_sysctl_tuning() { [[ "$IS_MACOS" == false ]]; }
 title_sysctl_tuning() { echo "Kernel VM, Sysctl, THP & Auto-Nice Tuning (ananicy-cpp / bpftune / sysctl)"; }
 strata_swappiness_value() { if status_zram_swap; then echo 100; else echo 10; fi; }
+strata_sysctl_dir() { echo "${STRATA_SYSCTL_DIR:-/etc/sysctl.d}"; }
+strata_tmpfiles_dir() { echo "${STRATA_TMPFILES_DIR:-/etc/tmpfiles.d}"; }
 write_swappiness_conf() {
   local v
   v="$(strata_swappiness_value)"
-  printf 'vm.swappiness = %s\n' "$v" | run_root tee /etc/sysctl.d/99-strata-swappiness.conf >/dev/null
+  printf 'vm.swappiness = %s\n' "$v" | run_root tee "$(strata_sysctl_dir)/99-strata-swappiness.conf" >/dev/null
   run_root sysctl -w "vm.swappiness=${v}" >/dev/null 2>&1 || true
 }
 thp_supported() { [[ -e /sys/kernel/mm/transparent_hugepage/enabled ]]; }
 status_sysctl_tuning() {
-  [[ -f /etc/sysctl.d/99-strata-perf.conf ]] && grep -q max_map_count /etc/sysctl.d/99-strata-perf.conf 2>/dev/null || return 1
-  [[ -f /etc/sysctl.d/99-strata-swappiness.conf ]] || return 1
-  if thp_supported; then [[ -f /etc/tmpfiles.d/99-strata-thp.conf ]] || return 1; fi
+  local sd td
+  sd="$(strata_sysctl_dir)"; td="$(strata_tmpfiles_dir)"
+  [[ -f "$sd/99-strata-perf.conf" ]] && grep -q max_map_count "$sd/99-strata-perf.conf" 2>/dev/null || return 1
+  [[ -f "$sd/99-strata-swappiness.conf" ]] || return 1
+  if thp_supported; then [[ -f "$td/99-strata-thp.conf" ]] || return 1; fi
   return 0
 }
 explain_sysctl_tuning() {
@@ -448,7 +455,7 @@ apply_sysctl_tuning() {
   cur_map="$(sysctl -n vm.max_map_count 2>/dev/null || echo 0)"
   [[ "$cur_map" =~ ^[0-9]+$ ]] || cur_map=0
   (( cur_map < 1048576 )) && cur_map=1048576
-  run_root tee /etc/sysctl.d/99-strata-perf.conf >/dev/null <<EOF2
+  run_root tee "$(strata_sysctl_dir)/99-strata-perf.conf" >/dev/null <<EOF2
 vm.vfs_cache_pressure = 50
 vm.dirty_ratio = 10
 vm.zone_reclaim_mode = 0
@@ -457,18 +464,19 @@ EOF2
   write_swappiness_conf
   run_root sysctl --system >/dev/null 2>&1 || true
   if thp_supported; then
-    local en=/sys/kernel/mm/transparent_hugepage/enabled df=/sys/kernel/mm/transparent_hugepage/defrag prev_en prev_df
-    if [[ -f /etc/tmpfiles.d/99-strata-thp.conf ]]; then
-      prev_en="$(sed -nE 's/^# prev_enabled=([^ ]+).*/\1/p' /etc/tmpfiles.d/99-strata-thp.conf)"
-      prev_df="$(sed -nE 's/^# prev_enabled=[^ ]+ prev_defrag=([^ ]+).*/\1/p' /etc/tmpfiles.d/99-strata-thp.conf)"
+    local en=/sys/kernel/mm/transparent_hugepage/enabled df=/sys/kernel/mm/transparent_hugepage/defrag prev_en prev_df tf
+    tf="$(strata_tmpfiles_dir)"
+    if [[ -f "$tf/99-strata-thp.conf" ]]; then
+      prev_en="$(sed -nE 's/^# prev_enabled=([^ ]+).*/\1/p' "$tf/99-strata-thp.conf")"
+      prev_df="$(sed -nE 's/^# prev_enabled=[^ ]+ prev_defrag=([^ ]+).*/\1/p' "$tf/99-strata-thp.conf")"
     else
       prev_en="$(sed -E 's/.*\[([a-z+_]+)\].*/\1/' "$en" 2>/dev/null)"
       prev_df="$(sed -E 's/.*\[([a-z+_]+)\].*/\1/' "$df" 2>/dev/null)"
     fi
     local thp_df_val="defer+madvise"
     grep -qw "defer+madvise" "$df" 2>/dev/null || thp_df_val="madvise"
-    run_root mkdir -p /etc/tmpfiles.d
-    run_root tee /etc/tmpfiles.d/99-strata-thp.conf >/dev/null <<EOF2
+    run_root mkdir -p "$tf"
+    run_root tee "$tf/99-strata-thp.conf" >/dev/null <<EOF2
 # prev_enabled=${prev_en:-madvise} prev_defrag=${prev_df:-madvise}
 w /sys/kernel/mm/transparent_hugepage/enabled - - - - always
 w /sys/kernel/mm/transparent_hugepage/defrag - - - - ${thp_df_val}
@@ -484,15 +492,17 @@ EOF2
   fi
 }
 revert_sysctl_tuning() {
-  run_root rm -f /etc/sysctl.d/99-strata-perf.conf /etc/sysctl.d/99-strata-swappiness.conf
+  local sd tf
+  sd="$(strata_sysctl_dir)"; tf="$(strata_tmpfiles_dir)"
+  run_root rm -f "$sd/99-strata-perf.conf" "$sd/99-strata-swappiness.conf"
   run_root sysctl -w vm.swappiness=60 >/dev/null 2>&1 || true
-  if [[ -f /etc/tmpfiles.d/99-strata-thp.conf ]]; then
+  if [[ -f "$tf/99-strata-thp.conf" ]]; then
     local prev_en prev_df
-    prev_en="$(sed -nE 's/^# prev_enabled=([^ ]+).*/\1/p' /etc/tmpfiles.d/99-strata-thp.conf)"
-    prev_df="$(sed -nE 's/^# prev_enabled=[^ ]+ prev_defrag=([^ ]+).*/\1/p' /etc/tmpfiles.d/99-strata-thp.conf)"
+    prev_en="$(sed -nE 's/^# prev_enabled=([^ ]+).*/\1/p' "$tf/99-strata-thp.conf")"
+    prev_df="$(sed -nE 's/^# prev_enabled=[^ ]+ prev_defrag=([^ ]+).*/\1/p' "$tf/99-strata-thp.conf")"
     [[ -n "$prev_en" ]] && echo "$prev_en" | run_root tee /sys/kernel/mm/transparent_hugepage/enabled >/dev/null 2>&1
     [[ -n "$prev_df" ]] && echo "$prev_df" | run_root tee /sys/kernel/mm/transparent_hugepage/defrag >/dev/null 2>&1
-    run_root rm -f /etc/tmpfiles.d/99-strata-thp.conf
+    run_root rm -f "$tf/99-strata-thp.conf"
   fi
   run_root sysctl --system >/dev/null 2>&1 || true
 }
@@ -615,21 +625,22 @@ applicable_numa_balancing() {
   (( $(numa_node_count) > 1 || $(cpu_socket_count) > 1 ))
 }
 title_numa_balancing() { echo "Disable Automatic NUMA Balancing ($(cpu_socket_count) socket(s), $(numa_node_count) NUMA nodes, page-migration hygiene)"; }
+numa_balancing_managed() { [[ -f "$(strata_sysctl_dir)/99-strata-numa.conf" ]]; }
 status_numa_balancing() {
-  [[ -f /etc/sysctl.d/99-strata-numa.conf ]] && [[ "$(cat /proc/sys/kernel/numa_balancing 2>/dev/null)" == "0" ]]
+  [[ -f "$(strata_sysctl_dir)/99-strata-numa.conf" ]] && [[ "$(cat /proc/sys/kernel/numa_balancing 2>/dev/null)" == "0" ]]
 }
 explain_numa_balancing() {
   echo -e "Impact:\n  Sets kernel.numa_balancing=0 (persistent via /etc/sysctl.d/99-strata-numa.conf).\n  Stops the kernel from periodically unmapping pages to migrate them between NUMA\n  nodes (jitter/stall hygiene for large model memory; no measured prefill/decode\n  speedup once allocations are resident)."
 }
 apply_numa_balancing() {
-  run_root tee /etc/sysctl.d/99-strata-numa.conf >/dev/null <<'EOF2'
+  run_root tee "$(strata_sysctl_dir)/99-strata-numa.conf" >/dev/null <<'EOF2'
 kernel.numa_balancing = 0
 EOF2
   run_root sysctl -w kernel.numa_balancing=0 >/dev/null 2>&1 || true
   run_root sysctl --system >/dev/null 2>&1 || true
 }
 revert_numa_balancing() {
-  run_root rm -f /etc/sysctl.d/99-strata-numa.conf
+  run_root rm -f "$(strata_sysctl_dir)/99-strata-numa.conf"
   run_root sysctl -w kernel.numa_balancing=1 >/dev/null 2>&1 || true
   run_root sysctl --system >/dev/null 2>&1 || true
 }
@@ -704,6 +715,7 @@ applicable_cstate_limit() {
 }
 title_cstate_limit() { echo "CPU Deep C-State Limit (lowest wake-up latency, C1 only)"; }
 note_cstate_limit() { echo -e "${C_YELLOW}[!]${C_RESET}"; }
+cstate_limit_managed() { cstate_limit_service_installed; }
 status_cstate_limit() { cstate_limit_service_installed && unit_enabled strata-cstate-limit.service; }
 explain_cstate_limit() {
   cat <<'EOF'

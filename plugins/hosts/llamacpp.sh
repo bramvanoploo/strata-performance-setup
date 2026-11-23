@@ -11,7 +11,8 @@ register_host_plugin \
   --id "llamacpp" \
   --name "llama.cpp" \
   --description "Install, update, manage service, and benchmark llama.cpp (llama-server)" \
-  --platforms "all"
+  --platforms "all" \
+  --url "https://github.com/ggml-org/llama.cpp"
 
 LLAMACPP_BIN=""
 LLAMACPP_BENCH_BIN=""

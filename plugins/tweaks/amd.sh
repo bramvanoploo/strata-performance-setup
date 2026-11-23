@@ -21,6 +21,7 @@ applicable_amd_gpu_perf() {
   [[ "$HAS_AMD_INSTINCT" == true ]] && { command -v amd-smi >/dev/null 2>&1 || command -v rocm-smi >/dev/null 2>&1; }
 }
 title_amd_gpu_perf() { echo "AMD Radeon / Instinct High Performance DPM Level (amdgpu)"; }
+amd_gpu_perf_managed() { service_installed strata-amd-gpu-perf.service; }
 status_amd_gpu_perf() {
   local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}" f
   for f in "${drm_dir}"/card*/device/power_dpm_force_performance_level; do

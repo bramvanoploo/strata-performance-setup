@@ -12,7 +12,8 @@ register_host_plugin \
   --name "ik_llama.cpp" \
   --description "Install, update, manage service, and benchmark ik_llama.cpp (CPU/hybrid MoE)" \
   --platforms "all" \
-  --caps "install,service,bench,stats"
+  --caps "install,service,bench,stats" \
+  --url "https://github.com/ikawrakow/ik_llama.cpp"
 
 IK_LLAMACPP_BIN=""
 IK_LLAMACPP_BENCH_BIN=""

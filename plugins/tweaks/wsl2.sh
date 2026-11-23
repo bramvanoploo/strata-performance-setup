@@ -83,10 +83,15 @@ apply_wsl2_windows_config() {
     cp "$cfg" "${cfg}.bak.strata-setup" 2>/dev/null || true
   fi
   if command -v python3 >/dev/null 2>&1; then
+    local wsl_py_rc=0
     python3 - "$cfg" "$target_gb" <<'PY'
 import configparser, os, sys
 
 path, mem_gb = sys.argv[1], sys.argv[2]
+comments = []
+if os.path.exists(path):
+    with open(path) as src:
+        comments = [l for l in src if l.lstrip().startswith("#") and "strata-wsl2-managed" not in l]
 cp = configparser.ConfigParser()
 cp.optionxform = str
 if os.path.exists(path):
@@ -104,8 +109,14 @@ for k, v in (
         cp.set("wsl2", k, v)
 with open(path, "w") as f:
     f.write("# strata-wsl2-managed\n")
+    f.writelines(l if l.endswith("\n") else l + "\n" for l in comments)
     cp.write(f, space_around_delimiters=False)
 PY
+    wsl_py_rc=$?
+    if (( wsl_py_rc != 0 )); then
+      echo -e "${C_RED}Could not rewrite ${cfg} (file left unchanged; check its syntax).${C_RESET}"
+      return 1
+    fi
   else
     cat > "$cfg" <<EOF
 # strata-wsl2-managed
@@ -126,8 +137,11 @@ revert_wsl2_windows_config() {
   [[ -n "$cfg" ]] || return 0
   if [[ -f "${cfg}.bak.strata-setup" ]]; then
     mv -f "${cfg}.bak.strata-setup" "$cfg"
-  else
+  elif [[ -f "$cfg" ]] && grep -qF "# strata-wsl2-managed" "$cfg" 2>/dev/null; then
     rm -f "$cfg"
+  else
+    echo -e "${C_YELLOW}Left ${cfg} alone: no backup found and it was not created by this tool.${C_RESET}"
+    return 0
   fi
   echo -e "${C_GREEN}Restored Windows .wslconfig (run 'wsl --shutdown' to apply).${C_RESET}"
 }
@@ -151,14 +165,19 @@ EOF
   fi
 }
 apply_wsl2_linux_tuning() {
-  if [[ ! -f "$WSL2_CONF_MARKER" && -f /etc/wsl.conf && ! -f /etc/wsl.conf.strata.bak ]]; then
+  if [[ -f /etc/wsl.conf && ! -f /etc/wsl.conf.strata.bak ]]; then
     run_root cp /etc/wsl.conf /etc/wsl.conf.strata.bak 2>/dev/null || true
   fi
   if command -v python3 >/dev/null 2>&1; then
+    local wsl_py_rc=0
     run_root python3 - <<'PY'
 import configparser, os
 
 p = "/etc/wsl.conf"
+comments = []
+if os.path.exists(p):
+    with open(p) as src:
+        comments = [l for l in src if l.lstrip().startswith("#")]
 cp = configparser.ConfigParser()
 if os.path.exists(p):
     cp.read(p)
@@ -170,8 +189,14 @@ if not cp.has_section("automount"):
 cp.set("automount", "enabled", "true")
 cp.set("automount", "options", '"metadata"')
 with open(p, "w") as f:
+    f.writelines(l if l.endswith("\n") else l + "\n" for l in comments)
     cp.write(f, space_around_delimiters=False)
 PY
+    wsl_py_rc=$?
+    if (( wsl_py_rc != 0 )); then
+      echo -e "${C_RED}Could not rewrite /etc/wsl.conf (file left unchanged; check its syntax).${C_RESET}"
+      return 1
+    fi
   else
     run_root tee /etc/wsl.conf >/dev/null <<'EOF'
 [boot]

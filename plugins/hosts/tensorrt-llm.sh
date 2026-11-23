@@ -11,7 +11,8 @@ register_host_plugin \
   --id "tensorrt-llm" \
   --name "TensorRT-LLM" \
   --description "Install, update, manage service, and benchmark NVIDIA TensorRT-LLM (trtllm-serve)" \
-  --platforms "linux-nvidia"
+  --platforms "linux-nvidia" \
+  --url "https://github.com/NVIDIA/TensorRT-LLM"
 
 _host_vp_setup \
   --id "tensorrt-llm" --tag "TRT-LLM" --name "TensorRT-LLM" --live-label "TRT-LLM" \

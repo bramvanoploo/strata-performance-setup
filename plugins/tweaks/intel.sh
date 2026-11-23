@@ -15,6 +15,7 @@ applicable_intel_gpu_perf() {
   compgen -G "/sys/class/drm/card*/gt_min_freq_mhz" >/dev/null 2>&1 || compgen -G "/sys/class/drm/card*/device/tile*/gt*/freq*/min_freq" >/dev/null 2>&1
 }
 title_intel_gpu_perf() { echo "Intel Arc / iGPU Maximum Base Frequency Lock (xe / i915 / SYCL)"; }
+intel_gpu_perf_managed() { service_installed strata-intel-gpu-perf.service; }
 status_intel_gpu_perf() { service_installed strata-intel-gpu-perf.service && unit_enabled strata-intel-gpu-perf.service; }
 explain_intel_gpu_perf() { echo -e "Impact:\n  Raises Intel GPU minimum frequency to RP0/max (supports xe and i915) for SYCL."; }
 apply_intel_gpu_perf() {

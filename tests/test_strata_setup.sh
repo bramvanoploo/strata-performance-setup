@@ -696,13 +696,33 @@ EOF
   assert_eq "${HOST_PLUGIN_CAPS[ik-llamacpp]}" "install,service,bench,stats" "ik-llamacpp caps omit unimplemented updates"
 
   STRATA_WSLCONFIG_PATH="${TMP_DIR}/reapply_wslconfig"
-  printf '[wsl2]\nkernel=C:\\custom\\bzImage\n' > "$STRATA_WSLCONFIG_PATH"
+  printf '# keep me\n[wsl2]\nkernel=C:\\custom\\bzImage\n' > "$STRATA_WSLCONFIG_PATH"
   apply_wsl2_windows_config <<< "24" >/dev/null
   apply_wsl2_windows_config <<< "32" >/dev/null
   assert_contains "$(cat "$STRATA_WSLCONFIG_PATH")" "kernel=C:\\custom\\bzImage" "wsl2_windows_config preserves custom keys"
+  assert_contains "$(cat "$STRATA_WSLCONFIG_PATH")" "# keep me" "wsl2_windows_config preserves user comments"
   assert_contains "$(cat "$STRATA_WSLCONFIG_PATH")" "memory=32GB" "wsl2_windows_config updates memory on reapply"
   revert_wsl2_windows_config >/dev/null
   assert_not_contains "$(cat "$STRATA_WSLCONFIG_PATH")" "memory=32GB" "revert_wsl2_windows_config restores original .wslconfig even after reapply"
+
+  printf '[wsl2]\n[wsl2]\n' > "${TMP_DIR}/bad_wslconfig"
+  STRATA_WSLCONFIG_PATH="${TMP_DIR}/bad_wslconfig"
+  rc_wslbad=0; apply_wsl2_windows_config <<< "24" >/dev/null 2>&1 || rc_wslbad=$?
+  assert_eq "$rc_wslbad" "1" "apply_wsl2_windows_config fails loudly on unparsable .wslconfig"
+  assert_eq "$(cat "${TMP_DIR}/bad_wslconfig")" "$(printf '[wsl2]\n[wsl2]\n')" "unparsable .wslconfig left unchanged"
+
+  printf '# user hand-written\nmemory=10GB\n' > "${TMP_DIR}/foreign_wslconfig"
+  STRATA_WSLCONFIG_PATH="${TMP_DIR}/foreign_wslconfig"
+  revert_wsl2_windows_config >/dev/null
+  assert_contains "$(cat "${TMP_DIR}/foreign_wslconfig")" "memory=10GB" "revert_wsl2_windows_config leaves unmanaged .wslconfig alone"
+  printf '# strata-wsl2-managed\n[wsl2]\nmemory=24GB\n' > "${TMP_DIR}/ours_wslconfig"
+  STRATA_WSLCONFIG_PATH="${TMP_DIR}/ours_wslconfig"
+  revert_wsl2_windows_config >/dev/null
+  if [[ -e "${TMP_DIR}/ours_wslconfig" ]]; then
+    fail "revert_wsl2_windows_config should delete marker-tagged file with no backup"
+  else
+    pass "revert_wsl2_windows_config deletes marker-tagged file with no backup"
+  fi
 
   MACOS_TM_LIST="${TMP_DIR}/tm_missing.list"
   printf '%s/does-not-exist\n' "$TMP_DIR" > "$MACOS_TM_LIST"
@@ -731,7 +751,93 @@ EOF
 
     srv_out="$(show_inference_servers_page <<< "q")"
     assert_contains "$srv_out" "Simulated inference server warning" "show_inference_servers_page displays inference server hw_warnings"
+
+    HOST_PLUGIN_URLS=([testhost]="https://example.com/testhost")
+    link_row="$(format_server_row 0 false)"
+    assert_contains "$link_row" $'\033]8;;https://example.com/testhost\033\\TestHost\033]8;;\033\\' "format_server_row wraps server name in OSC 8 hyperlink"
   )
+
+  # 17. PolyStrata, Basalt, and Adamant host plugins
+  (
+    IS_MACOS=false HAS_NVIDIA=true HAS_AMD=false HAS_INTEL_GPU=false
+    AVAILABLE_HOST_PLUGINS=()
+    discover_host_plugins
+    assert_contains "${AVAILABLE_HOST_PLUGINS[*]}" "polystrata" "Linux with NVIDIA shows polystrata host plugin"
+    assert_contains "${AVAILABLE_HOST_PLUGINS[*]}" "basalt" "Linux with NVIDIA shows basalt host plugin"
+    assert_contains "${AVAILABLE_HOST_PLUGINS[*]}" "adamant" "Linux with NVIDIA shows adamant host plugin"
+  )
+)
+
+# 18. sysctl previous-value capture round-trip (write_sysctl_with_prev / restore_sysctl_prev)
+(
+  log="${TMP_DIR}/sysctl_calls"
+  : > "$log"
+  sysctl() {
+    case "$1" in
+      -n) echo 60 ;;
+      -w) echo "$2" >> "$log" ;;
+      --system) : ;;
+    esac
+    return 0
+  }
+  conf="${TMP_DIR}/sysctl.d/99-strata-test.conf"
+  mkdir -p "${TMP_DIR}/sysctl.d"
+  write_sysctl_with_prev "$conf" "vm.foo=50"
+  assert_contains "$(cat "$conf")" "# prev vm.foo=60" "write_sysctl_with_prev captures previous value"
+  assert_contains "$(cat "$conf")" "vm.foo = 50" "write_sysctl_with_prev writes new value"
+  restore_sysctl_prev "$conf"
+  assert_contains "$(cat "$log")" "vm.foo=60" "restore_sysctl_prev replays previous value"
+  [[ ! -f "$conf" ]] && pass "restore_sysctl_prev removes conf file" || fail "restore_sysctl_prev removes conf file"
+)
+
+# 18b. sysctl_tuning & numa_balancing apply/status/revert round-trip (override dirs)
+(
+  STRATA_SYSCTL_DIR="${TMP_DIR}/sysctl_tune"
+  STRATA_TMPFILES_DIR="${TMP_DIR}/tmpfiles_tune"
+  mkdir -p "$STRATA_SYSCTL_DIR" "$STRATA_TMPFILES_DIR"
+  thp_supported() { return 1; }
+  sysctl() { case "$1" in -n) echo 65530 ;; *) : ;; esac; return 0; }
+  status_zram_swap() { return 1; }
+  unit_exists() { return 1; }
+  DISTRO_FAMILY="arch"
+  rc_st=0; apply_sysctl_tuning >/dev/null || rc_st=$?
+  assert_eq "$rc_st" "0" "apply_sysctl_tuning succeeds against fake dirs"
+  status_sysctl_tuning && pass "status_sysctl_tuning true after apply" || fail "status_sysctl_tuning after apply"
+  revert_sysctl_tuning >/dev/null
+  [[ ! -f "${STRATA_SYSCTL_DIR}/99-strata-perf.conf" && ! -f "${STRATA_SYSCTL_DIR}/99-strata-swappiness.conf" ]] &&
+    pass "revert_sysctl_tuning removes conf files" || fail "revert_sysctl_tuning removes conf files"
+  status_sysctl_tuning && fail "status_sysctl_tuning should be false after revert" || pass "status_sysctl_tuning false after revert"
+
+  sysctl() { return 0; }
+  apply_numa_balancing >/dev/null
+  assert_contains "$(cat "${STRATA_SYSCTL_DIR}/99-strata-numa.conf")" "kernel.numa_balancing = 0" "apply_numa_balancing writes conf to override dir"
+  numa_balancing_managed && pass "numa_balancing_managed hook detects conf (dispatch to pack hook)" || fail "numa_balancing_managed after apply"
+  is_step_managed_by_wizard numa_balancing && pass "is_step_managed_by_wizard dispatches to numa_balancing_managed" || fail "managed dispatch numa"
+  revert_numa_balancing >/dev/null
+  [[ ! -f "${STRATA_SYSCTL_DIR}/99-strata-numa.conf" ]] && pass "revert_numa_balancing removes conf" || fail "revert_numa_balancing removes conf"
+  numa_balancing_managed && fail "numa_balancing_managed should be false after revert" || pass "numa_balancing_managed false after revert"
+)
+
+# 19. nvidia_clock_lock apply/status/revert round-trip (fake nvidia-smi, rc-dir service)
+(
+  HAS_SYSTEMD=false HAS_LAUNCHD=false IS_UNRAID=false IS_SYNOLOGY=false
+  STRATA_RC_DIR="${TMP_DIR}/nvclk_rc"
+  mkdir -p "$STRATA_RC_DIR"
+  nvbin="${TMP_DIR}/nvclk_bin"
+  mkdir -p "$nvbin"
+  printf '#!/usr/bin/env bash\necho "All done."\nexit 0\n' > "${nvbin}/nvidia-smi"
+  chmod +x "${nvbin}/nvidia-smi"
+  PATH="${nvbin}:${PATH}"
+  unit_enabled() { return 0; }
+  HAS_NVIDIA=true NVIDIA_MAX_GFX_CLK=1455
+  NVIDIA_GPU_INDICES=(0) NVIDIA_GPU_MAX_GFX_CLK=(1455) NVIDIA_GPU_MAX_MEM_CLK=(1000)
+  NVIDIA_GPU_COMPUTE_CAP=(8.6) NVIDIA_GPU_NAMES=("Fake GPU")
+  rc_cl=0; apply_nvidia_clock_lock >/dev/null || rc_cl=$?
+  assert_eq "$rc_cl" "0" "apply_nvidia_clock_lock succeeds with fake nvidia-smi"
+  assert_contains "$(cat "${STRATA_RC_DIR}/rc.strata.nvidia-clock-lock")" "-lgc 1455,1455" "clock-lock service locks max core clocks"
+  status_nvidia_clock_lock && pass "status_nvidia_clock_lock true after apply" || fail "status_nvidia_clock_lock after apply"
+  revert_nvidia_clock_lock >/dev/null
+  [[ ! -f "${STRATA_RC_DIR}/rc.strata.nvidia-clock-lock" ]] && pass "revert_nvidia_clock_lock removes service" || fail "revert_nvidia_clock_lock removes service"
 )
 
 PASS="$(grep -c '^P$' "$RESULTS_FILE" || true)"

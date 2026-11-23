@@ -11,7 +11,8 @@ register_host_plugin \
   --id "ktransformers" \
   --name "KTransformers" \
   --description "Install, update, manage service, and benchmark KTransformers hybrid MoE server" \
-  --platforms "linux"
+  --platforms "linux" \
+  --url "https://github.com/kvcache-ai/ktransformers"
 
 _host_vp_setup \
   --id "ktransformers" --tag "KTRANS" --name "KTransformers" --live-label "KTrans" \

@@ -11,7 +11,8 @@ register_host_plugin \
   --id "vllm" \
   --name "vLLM" \
   --description "Install, update, manage service, and benchmark vLLM inference server" \
-  --platforms "linux"
+  --platforms "linux" \
+  --url "https://github.com/vllm-project/vllm"
 
 _host_vp_setup \
   --id "vllm" --tag "VLLM" --name "vLLM" --bin "vllm" --pip-pkg "vllm" \

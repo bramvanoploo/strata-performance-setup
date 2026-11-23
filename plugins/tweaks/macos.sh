@@ -15,6 +15,7 @@ applicable_macos_wired_limit() {
 }
 title_macos_wired_limit() { echo "macOS Metal GPU Wired Memory Limit (iogpu.wired_limit_mb)"; }
 note_macos_wired_limit() { echo -e "${C_BLUE}[OPT]${C_RESET}"; }
+macos_wired_limit_managed() { service_installed strata-macos-wired-limit.service; }
 status_macos_wired_limit() {
   service_installed strata-macos-wired-limit.service && return 0
   (( $(_macos_wired_limit_cur_mb) > 0 ))

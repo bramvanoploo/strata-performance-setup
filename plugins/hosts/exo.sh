@@ -11,7 +11,8 @@ register_host_plugin \
   --id "exo" \
   --name "exo" \
   --description "Install, update, manage service, and benchmark exo distributed cluster server" \
-  --platforms "all"
+  --platforms "all" \
+  --url "https://github.com/exo-explore/exo"
 
 EXO_BIN=""
 EXO_VERSION=""

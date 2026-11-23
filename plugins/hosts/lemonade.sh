@@ -11,7 +11,8 @@ register_host_plugin \
   --id "lemonade" \
   --name "Lemonade" \
   --description "Install, update, manage service, and benchmark AMD Lemonade (Ryzen AI NPU/iGPU)" \
-  --platforms "linux"
+  --platforms "linux" \
+  --url "https://github.com/lemonade-sdk/lemonade"
 
 _host_vp_setup \
   --id "lemonade" --tag "LEMONADE" --name "Lemonade" \

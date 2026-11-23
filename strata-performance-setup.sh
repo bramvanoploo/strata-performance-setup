@@ -158,7 +158,7 @@ STRATA_UPDATE_AVAILABLE=false STRATA_UPDATE_SUMMARY="" STRATA_UPDATE_CACHE_FILE=
 UNIT_FILES_CACHE=""
 declare -A PKG_AVAIL_CACHE PKG_INST_CACHE
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT_VERSION="1.9.5"
+SCRIPT_VERSION="1.9.6"
 PLUGIN_BASE_URL="${STRATA_PLUGIN_BASE_URL:-https://raw.githubusercontent.com/bramvanoploo/strata-performance-setup/main}"
 PLUGIN_CACHE_DIR="${STRATA_PLUGIN_CACHE_DIR:-${XDG_CACHE_HOME:-$TARGET_HOME/.cache}/strata-performance-setup/plugins}"
 NO_PLUGINS=false
@@ -168,6 +168,7 @@ declare -A HOST_PLUGIN_LOADED=() TWEAK_PACK_LOADED=()
 declare -A HOST_PLUGIN_NAMES=([strata]="Strata")
 declare -A HOST_PLUGIN_DESCS=([strata]="Install, update, launch, and benchmark Strata LLM server")
 declare -A HOST_PLUGIN_CAPS=([strata]="install,service,updates,bench,stats")
+declare -A HOST_PLUGIN_URLS=([strata]="https://github.com/Niko1221/Strata")
 declare -A HOST_UPDATE_AVAIL=() HOST_UPDATE_LATEST=() HOST_INSTALL_SOURCE=()
 SERVER_UPDATE_POLLER_PID=""
 declare -A TWEAK_REGISTERED=() STEP_TIER=() STEP_OS=() STEP_LAPTOP_REC=() STEP_VM_SUPPORTED=() STEP_EXP_NON_ARCH=() STEP_WSL_SUPPORTED=()
@@ -2038,8 +2039,6 @@ detect_environment() {
   HAS_NVIDIA=false HAS_NVIDIA_POWERD=false HAS_AMD=false HAS_INTEL_GPU=false HAS_INTEL_ARC=false
   HAS_AMD_NPU=false HAS_INTEL_NPU=false HAS_TENSTORRENT=false HAS_MTHREADS=false HAS_ASCEND=false HAS_ROCKCHIP_NPU=false HAS_HAILO=false
   IS_RASPBERRY_PI=false NPU_SUMMARY=""
-HAS_AMD_NPU=false HAS_INTEL_NPU=false HAS_TENSTORRENT=false HAS_MTHREADS=false HAS_ASCEND=false HAS_ROCKCHIP_NPU=false HAS_HAILO=false
-NPU_SUMMARY=""
   HAS_AMD_APU=false HAS_AMD_PREBUILT_GFX=false AMD_GTT_TOTAL_MB=0
   HAS_AMD_INSTINCT=false HAS_AMD_NON_INSTINCT=false
   AMD_GFX_SUMMARY="" AMD_MISSING_GFX_SUMMARY="" AMD_GFX_ARCHS=() AMD_MISSING_GFX_ARCHS=()
@@ -3084,7 +3083,7 @@ discover_host_plugins() {
 }
 
 register_host_plugin() {
-  local id="" name="" desc="" plat="all" caps="install,service,updates,bench,stats"
+  local id="" name="" desc="" plat="all" caps="install,service,updates,bench,stats" url=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --id) id="$2"; shift 2 ;;
@@ -3092,6 +3091,7 @@ register_host_plugin() {
       --description|--desc) desc="$2"; shift 2 ;;
       --platforms) plat="$2"; shift 2 ;;
       --caps) caps="$2"; shift 2 ;;
+      --url|--homepage) url="$2"; shift 2 ;;
       *) shift ;;
     esac
   done
@@ -3103,6 +3103,7 @@ register_host_plugin() {
   [[ -n "$name" ]] && HOST_PLUGIN_NAMES[$id]="$name"
   [[ -n "$desc" ]] && HOST_PLUGIN_DESCS[$id]="$desc"
   HOST_PLUGIN_CAPS[$id]="$caps"
+  [[ -n "$url" ]] && HOST_PLUGIN_URLS[$id]="$url"
 }
 
 register_tweak() {
@@ -3148,13 +3149,9 @@ _fetch_verified_plugin() {
   fi
 
   expected_sha="$(_registry_sha256 "$category" "$id")"
-  if [[ -f "$cache_file" ]]; then
-    if [[ -z "$expected_sha" ]]; then
-      target_file="$cache_file"
-    else
-      actual_sha="$(_sha256_file "$cache_file" || true)"
-      [[ "$actual_sha" == "$expected_sha" ]] && target_file="$cache_file"
-    fi
+  if [[ -f "$cache_file" && -n "$expected_sha" ]]; then
+    actual_sha="$(_sha256_file "$cache_file" || true)"
+    [[ "$actual_sha" == "$expected_sha" ]] && target_file="$cache_file"
   fi
   if [[ -z "$target_file" ]]; then
     mkdir -p "${PLUGIN_CACHE_DIR}/${category}" 2>/dev/null || return 1
@@ -3163,13 +3160,16 @@ _fetch_verified_plugin() {
       rm -f "$tmp_file"
       return 1
     fi
-    if [[ -n "$expected_sha" ]]; then
-      actual_sha="$(_sha256_file "$tmp_file" || true)"
-      if [[ "$actual_sha" != "$expected_sha" ]]; then
-        rm -f "$tmp_file"
-        echo -e "${C_RED}Checksum mismatch for plugin ${category}/${id}.sh — refusing to load.${C_RESET}" >&2
-        return 1
-      fi
+    if [[ -z "$expected_sha" ]]; then
+      rm -f "$tmp_file"
+      echo -e "${C_RED}No checksum in registry for plugin ${category}/${id}.sh — refusing to load.${C_RESET}" >&2
+      return 1
+    fi
+    actual_sha="$(_sha256_file "$tmp_file" || true)"
+    if [[ "$actual_sha" != "$expected_sha" ]]; then
+      rm -f "$tmp_file"
+      echo -e "${C_RED}Checksum mismatch for plugin ${category}/${id}.sh — refusing to load.${C_RESET}" >&2
+      return 1
     fi
     mv -f "$tmp_file" "$cache_file"
     target_file="$cache_file"
@@ -4691,6 +4691,15 @@ _run_all_server_updates() {
     sleep 1
     return 0
   fi
+  local -a outdated_names=()
+  for pid in "${outdated[@]}"; do
+    outdated_names+=("${HOST_PLUGIN_NAMES[$pid]:-$pid}")
+  done
+  echo -e "\n${C_YELLOW}Outdated servers:${C_RESET} ${outdated_names[*]}"
+  if ! confirm_yn "Update all listed servers? [y/N]: " "N"; then
+    echo -e "${C_DIM}Skipped server updates.${C_RESET}"
+    return 0
+  fi
   for pid in "${outdated[@]}"; do
     if [[ -z "${HOST_PLUGIN_LOADED[$pid]:-}" ]]; then
       load_plugin hosts "$pid" >/dev/null 2>&1 || continue
@@ -4936,6 +4945,7 @@ _tui_poll_live_stats_tick() {
   return 0
 }
 
+# shortcut: near-duplicate raw-key loop with read_step_action/read_choice_with_live_stats/strata options page; unify via dispatch table if TUI work touches them again
 read_line_with_live_stats() {
   local -n _line_out="$1"
   local prompt_str="${2:-Select action: }"
@@ -5029,6 +5039,7 @@ read_line_with_live_stats() {
   done
 }
 
+# shortcut: near-duplicate raw-key loop (see read_line_with_live_stats)
 read_step_action() {
   local -n _act_out="$1"
   local lines_up="${2:-0}"
@@ -5194,6 +5205,7 @@ index_row_up_offset() {
   fi
 }
 
+# shortcut: near-duplicate raw-key loop (see read_line_with_live_stats)
 read_choice_with_live_stats() {
   local -n _out_var="$1"
   local footer_lines="${2:-0}"
@@ -5438,9 +5450,17 @@ format_server_row() {
 
   local raw_label="$pname"
   (( ${#raw_label} > 18 )) && raw_label="${raw_label:0:15}..."
+  local pad_len=$(( 18 - ${#raw_label} ))
+  local pad_str=""
+  (( pad_len > 0 )) && printf -v pad_str '%*s' "$pad_len" ''
+  local purl="${HOST_PLUGIN_URLS[$pid]:-}"
+  local linked_label="$raw_label"
+  if [[ -n "$purl" ]]; then
+    linked_label=$'\033]8;;'"${purl}"$'\033\\'"${raw_label}"$'\033]8;;\033\\'
+  fi
   local label_txt ptr row_num svc_col upd_cell
-  label_txt="$(printf "%-18s" "$raw_label")"
-  svc_col="$(_pad_ansi_col "$svc_txt" 16)"
+  label_txt="${linked_label}${pad_str}"
+  svc_col="$(_pad_ansi_col "$svc_txt" 18)"
   if [[ "$has_upd" == true ]]; then
     upd_cell="$(_pad_ansi_col "${C_BGREEN}↑${C_RESET}" 7)"
   elif [[ "$inst" == true && "${HOST_INSTALL_SOURCE[$pid]:-}" == "manual" ]]; then
@@ -5451,12 +5471,15 @@ format_server_row() {
   if [[ "$selected" == true ]]; then
     ptr="${C_CYAN}>${C_RESET}"
     row_num="${C_CYAN}${C_BOLD}$(printf "%2d" "$num")${C_RESET}"
-    label_txt="${C_CYAN}${C_BOLD}${label_txt}${C_RESET}"
+    local _sel_pre="" _sel_rst=""
+    printf -v _sel_pre "%b%b" "${C_CYAN}" "${C_BOLD}"
+    printf -v _sel_rst "%b" "${C_RESET}"
+    label_txt="${_sel_pre}${linked_label}${_sel_rst}${pad_str}"
   else
     ptr=" "
     row_num="$(printf "%2d" "$num")"
   fi
-  printf "%b %b  | %b | %b | %b | %b | %b | %b | %b | %b" \
+  printf "%b %b  | %b | %s | %b | %b | %b | %b | %b | %b" \
     "$ptr" "$row_num" "$badge" "$label_txt" "$svc_col" \
     "$(_server_cap_cell "$caps" "install" 7)" \
     "$(_server_cap_cell "$caps" "service" 7)" \
@@ -5503,8 +5526,8 @@ show_inference_servers_page() {
     fi
     echo -e "${C_BOLD}Inference Servers (Applicable to this machine):${C_RESET}"
     echo ""
-    printf "  ${C_BOLD}%-3s | %-15s | %-18s | %-16s | %-7s | %-7s | %-7s | %-9s | %-5s${C_RESET}\n" "#" "Status" "Inference Server" "Service" "Install" "Service" "Updates" "Benchmark" "Stats"
-    printf "  %s\n" "----+-----------------+--------------------+------------------+---------+---------+---------+-----------+------"
+    printf "  ${C_BOLD}%-3s | %-15s | %-18s | %-18s | %-7s | %-7s | %-7s | %-9s | %-5s${C_RESET}\n" "#" "Status" "Inference Server" "Service" "Install" "Service" "Updates" "Benchmark" "Stats"
+    printf "  %s\n" "----+-----------------+--------------------+--------------------+---------+---------+---------+-----------+------"
     local i is_sel
     for (( i = 0; i < total; i++ )); do
       is_sel=false
@@ -5512,15 +5535,19 @@ show_inference_servers_page() {
       printf "%s\n" "$(format_server_row "$i" "$is_sel")"
     done
     echo ""
-    local footer_extra=0
+    local footer_extra=0 max_footer_w=0
     if (( ${#outdated_pids[@]} > 0 )); then
       echo -e "  ${C_BGREEN}[u]${C_RESET} Update all outdated servers (${outdated_names})"
+      local upd_plain="  [u] Update all outdated servers (${outdated_names})"
+      (( ${#upd_plain} > max_footer_w )) && max_footer_w=${#upd_plain}
       footer_extra=1
     fi
-    echo -e "  ${C_DIM}Use [↑↓] + Enter, or [1-${total}] to open, [b / Esc / 0] Back to Index, [q] Quit${C_RESET}"
+    local help_plain="  Use [↑↓] + Enter, or [1-${total}] to open, click name for homepage, [b / Esc / 0] Back to Index, [q] Quit"
+    echo -e "  ${C_DIM}Use [↑↓] + Enter, or [1-${total}] to open, click name for homepage, [b / Esc / 0] Back to Index, [q] Quit${C_RESET}"
+    (( ${#help_plain} > max_footer_w )) && max_footer_w=${#help_plain}
     echo ""
 
-    local saved_tty="" open_pid="" do_update_all=false
+    local saved_tty="" open_pid="" do_update_all=false do_refresh=false
     saved_tty="$(stty -g 2>/dev/null || true)"
     stty -echo 2>/dev/null || true
     trap '_tui_restore_tty "$saved_tty"; exit 0' INT TERM
@@ -5545,11 +5572,21 @@ show_inference_servers_page() {
           sel="$new_sel"
           local old_up=$(( 3 + footer_extra + (total - old_sel) ))
           local new_up=$(( 3 + footer_extra + (total - new_sel) ))
-          local old_row new_row
-          old_row="$(format_server_row "$old_sel" false)"
-          new_row="$(format_server_row "$new_sel" true)"
-          printf "\033[?2026h\033[?25l\033[s\033[%dA\r\033[2K%s\033[u\033[s\033[%dA\r\033[2K%s\033[u\033[?25h\033[?2026l" \
-            "$old_up" "$old_row" "$new_up" "$new_row"
+          local _tc=120 _tl=40
+          if [[ -t 1 ]]; then
+            _tc="$(tput cols 2>/dev/null || echo 120)"
+            _tl="$(tput lines 2>/dev/null || echo 40)"
+          fi
+          if (( _tc > 115 && _tc > max_footer_w && old_up < _tl && new_up < _tl )); then
+            local old_row new_row
+            old_row="$(format_server_row "$old_sel" false)"
+            new_row="$(format_server_row "$new_sel" true)"
+            printf "\033[?2026h\033[?25l\033[s\033[%dA\r\033[2K%s\033[u\033[s\033[%dA\r\033[2K%s\033[u\033[?25h\033[?2026l" \
+              "$old_up" "$old_row" "$new_up" "$new_row"
+          else
+            do_refresh=true
+            break
+          fi
         fi
         continue
       fi
@@ -5584,6 +5621,7 @@ show_inference_servers_page() {
     _tui_restore_tty "$saved_tty"
     trap - INT TERM
     printf "\n"
+    [[ "$do_refresh" == true ]] && continue
 
     if [[ "$do_update_all" == true ]]; then
       for _opid in "${outdated_pids[@]}"; do
@@ -5821,7 +5859,9 @@ Options:
                           for offline use and exit.
   --strata-api-key KEY    API key used for all requests to Strata (live /metrics
                           polling, 'strata bench run' benchmarking, and Strata
-                          CLI calls); overrides STRATA_API_KEY if set.
+                          CLI calls); overrides STRATA_API_KEY if set. Pass '-'
+                          to be prompted silently (keeps the key out of shell
+                          history); prefer exporting STRATA_API_KEY.
   -h, --help              Show this help message and exit.
 
 Environment:
@@ -5831,6 +5871,11 @@ EOF
 }
 
 is_step_managed_by_wizard() {
+  # Packs own their detection via <step>_managed(); the case below is the legacy fallback.
+  if declare -F "${1}_managed" >/dev/null 2>&1; then
+    "${1}_managed"
+    return $?
+  fi
   case "$1" in
     cpu_performance)     service_installed strata-cpu-perf.service ;;
     memlock_realtime)    [[ -n "$STRATA_DOCKER_CONTAINER" || -f /etc/security/limits.d/99-strata-memlock.conf || -f /etc/security/limits.d/99-realtime-privileges.conf ]] ;;
@@ -6070,11 +6115,20 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         ;;
       --strata-api-key)
         if [[ $# -lt 2 || -z "${2:-}" ]]; then
-          echo "Error: --strata-api-key requires a non-empty value." >&2
+          echo "Error: --strata-api-key requires a non-empty value ('-' to prompt silently)." >&2
           usage >&2
           exit 2
         fi
-        STRATA_API_KEY="$2"
+        if [[ "$2" == "-" ]]; then
+          IFS= read -rs STRATA_API_KEY </dev/tty || true
+          echo "" >&2
+        else
+          STRATA_API_KEY="$2"
+        fi
+        if [[ -z "$STRATA_API_KEY" ]]; then
+          echo "Error: --strata-api-key: no key entered." >&2
+          exit 2
+        fi
         export STRATA_API_KEY
         shift
         ;;

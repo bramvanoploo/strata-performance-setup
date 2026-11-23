@@ -11,7 +11,8 @@ register_host_plugin \
   --id "openvino" \
   --name "OpenVINO" \
   --description "Install, update, manage service, and benchmark OpenVINO Model Server (Intel NPU/GPU/CPU)" \
-  --platforms "linux"
+  --platforms "linux" \
+  --url "https://github.com/openvinotoolkit/model_server"
 
 OPENVINO_BIN=""
 OPENVINO_VERSION=""

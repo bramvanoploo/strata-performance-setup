@@ -11,7 +11,8 @@ register_host_plugin \
   --id "mlx-lm" \
   --name "MLX LM" \
   --description "Install, update, manage service, and benchmark MLX LM on Apple Silicon" \
-  --platforms "macos-arm64"
+  --platforms "macos-arm64" \
+  --url "https://github.com/ml-explore/mlx-lm"
 
 MLX_LM_BIN=""
 MLX_LM_VERSION=""

@@ -41,11 +41,14 @@ _host_find_docker() {
 }
 
 _host_http_get() {
-  local url="$1" timeout="${2:-2}"
+  local url="$1" timeout="${2:-2}" h
+  shift 2
+  local -a hdr=()
+  for h in "$@"; do hdr+=(--header="$h"); done
   if command -v curl >/dev/null 2>&1; then
-    curl -fsS --max-time "$timeout" "$url" 2>/dev/null || return 1
+    curl -fsS --max-time "$timeout" ${hdr[@]+"${hdr[@]}"} "$url" 2>/dev/null || return 1
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO- --timeout="$timeout" "$url" 2>/dev/null || return 1
+    wget -qO- --timeout="$timeout" ${hdr[@]+"${hdr[@]}"} "$url" 2>/dev/null || return 1
   else
     return 1
   fi
@@ -133,11 +136,17 @@ _host_endpoint_running() {
 }
 
 _host_openai_models() {
-  local base_url="${1%/}" body=""
+  local base_url="${1%/}" body="" out=""
+  # shortcut: model list cached 5s (positives only) so live-stats redraws don't re-GET the same endpoint
+  local cts="${_HOST_MODELS_TS[$base_url]:-}"
+  if [[ -n "$cts" ]]; then
+    printf '%s\n' "${_HOST_MODELS_CACHE[$base_url]}"
+    return 0
+  fi
   body="$(_host_http_get "${base_url}/v1/models" 2 || true)"
-  [[ -n "$body" ]] || return 1
-  if has_working_python3; then
-    python3 -c '
+  if [[ -n "$body" ]]; then
+    if has_working_python3; then
+      out="$(python3 -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -145,12 +154,16 @@ try:
     print(",".join(ids))
 except Exception:
     pass
-' <<< "$body" 2>/dev/null || true
-  else
-    grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]+"' <<< "$body" | sed -E 's/.*"([^"]+)"$/\1/' | paste -sd',' - || true
+' <<< "$body" 2>/dev/null || true)"
+    else
+      out="$(grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]+"' <<< "$body" | sed -E 's/.*"([^"]+)"$/\1/' | paste -sd',' - || true)"
+    fi
   fi
+  [[ -n "$out" ]] || return 1
+  _HOST_MODELS_CACHE[$base_url]="$out"
+  _HOST_MODELS_TS[$base_url]="$SECONDS"
+  printf '%s\n' "$out"
 }
-
 _host_has_served_model() {
   local base_url="${1%/}" models=""
   models="$(_host_openai_models "$base_url" || true)"
@@ -298,7 +311,8 @@ _host_ver_older() {
   if printf '1\n2\n' | sort -V >/dev/null 2>&1; then
     [[ "$(printf '%s\n%s\n' "$inst" "$lat" | sort -V | head -n1)" == "$inst" ]]
   else
-    return 0
+    # shortcut: no sort -V available → assume current rather than nag an update banner forever
+    return 1
   fi
 }
 
@@ -820,19 +834,25 @@ _host_run_options_page() {
     esac
   done
 
-  local sel=0
+  local sel=0 last_probe=-99
+  local bin_val="" ver_val="" docker_val="" src_val="" cur_url="$url"
+  local installed=false has_docker=false running=false can_bench=false
   while true; do
-    [[ -n "$refresh_fn" ]] && "$refresh_fn"
-    local bin_val="${!bin_var:-}" ver_val="${!ver_var:-}" docker_val="" src_val="" cur_url="$url"
-    [[ -n "$docker_var" ]] && docker_val="${!docker_var:-}"
-    [[ -n "$source_var" ]] && src_val="${!source_var:-}"
-    [[ -n "$url_var" && -n "${!url_var:-}" ]] && cur_url="${!url_var}"
-    local installed=false has_docker=false running=false can_bench=false
-    [[ -n "$bin_val" ]] && installed=true
-    [[ -n "$docker_val" ]] && has_docker=true
-    if [[ -n "$is_running_fn" ]] && "$is_running_fn"; then
-      running=true
-      _host_has_served_model "$cur_url" && can_bench=true
+    # shortcut: probes cached 3s to keep the menu responsive; forced fresh after every action below.
+    if (( SECONDS - last_probe >= 3 )); then
+      last_probe=$SECONDS
+      [[ -n "$refresh_fn" ]] && "$refresh_fn"
+      bin_val="${!bin_var:-}"; ver_val="${!ver_var:-}"; docker_val=""; src_val=""; cur_url="$url"
+      [[ -n "$docker_var" ]] && docker_val="${!docker_var:-}"
+      [[ -n "$source_var" ]] && src_val="${!source_var:-}"
+      [[ -n "$url_var" && -n "${!url_var:-}" ]] && cur_url="${!url_var}"
+      installed=false; has_docker=false; running=false; can_bench=false
+      [[ -n "$bin_val" ]] && installed=true
+      [[ -n "$docker_val" ]] && has_docker=true
+      if [[ -n "$is_running_fn" ]] && "$is_running_fn"; then
+        running=true
+        _host_has_served_model "$cur_url" && can_bench=true
+      fi
     fi
 
     local -a opts=()
@@ -935,6 +955,7 @@ _host_run_options_page() {
     printf "\n"
     "$dispatch_fn" "$chosen_opt"
     pause_prompt
+    last_probe=-99
   done
 }
 
@@ -942,6 +963,7 @@ declare -gA _HOST_VP_TAG=() _HOST_VP_NAME=() _HOST_VP_BIN_NAME=() _HOST_VP_PIP_P
 declare -gA _HOST_VP_REPO=() _HOST_VP_PORT=() _HOST_VP_URL=() _HOST_VP_HEALTH=() _HOST_VP_DOCKER_PAT=()
 declare -gA _HOST_VP_SVC_DESC=() _HOST_VP_SVC_ARGS=() _HOST_VP_MODEL_PROMPT=() _HOST_VP_LIVE_LABEL=()
 declare -gA _HOST_VP_BIN=() _HOST_VP_VER=() _HOST_VP_DOCKER=() _HOST_VP_SRC=()
+declare -gA _HOST_VP_RUN=() _HOST_VP_RUN_TS=() _HOST_MODELS_CACHE=() _HOST_MODELS_TS=()
 _HOST_VP_ACTIVE_ID="" _HOST_VP_CUR_BIN="" _HOST_VP_CUR_VER="" _HOST_VP_CUR_DOCKER="" _HOST_VP_CUR_SRC="" _HOST_VP_CUR_URL=""
 
 _host_vp_setup() {
@@ -1017,20 +1039,28 @@ _host_vp_refresh() {
 }
 
 _host_vp_running() {
-  local id="$1" base="${_HOST_VP_URL[$1]:-}" ep bin_name="${_HOST_VP_BIN_NAME[$1]:-}" pat=""
+  local id="$1" base="${_HOST_VP_URL[$1]:-}" ep bin_name="${_HOST_VP_BIN_NAME[$1]:-}" pat="" rc=1
   local docker_val="${_HOST_VP_DOCKER[$1]:-}"
+  # shortcut: run state cached 5s so dashboard redraws don't repeat pgrep+HTTP probes;
+  # _host_vp_dispatch clears the cache after actions that can change server state.
+  local cts="${_HOST_VP_RUN_TS[$id]:-}"
+  if [[ -n "$cts" ]] && (( SECONDS - cts < 5 )); then
+    [[ "${_HOST_VP_RUN[$id]:-1}" == "0" ]] && return 0
+    return 1
+  fi
   if [[ -n "$bin_name" && "$bin_name" != "python3" ]]; then
     pat="(^|/)${bin_name}([[:space:]]|$)"
   else
     pat="$id"
   fi
-  if [[ -z "$docker_val" ]] && ! unit_active "${id}.service" 2>/dev/null; then
-    _host_proc_running "$pat" || return 1
+  if [[ -n "$docker_val" ]] || unit_active "${id}.service" 2>/dev/null || _host_proc_running "$pat"; then
+    for ep in ${_HOST_VP_HEALTH[$id]:-/v1/models}; do
+      if _host_http_ok "${base}${ep}" 1; then rc=0; break; fi
+    done
   fi
-  for ep in ${_HOST_VP_HEALTH[$1]:-/v1/models}; do
-    _host_http_ok "${base}${ep}" 1 && return 0
-  done
-  return 1
+  _HOST_VP_RUN[$id]="$rc"
+  _HOST_VP_RUN_TS[$id]="$SECONDS"
+  return "$rc"
 }
 
 _host_vp_menu_row() {
@@ -1065,6 +1095,7 @@ _host_vp_check_update() {
 _host_vp_dispatch() {
   local id="$1" action="$2"
   local name="${_HOST_VP_NAME[$id]}" url="${_HOST_VP_URL[$id]}" port="${_HOST_VP_PORT[$id]}"
+  unset "_HOST_VP_RUN_TS[$id]" "_HOST_VP_RUN[$id]"
   case "$action" in
     install|update)
       local upgrade=false

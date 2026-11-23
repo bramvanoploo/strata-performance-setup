@@ -11,7 +11,8 @@ register_host_plugin \
   --id "sglang" \
   --name "SGLang" \
   --description "Install, update, manage service, and benchmark SGLang inference server" \
-  --platforms "linux"
+  --platforms "linux" \
+  --url "https://github.com/sgl-project/sglang"
 
 _host_vp_setup \
   --id "sglang" --tag "SGLANG" --name "SGLang" --bin "python3" --pip-pkg "sglang" \

@@ -11,7 +11,8 @@ register_host_plugin \
   --id "localai" \
   --name "LocalAI" \
   --description "Install, update, manage service, and benchmark LocalAI server" \
-  --platforms "all"
+  --platforms "all" \
+  --url "https://localai.io"
 
 LOCALAI_BIN=""
 LOCALAI_VERSION=""

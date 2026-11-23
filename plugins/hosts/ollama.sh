@@ -11,7 +11,8 @@ register_host_plugin \
   --id "ollama" \
   --name "Ollama" \
   --description "Install, update, manage service, and benchmark Ollama LLM server" \
-  --platforms "all"
+  --platforms "all" \
+  --url "https://ollama.com"
 
 OLLAMA_BIN=""
 OLLAMA_VERSION=""
