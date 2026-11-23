@@ -103,7 +103,7 @@ _host_ver_older() {
 }
 
 _host_check_update_cached() {
-  local id="$1" inst_ver="$2" repo="$3" ttl="${4:-7200}"
+  local id="$1" inst_ver="$2" target="$3" ttl="${4:-7200}" kind="${5:-github}"
   HOST_UPDATE_AVAIL[$id]="false"
   HOST_UPDATE_LATEST[$id]=""
   [[ -n "$inst_ver" && "$inst_ver" != "installed" && "$inst_ver" != "n/a" ]] || return 0
@@ -121,7 +121,11 @@ _host_check_update_cached() {
     fi
   fi
   if [[ -z "$latest" ]]; then
-    latest="$(_host_github_latest_tag "$repo" || true)"
+    if [[ "$kind" == "pypi" ]]; then
+      latest="$(_host_pypi_latest_ver "$target" || true)"
+    else
+      latest="$(_host_github_latest_tag "$target" || true)"
+    fi
     if [[ -n "$latest" ]]; then
       mkdir -p "$cdir" 2>/dev/null || true
       printf "%s|%s\n" "$now" "$latest" > "$cfile" 2>/dev/null || true
@@ -151,6 +155,114 @@ _host_clear_update_cache() {
     mv -f "$tmp_sfile" "$sfile" 2>/dev/null || rm -f "$tmp_sfile" 2>/dev/null || true
     [[ $EUID -eq 0 && "${TARGET_USER:-root}" != "root" ]] && chown "$TARGET_USER" "$sfile" 2>/dev/null || true
   fi
+}
+
+_host_detect_install_source() {
+  local id="$1" bin_path="$2" pkg_name="$3" has_installer="${4:-false}" src="manual"
+  if [[ -z "$bin_path" ]]; then
+    src="none"
+  elif [[ "$bin_path" == "$(_host_venv_dir "$id")/"* ]]; then
+    src="venv"
+  elif [[ "$IS_MACOS" == true ]] && command -v brew >/dev/null 2>&1 && pkg_installed "$pkg_name" 2>/dev/null; then
+    src="brew"
+  elif [[ "$IS_MACOS" != true ]] && pkg_installed "$pkg_name" 2>/dev/null; then
+    if [[ "$DISTRO_FAMILY" == "arch" ]] && pacman -Qm "$pkg_name" >/dev/null 2>&1; then
+      src="aur"
+    else
+      src="distro"
+    fi
+  elif [[ "$has_installer" == true ]]; then
+    src="installer"
+  fi
+  HOST_INSTALL_SOURCE[$id]="$src"
+  echo "$src"
+}
+
+_host_pypi_latest_ver() {
+  local pkg="$1" body=""
+  body="$(_host_http_get "https://pypi.org/pypi/${pkg}/json" 4 || true)"
+  [[ -n "$body" ]] || return 1
+  if has_working_python3; then
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["info"]["version"])' <<< "$body" 2>/dev/null || return 1
+  else
+    sed -nE 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' <<< "$body" | head -n1
+  fi
+}
+
+_host_pkg_mgr_update_ver() {
+  local src="$1" pkg="$2" out=""
+  case "$src" in
+    brew)
+      command -v brew >/dev/null 2>&1 || return 0
+      out="$(run_as_user_exec brew outdated --quiet --formula "$pkg" 2>/dev/null || true)"
+      [[ -n "$out" ]] && echo "brew-update"
+      ;;
+    distro)
+      case "$DISTRO_FAMILY" in
+        arch)
+          out="$(pacman -Qu "$pkg" 2>/dev/null | awk '{print $NF; exit}' || true)"
+          [[ -n "$out" ]] && echo "$out"
+          ;;
+        debian)
+          out="$(apt-get -s upgrade 2>/dev/null | awk -v p="$pkg" '$1=="Inst" && $2==p {gsub(/[\[\]()]/,"",$4); print $4; exit}' || true)"
+          [[ -n "$out" ]] && echo "$out"
+          ;;
+        fedora)
+          out="$(dnf -q check-update "$pkg" 2>/dev/null | awk -v p="$pkg" '$1 ~ "^"p"\\." {print $2; exit}' || true)"
+          [[ -n "$out" ]] && echo "$out"
+          ;;
+      esac
+      ;;
+    aur)
+      if [[ -n "${AUR_HELPER:-}" ]]; then
+        out="$(run_as_user_exec "$AUR_HELPER" -Qu "$pkg" 2>/dev/null | awk '{print $NF; exit}' || true)"
+        [[ -n "$out" ]] && echo "$out"
+      fi
+      ;;
+  esac
+}
+
+_host_check_update_by_source() {
+  local id="$1" src="$2" inst_ver="$3" pkg="$4" repo="$5" pypi_pkg="${6:-}" ttl="${7:-7200}"
+  case "$src" in
+    none|manual|docker)
+      _host_clear_update_cache "$id"
+      return 0
+      ;;
+    installer)
+      _host_check_update_cached "$id" "$inst_ver" "$repo" "$ttl" "github"
+      ;;
+    venv)
+      _host_check_update_cached "$id" "$inst_ver" "${pypi_pkg:-$pkg}" "$ttl" "pypi"
+      ;;
+    brew|distro|aur)
+      HOST_UPDATE_AVAIL[$id]="false"
+      HOST_UPDATE_LATEST[$id]=""
+      local cdir cfile now ts="" cached_ver=""
+      cdir="$(_host_update_cache_dir)"
+      cfile="${cdir}/${id}.cache"
+      now="$(date +%s 2>/dev/null || echo 0)"
+      if [[ -r "$cfile" ]]; then
+        IFS='|' read -r ts cached_ver < "$cfile" || true
+        if [[ "$ts" =~ ^[0-9]+$ ]] && (( now - ts < ttl )); then
+          if [[ -n "$cached_ver" && "$cached_ver" != "none" ]]; then
+            HOST_UPDATE_AVAIL[$id]="true"
+            HOST_UPDATE_LATEST[$id]="$cached_ver"
+          fi
+          return 0
+        fi
+      fi
+      cached_ver="$(_host_pkg_mgr_update_ver "$src" "$pkg" || true)"
+      mkdir -p "$cdir" 2>/dev/null || true
+      printf "%s|%s\n" "$now" "${cached_ver:-none}" > "$cfile" 2>/dev/null || true
+      [[ $EUID -eq 0 && "${TARGET_USER:-root}" != "root" ]] && chown "$TARGET_USER" "$cdir" "$cfile" 2>/dev/null || true
+      if [[ -n "$cached_ver" && "$cached_ver" != "none" ]]; then
+        HOST_UPDATE_AVAIL[$id]="true"
+        HOST_UPDATE_LATEST[$id]="$cached_ver"
+      fi
+      ;;
+  esac
+  return 0
 }
 
 _host_format_menu_row() {
@@ -469,9 +581,13 @@ _host_option_row() {
 }
 
 _host_build_options_list() {
-  local installed="$1" has_docker="${2:-false}"
+  local installed="$1" has_docker="${2:-false}" src="${3:-}"
   if [[ "$installed" == true ]]; then
-    echo "update service bench latest"
+    if [[ "$src" == "manual" ]]; then
+      echo "service bench latest"
+    else
+      echo "update service bench latest"
+    fi
   elif [[ "$has_docker" == true ]]; then
     echo "bench latest"
   else
@@ -480,7 +596,7 @@ _host_build_options_list() {
 }
 
 _host_run_options_page() {
-  local name="" unit="" refresh_fn="" bin_var="" ver_var="" docker_var="" url="" is_running_fn="" dispatch_fn=""
+  local name="" unit="" refresh_fn="" bin_var="" ver_var="" docker_var="" source_var="" url="" is_running_fn="" dispatch_fn=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --name) name="$2"; shift 2 ;;
@@ -489,6 +605,7 @@ _host_run_options_page() {
       --bin-var) bin_var="$2"; shift 2 ;;
       --ver-var) ver_var="$2"; shift 2 ;;
       --docker-var) docker_var="$2"; shift 2 ;;
+      --source-var) source_var="$2"; shift 2 ;;
       --url) url="$2"; shift 2 ;;
       --is-running) is_running_fn="$2"; shift 2 ;;
       --dispatch) dispatch_fn="$2"; shift 2 ;;
@@ -499,8 +616,9 @@ _host_run_options_page() {
   local sel=0
   while true; do
     [[ -n "$refresh_fn" ]] && "$refresh_fn"
-    local bin_val="${!bin_var:-}" ver_val="${!ver_var:-}" docker_val=""
+    local bin_val="${!bin_var:-}" ver_val="${!ver_var:-}" docker_val="" src_val=""
     [[ -n "$docker_var" ]] && docker_val="${!docker_var:-}"
+    [[ -n "$source_var" ]] && src_val="${!source_var:-}"
     local installed=false has_docker=false running=false
     [[ -n "$bin_val" ]] && installed=true
     [[ -n "$docker_val" ]] && has_docker=true
@@ -509,7 +627,7 @@ _host_run_options_page() {
     fi
 
     local -a opts=()
-    read -ra opts <<< "$(_host_build_options_list "$installed" "$has_docker")"
+    read -ra opts <<< "$(_host_build_options_list "$installed" "$has_docker" "$src_val")"
     local total=${#opts[@]}
     (( sel >= total )) && sel=$(( total - 1 ))
     (( sel < 0 )) && sel=0
@@ -520,7 +638,7 @@ _host_run_options_page() {
     if [[ "$installed" != true && "$has_docker" == true ]]; then
       echo -e "  Docker:   ${docker_val%%|*} (${docker_val#*|})"
     else
-      echo -e "  Binary:   ${bin_val:-not installed}"
+      echo -e "  Binary:   ${bin_val:-not installed}${src_val:+ (${src_val})}"
       echo -e "  Version:  ${ver_val:-n/a}"
     fi
     echo -e "  Endpoint: ${url}"

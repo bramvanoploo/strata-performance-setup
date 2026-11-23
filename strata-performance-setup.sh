@@ -165,7 +165,7 @@ declare -A HOST_PLUGIN_LOADED=() TWEAK_PACK_LOADED=()
 declare -A HOST_PLUGIN_NAMES=([strata]="Strata")
 declare -A HOST_PLUGIN_DESCS=([strata]="Install, update, launch, and benchmark Strata LLM server")
 declare -A HOST_PLUGIN_CAPS=([strata]="install,service,updates,bench,stats")
-declare -A HOST_UPDATE_AVAIL=() HOST_UPDATE_LATEST=()
+declare -A HOST_UPDATE_AVAIL=() HOST_UPDATE_LATEST=() HOST_INSTALL_SOURCE=()
 SERVER_UPDATE_POLLER_PID=""
 declare -A TWEAK_REGISTERED=() STEP_TIER=() STEP_OS=() STEP_LAPTOP_REC=() STEP_VM_SUPPORTED=() STEP_EXP_NON_ARCH=()
 
@@ -5237,6 +5237,8 @@ format_server_row() {
   svc_col="$(_pad_ansi_col "$svc_txt" 16)"
   if [[ "$has_upd" == true ]]; then
     upd_cell="$(_pad_ansi_col "${C_BGREEN}↑${C_RESET}" 3)"
+  elif [[ "$inst" == true && "${HOST_INSTALL_SOURCE[$pid]:-}" == "manual" ]]; then
+    upd_cell="$(_pad_ansi_col "${C_DIM}-${C_RESET}" 3)"
   else
     upd_cell="$(_server_cap_cell "$caps" "updates" 3)"
   fi

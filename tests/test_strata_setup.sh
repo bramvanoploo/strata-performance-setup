@@ -533,6 +533,22 @@ EOF
 
   DISTRO_FAMILY="arch" IS_MACOS=false AUR_HELPER="" LLAMACPP_BIN="/usr/local/bin/llama-server"
   pacman() { return 1; }
+  PKG_INST_CACHE=()
+  src_manual="$(_host_detect_install_source "llamacpp" "/usr/local/bin/llama-server" "llama.cpp" false)"
+  assert_eq "$src_manual" "manual" "_host_detect_install_source detects manual build when unowned by package manager"
+  src_venv="$(_host_detect_install_source "vllm" "$(_host_venv_dir "vllm")/bin/vllm" "vllm" false)"
+  assert_eq "$src_venv" "venv" "_host_detect_install_source detects managed venv install"
+  HOST_UPDATE_AVAIL[llamacpp]="true"
+  _host_check_update_by_source "llamacpp" "manual" "0.6.0-dev" "llama.cpp" "ggml-org/llama.cpp"
+  assert_eq "${HOST_UPDATE_AVAIL[llamacpp]}" "false" "_host_check_update_by_source does not flag manual builds from GitHub"
+  opts_manual="$(_host_build_options_list true false "manual")"
+  assert_eq "$opts_manual" "service bench latest" "manual build hides update option"
+  HOST_INSTALL_SOURCE[llamacpp]="manual"
+  HOST_UPDATE_AVAIL[llamacpp]="false"
+  AVAILABLE_HOST_PLUGINS=("llamacpp")
+  srv_manual_row="$(format_server_row 0 false | sed -E $'s/\033\\[[0-9;]*m//g')"
+  assert_contains "$srv_manual_row" "| -   | ✓" "manual install hides Upd checkmark in Servers table"
+  LLAMACPP_SOURCE="$src_manual"
   rc_ll=0; _llamacpp_install_or_update >/dev/null 2>&1 || rc_ll=$?
   assert_eq "$rc_ll" "1" "_llamacpp_install_or_update returns 1 cleanly without unbound variable when no package exists"
 )
