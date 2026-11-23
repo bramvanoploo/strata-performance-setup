@@ -15,6 +15,7 @@ register_host_plugin \
 
 MLX_LM_BIN=""
 MLX_LM_VERSION=""
+MLX_LM_SOURCE="none"
 MLX_LM_PORT="${MLX_LM_PORT:-8080}"
 MLX_LM_URL="http://127.0.0.1:${MLX_LM_PORT}"
 
@@ -25,6 +26,7 @@ _mlx_lm_refresh() {
     MLX_LM_VERSION="$(_host_venv_pkg_version "mlx-lm" "mlx-lm" || true)"
     [[ -z "$MLX_LM_VERSION" ]] && MLX_LM_VERSION="installed"
   fi
+  MLX_LM_SOURCE="$(_host_detect_install_source "mlx-lm" "$MLX_LM_BIN" "mlx-lm" false)"
 }
 
 _mlx_lm_running() {
@@ -60,7 +62,7 @@ mlx-lm_table_status() {
 }
 
 mlx-lm_check_update() {
-  [[ -n "$MLX_LM_BIN" ]] && _host_check_update_cached "mlx-lm" "$MLX_LM_VERSION" "ml-explore/mlx-lm"
+  [[ -n "$MLX_LM_BIN" ]] && _host_check_update_by_source "mlx-lm" "$MLX_LM_SOURCE" "$MLX_LM_VERSION" "mlx-lm" "ml-explore/mlx-lm" "mlx-lm"
 }
 
 mlx-lm_update() {
@@ -120,6 +122,7 @@ mlx-lm_open() {
     --refresh "_mlx_lm_refresh" \
     --bin-var "MLX_LM_BIN" \
     --ver-var "MLX_LM_VERSION" \
+    --source-var "MLX_LM_SOURCE" \
     --url "$MLX_LM_URL" \
     --is-running "_mlx_lm_running" \
     --dispatch "_mlx_lm_dispatch"

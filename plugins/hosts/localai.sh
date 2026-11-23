@@ -16,6 +16,7 @@ register_host_plugin \
 LOCALAI_BIN=""
 LOCALAI_VERSION=""
 LOCALAI_DOCKER=""
+LOCALAI_SOURCE="none"
 LOCALAI_PORT="${LOCALAI_PORT:-8080}"
 LOCALAI_URL="http://127.0.0.1:${LOCALAI_PORT}"
 
@@ -30,6 +31,7 @@ _localai_refresh() {
   if [[ -z "$LOCALAI_BIN" ]]; then
     LOCALAI_DOCKER="$(_host_find_docker 'local-ai|localai' || true)"
   fi
+  LOCALAI_SOURCE="$(_host_detect_install_source "localai" "$LOCALAI_BIN" "localai" true)"
 }
 
 _localai_running() {
@@ -65,7 +67,7 @@ localai_table_status() {
 }
 
 localai_check_update() {
-  [[ -n "$LOCALAI_BIN" ]] && _host_check_update_cached "localai" "$LOCALAI_VERSION" "mudler/LocalAI"
+  [[ -n "$LOCALAI_BIN" ]] && _host_check_update_by_source "localai" "$LOCALAI_SOURCE" "$LOCALAI_VERSION" "localai" "mudler/LocalAI"
 }
 
 localai_update() {
@@ -73,12 +75,22 @@ localai_update() {
 }
 
 _localai_install_or_update() {
-  if [[ "$IS_MACOS" == true ]] && command -v brew >/dev/null 2>&1; then
-    if [[ -n "$LOCALAI_BIN" ]]; then
-      run_as_user_exec brew upgrade localai || true
-    else
-      run_as_user_exec brew install localai
-    fi
+  if [[ -n "$LOCALAI_BIN" ]]; then
+    case "$LOCALAI_SOURCE" in
+      brew)   run_as_user_exec brew upgrade localai || true ;;
+      distro) pkg_install localai ;;
+      aur)    aur_install localai ;;
+      installer)
+        echo -e "${C_CYAN}Running official LocalAI installer...${C_RESET}"
+        run_root bash -c 'curl -fsSL https://localai.io/install.sh | sh'
+        ;;
+      *)
+        echo -e "${C_YELLOW}LocalAI at ${LOCALAI_BIN} is not managed by a package manager; update it from its original source.${C_RESET}"
+        return 1
+        ;;
+    esac
+  elif [[ "$IS_MACOS" == true ]] && command -v brew >/dev/null 2>&1; then
+    run_as_user_exec brew install localai
   elif [[ "$IS_MACOS" == false ]]; then
     echo -e "${C_CYAN}Running official LocalAI installer...${C_RESET}"
     run_root bash -c 'curl -fsSL https://localai.io/install.sh | sh'
@@ -121,6 +133,7 @@ localai_open() {
     --bin-var "LOCALAI_BIN" \
     --ver-var "LOCALAI_VERSION" \
     --docker-var "LOCALAI_DOCKER" \
+    --source-var "LOCALAI_SOURCE" \
     --url "$LOCALAI_URL" \
     --is-running "_localai_running" \
     --dispatch "_localai_dispatch"

@@ -16,6 +16,7 @@ register_host_plugin \
 OLLAMA_BIN=""
 OLLAMA_VERSION=""
 OLLAMA_DOCKER=""
+OLLAMA_SOURCE="none"
 OLLAMA_URL="${OLLAMA_HOST:-http://127.0.0.1:11434}"
 [[ "$OLLAMA_URL" != http* ]] && OLLAMA_URL="http://${OLLAMA_URL}"
 
@@ -29,6 +30,7 @@ _ollama_refresh() {
   if [[ -z "$OLLAMA_BIN" ]]; then
     OLLAMA_DOCKER="$(_host_find_docker '(^|[/_-])ollama(:|@|$)' || true)"
   fi
+  OLLAMA_SOURCE="$(_host_detect_install_source "ollama" "$OLLAMA_BIN" "ollama" true)"
 }
 
 _ollama_running() {
@@ -83,7 +85,7 @@ ollama_table_status() {
 }
 
 ollama_check_update() {
-  [[ -n "$OLLAMA_BIN" ]] && _host_check_update_cached "ollama" "$OLLAMA_VERSION" "ollama/ollama"
+  [[ -n "$OLLAMA_BIN" ]] && _host_check_update_by_source "ollama" "$OLLAMA_SOURCE" "$OLLAMA_VERSION" "ollama" "ollama/ollama"
 }
 
 ollama_update() {
@@ -91,14 +93,24 @@ ollama_update() {
 }
 
 _ollama_install_or_update() {
-  if [[ "$IS_MACOS" == true ]] && command -v brew >/dev/null 2>&1; then
-    if [[ -n "$OLLAMA_BIN" ]]; then
-      run_as_user_exec brew upgrade ollama || true
-    else
-      run_as_user_exec brew install ollama
-    fi
+  if [[ -n "$OLLAMA_BIN" ]]; then
+    case "$OLLAMA_SOURCE" in
+      brew)   run_as_user_exec brew upgrade ollama || true ;;
+      distro) pkg_install ollama ;;
+      aur)    aur_install ollama ;;
+      installer)
+        echo -e "${C_CYAN}Running official Ollama installer...${C_RESET}"
+        run_root bash -c 'curl -fsSL https://ollama.com/install.sh | sh'
+        ;;
+      *)
+        echo -e "${C_YELLOW}Ollama at ${OLLAMA_BIN} is not managed by a package manager; update it from its original source.${C_RESET}"
+        return 1
+        ;;
+    esac
+  elif [[ "$IS_MACOS" == true ]] && command -v brew >/dev/null 2>&1; then
+    run_as_user_exec brew install ollama
   elif [[ "$IS_MACOS" == false ]]; then
-    if [[ -z "$OLLAMA_BIN" ]] && pkg_available repo ollama 2>/dev/null; then
+    if pkg_available repo ollama 2>/dev/null; then
       pkg_install ollama || true
     else
       echo -e "${C_CYAN}Running official Ollama installer...${C_RESET}"
@@ -142,6 +154,7 @@ ollama_open() {
     --bin-var "OLLAMA_BIN" \
     --ver-var "OLLAMA_VERSION" \
     --docker-var "OLLAMA_DOCKER" \
+    --source-var "OLLAMA_SOURCE" \
     --url "$OLLAMA_URL" \
     --is-running "_ollama_running" \
     --dispatch "_ollama_dispatch"

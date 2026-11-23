@@ -16,6 +16,7 @@ register_host_plugin \
 VLLM_BIN=""
 VLLM_VERSION=""
 VLLM_DOCKER=""
+VLLM_SOURCE="none"
 VLLM_PORT="${VLLM_PORT:-8000}"
 VLLM_URL="http://127.0.0.1:${VLLM_PORT}"
 
@@ -30,6 +31,7 @@ _vllm_refresh() {
   if [[ -z "$VLLM_BIN" ]]; then
     VLLM_DOCKER="$(_host_find_docker 'vllm' || true)"
   fi
+  VLLM_SOURCE="$(_host_detect_install_source "vllm" "$VLLM_BIN" "vllm" false)"
 }
 
 _vllm_running() {
@@ -71,7 +73,7 @@ vllm_table_status() {
 }
 
 vllm_check_update() {
-  [[ -n "$VLLM_BIN" ]] && _host_check_update_cached "vllm" "$VLLM_VERSION" "vllm-project/vllm"
+  [[ -n "$VLLM_BIN" ]] && _host_check_update_by_source "vllm" "$VLLM_SOURCE" "$VLLM_VERSION" "vllm" "vllm-project/vllm" "vllm"
 }
 
 vllm_update() {
@@ -120,6 +122,7 @@ vllm_open() {
     --bin-var "VLLM_BIN" \
     --ver-var "VLLM_VERSION" \
     --docker-var "VLLM_DOCKER" \
+    --source-var "VLLM_SOURCE" \
     --url "$VLLM_URL" \
     --is-running "_vllm_running" \
     --dispatch "_vllm_dispatch"

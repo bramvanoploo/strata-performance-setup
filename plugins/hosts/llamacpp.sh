@@ -17,6 +17,7 @@ LLAMACPP_BIN=""
 LLAMACPP_BENCH_BIN=""
 LLAMACPP_VERSION=""
 LLAMACPP_DOCKER=""
+LLAMACPP_SOURCE="none"
 LLAMACPP_PORT="${LLAMACPP_PORT:-8080}"
 LLAMACPP_URL="http://127.0.0.1:${LLAMACPP_PORT}"
 
@@ -32,6 +33,7 @@ _llamacpp_refresh() {
   if [[ -z "$LLAMACPP_BIN" ]]; then
     LLAMACPP_DOCKER="$(_host_find_docker 'llama[.]?cpp|llama-server' || true)"
   fi
+  LLAMACPP_SOURCE="$(_host_detect_install_source "llamacpp" "$LLAMACPP_BIN" "llama.cpp" false)"
 }
 
 _llamacpp_running() {
@@ -67,7 +69,7 @@ llamacpp_table_status() {
 }
 
 llamacpp_check_update() {
-  [[ -n "$LLAMACPP_BIN" ]] && _host_check_update_cached "llamacpp" "$LLAMACPP_VERSION" "ggml-org/llama.cpp"
+  [[ -n "$LLAMACPP_BIN" ]] && _host_check_update_by_source "llamacpp" "$LLAMACPP_SOURCE" "$LLAMACPP_VERSION" "llama.cpp" "ggml-org/llama.cpp"
 }
 
 llamacpp_update() {
@@ -75,18 +77,24 @@ llamacpp_update() {
 }
 
 _llamacpp_install_or_update() {
-  if [[ "$IS_MACOS" == true ]] && command -v brew >/dev/null 2>&1; then
-    if [[ -n "$LLAMACPP_BIN" ]]; then
-      run_as_user_exec brew upgrade llama.cpp || true
-    else
-      run_as_user_exec brew install llama.cpp
-    fi
+  if [[ -n "$LLAMACPP_BIN" ]]; then
+    case "$LLAMACPP_SOURCE" in
+      brew)   run_as_user_exec brew upgrade llama.cpp || true ;;
+      distro) pkg_install llama.cpp ;;
+      aur)    aur_install llama.cpp ;;
+      *)
+        echo -e "${C_YELLOW}llama.cpp at ${LLAMACPP_BIN} is not managed by a package manager; update it from its original build source.${C_RESET}"
+        return 1
+        ;;
+    esac
+  elif [[ "$IS_MACOS" == true ]] && command -v brew >/dev/null 2>&1; then
+    run_as_user_exec brew install llama.cpp
   elif pkg_available repo llama.cpp 2>/dev/null; then
     pkg_install llama.cpp
   elif [[ "$DISTRO_FAMILY" == "arch" ]] && pkg_available aur llama.cpp 2>/dev/null; then
     aur_install llama.cpp
   else
-    echo -e "${C_YELLOW}No repo/AUR package 'llama.cpp' found${LLAMACPP_BIN:+ (binary at ${LLAMACPP_BIN})}. Update your local build or install from https://github.com/ggml-org/llama.cpp${C_RESET}"
+    echo -e "${C_YELLOW}No repo/AUR package 'llama.cpp' found. Install via Homebrew, your distro/AUR, or build from https://github.com/ggml-org/llama.cpp${C_RESET}"
     return 1
   fi
   _llamacpp_refresh
@@ -139,6 +147,7 @@ llamacpp_open() {
     --bin-var "LLAMACPP_BIN" \
     --ver-var "LLAMACPP_VERSION" \
     --docker-var "LLAMACPP_DOCKER" \
+    --source-var "LLAMACPP_SOURCE" \
     --url "$LLAMACPP_URL" \
     --is-running "_llamacpp_running" \
     --dispatch "_llamacpp_dispatch"

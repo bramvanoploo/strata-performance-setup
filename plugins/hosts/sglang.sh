@@ -16,6 +16,7 @@ register_host_plugin \
 SGLANG_PY=""
 SGLANG_VERSION=""
 SGLANG_DOCKER=""
+SGLANG_SOURCE="none"
 SGLANG_PORT="${SGLANG_PORT:-30000}"
 SGLANG_URL="http://127.0.0.1:${SGLANG_PORT}"
 
@@ -35,6 +36,7 @@ _sglang_refresh() {
   if [[ -z "$SGLANG_VERSION" ]]; then
     SGLANG_DOCKER="$(_host_find_docker 'sglang' || true)"
   fi
+  SGLANG_SOURCE="$(_host_detect_install_source "sglang" "$SGLANG_PY" "sglang" false)"
 }
 
 _sglang_running() {
@@ -76,7 +78,7 @@ sglang_table_status() {
 }
 
 sglang_check_update() {
-  [[ -n "$SGLANG_VERSION" ]] && _host_check_update_cached "sglang" "$SGLANG_VERSION" "sgl-project/sglang"
+  [[ -n "$SGLANG_VERSION" ]] && _host_check_update_by_source "sglang" "$SGLANG_SOURCE" "$SGLANG_VERSION" "sglang" "sgl-project/sglang" "sglang"
 }
 
 sglang_update() {
@@ -125,6 +127,7 @@ sglang_open() {
     --bin-var "SGLANG_PY" \
     --ver-var "SGLANG_VERSION" \
     --docker-var "SGLANG_DOCKER" \
+    --source-var "SGLANG_SOURCE" \
     --url "$SGLANG_URL" \
     --is-running "_sglang_running" \
     --dispatch "_sglang_dispatch"
