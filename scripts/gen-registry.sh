@@ -23,13 +23,14 @@ for cat in hosts tweaks; do
   for f in "$dir"/*.sh; do
     [[ -f "$f" ]] || continue
     base="$(basename "$f")"
-    [[ "$base" == _* ]] && continue
+    [[ "$base" == _* && "$base" != "_common.sh" ]] && continue
     id="${base%.sh}"
     name="$(awk -F': ' '/^# PLUGIN_NAME:/ {print $2; exit}' "$f" || true)"
     desc="$(awk -F': ' '/^# PLUGIN_DESC:/ {print $2; exit}' "$f" || true)"
+    plat="$(awk -F': ' '/^# PLUGIN_PLATFORMS:/ {print $2; exit}' "$f" || true)"
     sha="$(_hash_file "$f")"
-    printf '%s\t%s\t%s\t%s\tplugins/%s/%s\t%s\n' \
-      "$cat" "$id" "${name:-$id}" "${desc:-}" "$cat" "$base" "$sha" >> "$tmp"
+    printf '%s\t%s\t%s\t%s\tplugins/%s/%s\t%s\t%s\n' \
+      "$cat" "$id" "${name:-$id}" "${desc:-}" "$cat" "$base" "$sha" "${plat:-all}" >> "$tmp"
   done
 done
 

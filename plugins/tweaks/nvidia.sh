@@ -463,6 +463,7 @@ apply_gpu_unlock() {
       fi
       local build_dir build_ok=false
       build_dir="$(mktemp -d /tmp/gpu-unlock.XXXXXX)"
+      trap "rm -rf $(printf '%q' "$build_dir")" RETURN
       [[ $EUID -eq 0 && "$TARGET_USER" != "root" ]] && chown "$TARGET_USER" "$build_dir" 2>/dev/null || true
       echo -e "${C_CYAN}Cloning and building gpu-unlock from source...${C_RESET}"
       if ! run_as_user_exec git clone --depth 1 https://github.com/Zagitta/gpu-unlock.git "$build_dir/src"; then
@@ -610,6 +611,7 @@ apply_nvidia_pstate() {
       local bdir nvml_inc
       nvml_inc="$(_find_nvml_include_dir)"
       bdir="$(mktemp -d /tmp/nvidia-pstated.XXXXXX)"
+      trap "rm -rf $(printf '%q' "$bdir")" RETURN
       [[ $EUID -eq 0 && "$TARGET_USER" != "root" ]] && chown "$TARGET_USER" "$bdir" 2>/dev/null || true
       echo -e "${C_CYAN}Building sasha0552/nvidia-pstated from source...${C_RESET}"
       if run_as_user_exec git clone --depth 1 https://github.com/sasha0552/nvidia-pstated.git "$bdir/src" &&

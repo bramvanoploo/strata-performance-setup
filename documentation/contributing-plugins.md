@@ -2,7 +2,7 @@
 
 `strata-performance-setup.sh` uses a modular, lazy-loaded plugin architecture with two plugin categories:
 
-1. **LLM Host Plugins (`plugins/hosts/<id>.sh`)** — Install, update, manage services, and benchmark LLM inference servers (e.g. `strata.sh`). Loaded on demand when selected from the Index page or passed via `--plugin <id>`.
+1. **LLM Host Plugins (`plugins/hosts/<id>.sh`)** — Install, update, manage services, and benchmark LLM inference servers (`strata.sh`, `ollama.sh`, `llamacpp.sh`, `localai.sh`, `vllm.sh`, `sglang.sh`, `mlx-lm.sh`). Loaded on demand when selected from the Index page or passed via `--plugin <id>`, and filtered by detected OS/hardware via `# PLUGIN_PLATFORMS`.
 2. **Performance Tweak Packs (`plugins/tweaks/<pack>.sh`)** — Host/hardware optimization steps grouped by platform/vendor (`linux-core.sh`, `linux-laptop.sh`, `nvidia.sh`, `amd.sh`, `intel.sh`, `jetson.sh`, `macos.sh`, `common.sh`). Loaded automatically based on detected OS and hardware.
 
 ---
@@ -25,28 +25,49 @@ plugins/
 ## Creating an LLM Host Plugin (`plugins/hosts/<id>.sh`)
 
 1. Copy `plugins/hosts/_template.sh` to `plugins/hosts/<id>.sh`.
-2. Add the 3-line metadata header at the top:
+2. Add the metadata header at the top:
    ```bash
    # PLUGIN_ID: ollama
    # PLUGIN_NAME: Ollama
-   # PLUGIN_DESC: Install, configure, and benchmark Ollama LLM server
+   # PLUGIN_DESC: Install, update, manage service, and benchmark Ollama LLM server
+   # PLUGIN_PLATFORMS: all
    ```
+   Supported `# PLUGIN_PLATFORMS` values (also stored in `plugins/registry.tsv`):
+   - `all` (default) — Shown on Linux and macOS.
+   - `linux` — Shown on Linux only (`vllm`, `sglang`).
+   - `linux-gpu` — Shown on Linux with a detected NVIDIA, AMD, or Intel GPU.
+   - `macos` — Shown on macOS only.
+   - `macos-arm64` — Shown on Apple Silicon macOS only (`mlx-lm`).
 3. Call `register_host_plugin`:
    ```bash
    register_host_plugin \
      --id "ollama" \
      --name "Ollama" \
-     --description "Install, configure, and benchmark Ollama LLM server"
+     --description "Install, update, manage service, and benchmark Ollama LLM server" \
+     --platforms "all"
    ```
-4. Implement the required hooks:
+4. Optionally source `plugins/hosts/_common.sh` for shared helpers (`_host_find_bin`, `_host_find_docker`, `_host_github_latest_tag`, `_host_venv_install_or_upgrade`, `_host_manage_service_action`, `_host_openai_bench`, `_host_format_menu_row`).
+5. Implement the required hooks:
    - `<id>_init()` — Called once after sourcing; detect binary/container/version or start pollers.
    - `<id>_menu_row(selected)` — Print a 1-line status row for the Index page.
    - `<id>_open()` — Render and handle your interactive TUI subpage.
-5. Implement optional hooks as needed:
+6. Implement optional hooks as needed:
    - `<id>_live_stats()` — Populate `LIVE_STAT_LINES` / `LIVE_COMPACT_STRATA` for `[STATS]`.
    - `<id>_check_summary()` — Print summary lines for `--check` / `[c]`.
    - `<id>_hw_warnings()` — Print hardware compatibility warnings above the Index.
    - `<id>_cleanup()` — Stop background pollers on exit.
+
+### Built-in LLM Host Plugins
+
+| ID | Host | Platforms | Capabilities |
+| :--- | :--- | :--- | :--- |
+| `strata` | Strata | `all` | Install/build/update, `systemd`/`launchd` service, live stats, `strata bench` |
+| `ollama` | Ollama | `all` | Installer/`brew`, `ollama.service`, release check, `/api/ps` stats, OpenAI bench |
+| `llamacpp` | llama.cpp | `all` | `brew`/distro/AUR, `llama-server` service, release check, `llama-bench`/OpenAI bench |
+| `localai` | LocalAI | `all` | Installer/`brew`, `localai.service`, release check, `/readyz` stats, OpenAI bench |
+| `vllm` | vLLM | `linux` | `uv`/`pip` venv, `vllm.service`, release check, `/health` stats, OpenAI bench |
+| `sglang` | SGLang | `linux` | `uv`/`pip` venv, `sglang.service`, release check, `/health` stats, OpenAI bench |
+| `mlx-lm` | MLX LM | `macos-arm64` | `uv`/`pip` venv, `mlx-lm` `launchd` service, release check, `mlx_lm.benchmark`/OpenAI bench |
 
 ---
 

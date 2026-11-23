@@ -155,7 +155,7 @@ STRATA_UPDATE_AVAILABLE=false STRATA_UPDATE_SUMMARY="" STRATA_UPDATE_CACHE_FILE=
 UNIT_FILES_CACHE=""
 declare -A PKG_AVAIL_CACHE PKG_INST_CACHE
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT_VERSION="1.9.0"
+SCRIPT_VERSION="1.9.2"
 PLUGIN_BASE_URL="${STRATA_PLUGIN_BASE_URL:-https://raw.githubusercontent.com/bramvanoploo/strata-performance-setup/main}"
 PLUGIN_CACHE_DIR="${STRATA_PLUGIN_CACHE_DIR:-${XDG_CACHE_HOME:-$TARGET_HOME/.cache}/strata-performance-setup/plugins}"
 NO_PLUGINS=false
@@ -164,6 +164,7 @@ declare -a REQUESTED_HOST_PLUGINS=() LOADED_HOST_PLUGINS=() LOADED_TWEAK_PACKS=(
 declare -A HOST_PLUGIN_LOADED=() TWEAK_PACK_LOADED=()
 declare -A HOST_PLUGIN_NAMES=([strata]="Strata")
 declare -A HOST_PLUGIN_DESCS=([strata]="Install, update, launch, and benchmark Strata LLM server")
+declare -A HOST_PLUGIN_CAPS=([strata]="install,service,updates,bench,stats")
 declare -A TWEAK_REGISTERED=() STEP_TIER=() STEP_OS=() STEP_LAPTOP_REC=() STEP_VM_SUPPORTED=() STEP_EXP_NON_ARCH=()
 
 # ------------------------------------------------------------------------------
@@ -2850,13 +2851,27 @@ _registry_sha256() {
   awk -F'\t' -v c="$category" -v i="$id" '$1==c && $2==i {print $6; exit}' "$reg" 2>/dev/null || true
 }
 
+_host_plugin_supported() {
+  local plat="${1:-all}"
+  case "$plat" in
+    ""|all) return 0 ;;
+    linux) [[ "$IS_MACOS" != true ]] ;;
+    linux-gpu) [[ "$IS_MACOS" != true && ( "$HAS_NVIDIA" == true || "$HAS_AMD" == true || "$HAS_INTEL_GPU" == true ) ]] ;;
+    macos) [[ "$IS_MACOS" == true ]] ;;
+    macos-arm64) [[ "$IS_MACOS" == true && "$IS_APPLE_SILICON" == true ]] ;;
+    *) return 0 ;;
+  esac
+}
+
 discover_host_plugins() {
-  local f id name desc reg=""
+  local f id name desc plat reg=""
   if [[ -d "${SCRIPT_DIR}/plugins/hosts" ]]; then
     for f in "${SCRIPT_DIR}/plugins/hosts/"*.sh; do
       [[ -f "$f" ]] || continue
       id="$(basename "$f" .sh)"
       [[ "$id" == _* ]] && continue
+      plat="$(awk -F': ' '/^# PLUGIN_PLATFORMS:/ {print $2; exit}' "$f" 2>/dev/null || true)"
+      _host_plugin_supported "${plat:-all}" || continue
       if ! _array_contains_val "$id" "${AVAILABLE_HOST_PLUGINS[@]}"; then
         AVAILABLE_HOST_PLUGINS+=("$id")
       fi
@@ -2872,8 +2887,9 @@ discover_host_plugins() {
   fi
   reg="$(_registry_file || true)"
   if [[ -n "$reg" && -f "$reg" ]]; then
-    while IFS=$'\t' read -r cat pid pname pdesc _pfile _psha; do
+    while IFS=$'\t' read -r cat pid pname pdesc _pfile _psha pplat; do
       [[ "$cat" == "hosts" && -n "$pid" && "$pid" != _* ]] || continue
+      _host_plugin_supported "${pplat:-all}" || continue
       if ! _array_contains_val "$pid" "${AVAILABLE_HOST_PLUGINS[@]}"; then
         AVAILABLE_HOST_PLUGINS+=("$pid")
       fi
@@ -2884,21 +2900,25 @@ discover_host_plugins() {
 }
 
 register_host_plugin() {
-  local id="" name="" desc=""
+  local id="" name="" desc="" plat="all" caps="install,service,updates,bench,stats"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --id) id="$2"; shift 2 ;;
       --name) name="$2"; shift 2 ;;
       --description|--desc) desc="$2"; shift 2 ;;
+      --platforms) plat="$2"; shift 2 ;;
+      --caps) caps="$2"; shift 2 ;;
       *) shift ;;
     esac
   done
   [[ -n "$id" ]] || return 1
+  _host_plugin_supported "$plat" || return 0
   if ! _array_contains_val "$id" "${AVAILABLE_HOST_PLUGINS[@]}"; then
     AVAILABLE_HOST_PLUGINS+=("$id")
   fi
   [[ -n "$name" ]] && HOST_PLUGIN_NAMES[$id]="$name"
   [[ -n "$desc" ]] && HOST_PLUGIN_DESCS[$id]="$desc"
+  HOST_PLUGIN_CAPS[$id]="$caps"
 }
 
 register_tweak() {
@@ -2928,6 +2948,49 @@ register_tweak() {
   STEP_EXP_NON_ARCH[$id]="$exp_non_arch"
 }
 
+_FETCHED_PLUGIN_FILE=""
+
+_fetch_verified_plugin() {
+  local category="$1" id="$2"
+  local local_file="${SCRIPT_DIR}/plugins/${category}/${id}.sh"
+  local cache_file="${PLUGIN_CACHE_DIR}/${category}/${id}.sh"
+  local target_file="" expected_sha="" actual_sha=""
+
+  if [[ -f "$local_file" ]]; then
+    _FETCHED_PLUGIN_FILE="$local_file"
+    return 0
+  fi
+
+  expected_sha="$(_registry_sha256 "$category" "$id")"
+  if [[ -f "$cache_file" ]]; then
+    if [[ -z "$expected_sha" ]]; then
+      target_file="$cache_file"
+    else
+      actual_sha="$(_sha256_file "$cache_file" || true)"
+      [[ "$actual_sha" == "$expected_sha" ]] && target_file="$cache_file"
+    fi
+  fi
+  if [[ -z "$target_file" ]]; then
+    mkdir -p "${PLUGIN_CACHE_DIR}/${category}" 2>/dev/null || return 1
+    local tmp_file="${cache_file}.tmp.$$"
+    if ! _fetch_url "${PLUGIN_BASE_URL}/plugins/${category}/${id}.sh" "$tmp_file"; then
+      rm -f "$tmp_file"
+      return 1
+    fi
+    if [[ -n "$expected_sha" ]]; then
+      actual_sha="$(_sha256_file "$tmp_file" || true)"
+      if [[ "$actual_sha" != "$expected_sha" ]]; then
+        rm -f "$tmp_file"
+        echo -e "${C_RED}Checksum mismatch for plugin ${category}/${id}.sh — refusing to load.${C_RESET}" >&2
+        return 1
+      fi
+    fi
+    mv -f "$tmp_file" "$cache_file"
+    target_file="$cache_file"
+  fi
+  _FETCHED_PLUGIN_FILE="$target_file"
+}
+
 load_plugin() {
   local category="$1" id="$2"
   if [[ "$category" == "hosts" && -n "${HOST_PLUGIN_LOADED[$id]:-}" ]]; then
@@ -2936,41 +2999,11 @@ load_plugin() {
     return 0
   fi
 
-  local local_file="${SCRIPT_DIR}/plugins/${category}/${id}.sh"
-  local cache_file="${PLUGIN_CACHE_DIR}/${category}/${id}.sh"
-  local target_file="" expected_sha="" actual_sha=""
-
-  if [[ -f "$local_file" ]]; then
-    target_file="$local_file"
-  else
-    expected_sha="$(_registry_sha256 "$category" "$id")"
-    if [[ -f "$cache_file" ]]; then
-      if [[ -z "$expected_sha" ]]; then
-        target_file="$cache_file"
-      else
-        actual_sha="$(_sha256_file "$cache_file" || true)"
-        [[ "$actual_sha" == "$expected_sha" ]] && target_file="$cache_file"
-      fi
-    fi
-    if [[ -z "$target_file" ]]; then
-      mkdir -p "${PLUGIN_CACHE_DIR}/${category}" 2>/dev/null || return 1
-      local tmp_file="${cache_file}.tmp.$$"
-      if ! _fetch_url "${PLUGIN_BASE_URL}/plugins/${category}/${id}.sh" "$tmp_file"; then
-        rm -f "$tmp_file"
-        return 1
-      fi
-      if [[ -n "$expected_sha" ]]; then
-        actual_sha="$(_sha256_file "$tmp_file" || true)"
-        if [[ "$actual_sha" != "$expected_sha" ]]; then
-          rm -f "$tmp_file"
-          echo -e "${C_RED}Checksum mismatch for plugin ${category}/${id}.sh — refusing to load.${C_RESET}" >&2
-          return 1
-        fi
-      fi
-      mv -f "$tmp_file" "$cache_file"
-      target_file="$cache_file"
-    fi
+  if [[ "$category" == "hosts" && ! -f "${SCRIPT_DIR}/plugins/hosts/_common.sh" ]]; then
+    _fetch_verified_plugin "hosts" "_common" || return 1
   fi
+  _fetch_verified_plugin "$category" "$id" || return 1
+  local target_file="$_FETCHED_PLUGIN_FILE"
 
   # shellcheck source=/dev/null
   source "$target_file"
@@ -4332,21 +4365,15 @@ format_stats_toggle_row() {
   fi
 }
 
-format_host_plugin_row() {
-  local pid="$1" selected="${2:-false}"
-  if [[ -n "${HOST_PLUGIN_LOADED[$pid]:-}" ]] && declare -F "${pid}_menu_row" >/dev/null 2>&1; then
-    "${pid}_menu_row" "$selected"
-    return 0
-  fi
-  local pname="${HOST_PLUGIN_NAMES[$pid]:-$pid}"
-  local pdesc="${HOST_PLUGIN_DESCS[$pid]:-LLM host plugin}"
-  local tag_upper="${pid^^}"
+format_servers_toggle_row() {
+  local selected="${1:-false}"
+  local count=${#AVAILABLE_HOST_PLUGINS[@]}
   local prefix="  "
   [[ "$selected" == true ]] && prefix="▶ "
   if [[ "$selected" == true ]]; then
-    printf "%b%s[%s]  %s — %s (not loaded — press Enter to load)%b" "${C_BOLD}${C_CYAN}" "$prefix" "$tag_upper" "$pname" "$pdesc" "$C_RESET"
+    printf "%b%s[SERVERS]  Inference Servers — Install, configure, and benchmark (%d available)%b" "${C_BOLD}${C_CYAN}" "$prefix" "$count" "$C_RESET"
   else
-    printf "%s%b[%s]%b  %b%s — %s (not loaded)%b" "$prefix" "${C_MAGENTA}" "$tag_upper" "${C_RESET}" "${C_DIM}" "$pname" "$pdesc" "${C_RESET}"
+    printf "%s%b[SERVERS]%b  %bInference Servers — Install, configure, and benchmark (%d available)%b" "$prefix" "${C_MAGENTA}" "${C_RESET}" "${C_DIM}" "$count" "${C_RESET}"
   fi
 }
 
@@ -4375,16 +4402,12 @@ print_header() {
     printf "%s\n" "$(format_stats_toggle_row "$_tgl_sel")"
     echo ""
     local _hdr_lines=3
-    if [[ "$NO_PLUGINS" != true ]]; then
-      local _hi _pid _hsel
-      for (( _hi = 0; _hi < ${#AVAILABLE_HOST_PLUGINS[@]}; _hi++ )); do
-        _pid="${AVAILABLE_HOST_PLUGINS[$_hi]}"
-        _hsel=false
-        (( INDEX_SELECTED == _hi + 1 )) && _hsel=true
-        printf "%s\n" "$(format_host_plugin_row "$_pid" "$_hsel")"
-        echo ""
-        (( _hdr_lines += 2 ))
-      done
+    if [[ "$NO_PLUGINS" != true ]] && (( ${#AVAILABLE_HOST_PLUGINS[@]} > 0 )); then
+      local _hsel=false
+      (( INDEX_SELECTED == 1 )) && _hsel=true
+      printf "%s\n" "$(format_servers_toggle_row "$_hsel")"
+      echo ""
+      (( _hdr_lines += 2 ))
     fi
     POST_HEADER_LINES=$_hdr_lines
     UPDATE_BANNER_OFFSET=$_hdr_lines
@@ -4773,15 +4796,23 @@ run_step_view() {
   done
 }
 
+_index_host_rows_count() {
+  if [[ "$NO_PLUGINS" != true ]] && (( ${#AVAILABLE_HOST_PLUGINS[@]} > 0 )); then
+    echo 1
+  else
+    echo 0
+  fi
+}
+
 render_any_index_row() {
   local idx="$1" selected="${2:-false}"
-  local host_rows=0
-  [[ "$NO_PLUGINS" != true ]] && host_rows=${#AVAILABLE_HOST_PLUGINS[@]}
+  local host_rows
+  host_rows="$(_index_host_rows_count)"
   local top_rows=$(( 1 + host_rows ))
   if (( idx == 0 )); then
     format_stats_toggle_row "$selected"
-  elif (( idx >= 1 && idx < top_rows )); then
-    format_host_plugin_row "${AVAILABLE_HOST_PLUGINS[$((idx - 1))]}" "$selected"
+  elif (( host_rows > 0 && idx == 1 )); then
+    format_servers_toggle_row "$selected"
   else
     format_index_row "$((idx - top_rows))" "$selected"
   fi
@@ -4789,13 +4820,13 @@ render_any_index_row() {
 
 index_row_up_offset() {
   local idx="$1" n_opt="$2" _unused="$3" footer_menu_lines="$4" toggle_up="${5:-0}"
-  local host_rows=0
-  [[ "$NO_PLUGINS" != true ]] && host_rows=${#AVAILABLE_HOST_PLUGINS[@]}
+  local host_rows
+  host_rows="$(_index_host_rows_count)"
   local top_rows=$(( 1 + host_rows ))
   if (( idx == 0 )); then
     echo "$toggle_up"
-  elif (( idx >= 1 && idx < top_rows )); then
-    echo $(( toggle_up - (2 * idx) ))
+  elif (( host_rows > 0 && idx == 1 )); then
+    echo $(( toggle_up - 2 ))
   else
     local o_idx=$(( idx - top_rows ))
     local leg_lines=$(( INDEX_LEGEND_LINES > 0 ? INDEX_LEGEND_LINES + 1 : 0 ))
@@ -4850,8 +4881,8 @@ read_choice_with_live_stats() {
           continue
         fi
         local n_opt="${#ACTIVE_STEPS[@]}"
-        local host_rows=0
-        [[ "$NO_PLUGINS" != true ]] && host_rows=${#AVAILABLE_HOST_PLUGINS[@]}
+        local host_rows
+        host_rows="$(_index_host_rows_count)"
         local total_rows=$(( 1 + host_rows + n_opt ))
         if (( footer_lines > 0 && total_rows > 0 )); then
           local old_idx="$INDEX_SELECTED" new_idx="$INDEX_SELECTED"
@@ -4987,6 +5018,187 @@ show_stats_page() {
   done
 }
 
+_pad_ansi_col() {
+  local expanded="" plain="" pad_len=0 pad=""
+  printf -v expanded "%b" "$1"
+  plain="$(sed -E $'s/\033\\[[0-9;]*m//g' <<< "$expanded")"
+  pad_len=$(( $2 - ${#plain} ))
+  (( pad_len > 0 )) && printf -v pad "%*s" "$pad_len" ""
+  printf "%b%s" "$expanded" "$pad"
+}
+
+_server_cap_cell() {
+  local caps_csv="$1" cap="$2" width="$3"
+  local sym="${C_DIM}-${C_RESET}"
+  if [[ ",${caps_csv}," == *",${cap},"* ]]; then
+    sym="${C_GREEN}✓${C_RESET}"
+  fi
+  _pad_ansi_col "$sym" "$width"
+}
+
+format_server_row() {
+  local idx="$1" selected="${2:-false}"
+  local pid="${AVAILABLE_HOST_PLUGINS[$idx]}"
+  local num=$(( idx + 1 ))
+  local pname="${HOST_PLUGIN_NAMES[$pid]:-$pid}"
+  local pdesc="${HOST_PLUGIN_DESCS[$pid]:-Inference server}"
+  local caps="${HOST_PLUGIN_CAPS[$pid]:-install,service,updates,bench,stats}"
+  local inst="false" svc_txt="${C_DIM}-${C_RESET}"
+  if declare -F "${pid}_table_status" >/dev/null 2>&1; then
+    local raw_st=""
+    raw_st="$("${pid}_table_status")"
+    IFS='|' read -r inst svc_txt <<< "$raw_st"
+  elif service_installed "${pid}.service" 2>/dev/null; then
+    inst="true"
+    if unit_active "${pid}.service" 2>/dev/null; then
+      svc_txt="${C_GREEN}active (service)${C_RESET}"
+    else
+      svc_txt="${C_YELLOW}inactive (svc)${C_RESET}"
+    fi
+  fi
+
+  local badge
+  if [[ "$inst" == true ]]; then
+    badge="${C_GREEN}[INSTALLED]    ${C_RESET}"
+  else
+    badge="${C_DIM}[NOT INSTALLED]${C_RESET}"
+    svc_txt="${C_DIM}-${C_RESET}"
+  fi
+
+  local raw_label="$pname"
+  (( ${#raw_label} > 18 )) && raw_label="${raw_label:0:15}..."
+  local label_txt ptr row_num svc_col
+  label_txt="$(printf "%-18s" "$raw_label")"
+  svc_col="$(_pad_ansi_col "$svc_txt" 16)"
+  if [[ "$selected" == true ]]; then
+    ptr="${C_CYAN}>${C_RESET}"
+    row_num="${C_CYAN}${C_BOLD}$(printf "%2d" "$num")${C_RESET}"
+    label_txt="${C_CYAN}${C_BOLD}${label_txt}${C_RESET}"
+  else
+    ptr=" "
+    row_num="$(printf "%2d" "$num")"
+  fi
+  printf "%b %b  | %b | %b | %b | %b | %b | %b | %b | %b" \
+    "$ptr" "$row_num" "$badge" "$label_txt" "$svc_col" \
+    "$(_server_cap_cell "$caps" "install" 4)" \
+    "$(_server_cap_cell "$caps" "service" 3)" \
+    "$(_server_cap_cell "$caps" "updates" 3)" \
+    "$(_server_cap_cell "$caps" "bench" 5)" \
+    "$(_server_cap_cell "$caps" "stats" 5)"
+}
+
+show_inference_servers_page() {
+  discover_host_plugins
+  local sel=0 _p
+  for _p in "${AVAILABLE_HOST_PLUGINS[@]}"; do
+    if [[ -z "${HOST_PLUGIN_LOADED[$_p]:-}" ]]; then
+      load_plugin hosts "$_p" >/dev/null 2>&1 || true
+    fi
+  done
+  while true; do
+    local total=${#AVAILABLE_HOST_PLUGINS[@]}
+    if (( total == 0 )); then
+      print_header
+      echo -e "${C_BOLD}Inference Servers${C_RESET}"
+      echo ""
+      echo -e "  ${C_DIM}No inference server plugins available for this platform.${C_RESET}"
+      pause_prompt
+      return 0
+    fi
+    (( sel >= total )) && sel=$(( total - 1 ))
+    (( sel < 0 )) && sel=0
+
+    print_header
+    echo -e "${C_BOLD}Inference Servers (Applicable to this machine):${C_RESET}"
+    echo ""
+    printf "  ${C_BOLD}%-3s | %-15s | %-18s | %-16s | %-4s | %-3s | %-3s | %-5s | %-5s${C_RESET}\n" "#" "Status" "Inference Server" "Service" "Inst" "Svc" "Upd" "Bench" "Stats"
+    printf "  %s\n" "----+-----------------+--------------------+------------------+------+-----+-----+-------+------"
+    local i is_sel
+    for (( i = 0; i < total; i++ )); do
+      is_sel=false
+      (( i == sel )) && is_sel=true
+      printf "%s\n" "$(format_server_row "$i" "$is_sel")"
+    done
+    echo ""
+    echo -e "  ${C_DIM}Use [↑↓] + Enter, or [1-${total}] to open, [b / Esc / 0] Back to Index, [q] Quit${C_RESET}"
+    echo ""
+
+    local saved_tty="" open_pid=""
+    saved_tty="$(stty -g 2>/dev/null || true)"
+    stty -echo 2>/dev/null || true
+    trap '_tui_restore_tty "$saved_tty"; exit 0' INT TERM
+
+    printf "Select server: "
+    while true; do
+      local action=""
+      IFS= read -rsn1 action || { _tui_restore_tty "$saved_tty"; trap - INT TERM; printf "\n"; return 0; }
+      if [[ "$action" == $'\e' ]]; then
+        local seq=""
+        _tui_read_esc_seq seq
+        if [[ -z "$seq" ]]; then
+          _tui_restore_tty "$saved_tty"; trap - INT TERM; printf "\n"; return 0
+        fi
+        local old_sel="$sel" new_sel="$sel"
+        if [[ "$seq" == "[A" || "$seq" == "OA" ]]; then
+          new_sel=$(( (old_sel - 1 + total) % total ))
+        elif [[ "$seq" == "[B" || "$seq" == "OB" ]]; then
+          new_sel=$(( (old_sel + 1) % total ))
+        fi
+        if (( new_sel != old_sel )); then
+          sel="$new_sel"
+          local old_up=$(( 3 + (total - old_sel) ))
+          local new_up=$(( 3 + (total - new_sel) ))
+          local old_row new_row
+          old_row="$(format_server_row "$old_sel" false)"
+          new_row="$(format_server_row "$new_sel" true)"
+          printf "\033[?2026h\033[?25l\033[s\033[%dA\r\033[2K%s\033[u\033[s\033[%dA\r\033[2K%s\033[u\033[?25h\033[?2026l" \
+            "$old_up" "$old_row" "$new_up" "$new_row"
+        fi
+        continue
+      fi
+
+      case "$action" in
+        "")
+          open_pid="${AVAILABLE_HOST_PLUGINS[$sel]}"
+          break
+          ;;
+        [1-9])
+          if (( action <= total )); then
+            sel=$(( action - 1 ))
+            open_pid="${AVAILABLE_HOST_PLUGINS[$sel]}"
+            break
+          fi
+          ;;
+        0|b|B|i|I)
+          _tui_restore_tty "$saved_tty"; trap - INT TERM; printf "\n"; return 0
+          ;;
+        q|Q)
+          _tui_restore_tty "$saved_tty"; trap - INT TERM; printf "\n"; exit 0
+          ;;
+      esac
+    done
+
+    _tui_restore_tty "$saved_tty"
+    trap - INT TERM
+    printf "\n"
+
+    if [[ -z "${HOST_PLUGIN_LOADED[$open_pid]:-}" ]]; then
+      echo -e "\n${C_CYAN}Loading ${open_pid} plugin...${C_RESET}"
+      if ! load_plugin hosts "$open_pid"; then
+        echo -e "${C_RED}Failed to load plugin '${open_pid}'.${C_RESET}"
+        sleep 2
+        continue
+      fi
+    fi
+    if declare -F "${open_pid}_open" >/dev/null 2>&1; then
+      "${open_pid}_open"
+    else
+      echo -e "${C_RED}Plugin '${open_pid}' does not define ${open_pid}_open.${C_RESET}"
+      sleep 2
+    fi
+  done
+}
+
 STRATA_PAGE_SELECTED=0
 
 show_index() {
@@ -4994,8 +5206,8 @@ show_index() {
   while true; do
     declare -F refresh_strata_bin >/dev/null 2>&1 && refresh_strata_bin
     build_active_steps
-    local host_rows=0
-    [[ "$NO_PLUGINS" != true ]] && host_rows=${#AVAILABLE_HOST_PLUGINS[@]}
+    local host_rows
+    host_rows="$(_index_host_rows_count)"
     local top_rows=$(( 1 + host_rows ))
     local total_rows=$(( top_rows + ${#ACTIVE_STEPS[@]} ))
     if (( total_rows == 0 )); then
@@ -5108,21 +5320,7 @@ show_index() {
         if (( INDEX_SELECTED == 0 )); then
           show_stats_page
         elif (( INDEX_SELECTED >= 1 && INDEX_SELECTED < top_rows )); then
-          local _sel_pid="${AVAILABLE_HOST_PLUGINS[$(( INDEX_SELECTED - 1 ))]}"
-          if [[ -z "${HOST_PLUGIN_LOADED[$_sel_pid]:-}" ]]; then
-            echo -e "\n${C_CYAN}Loading ${_sel_pid} plugin...${C_RESET}"
-            if ! load_plugin hosts "$_sel_pid"; then
-              echo -e "${C_RED}Failed to load plugin '${_sel_pid}'.${C_RESET}"
-              sleep 2
-              continue
-            fi
-          fi
-          if declare -F "${_sel_pid}_open" >/dev/null 2>&1; then
-            "${_sel_pid}_open"
-          else
-            echo -e "${C_RED}Plugin '${_sel_pid}' does not define ${_sel_pid}_open.${C_RESET}"
-            sleep 2
-          fi
+          show_inference_servers_page
         else
           run_step_view $(( INDEX_SELECTED - top_rows )) "single"
         fi
@@ -5499,10 +5697,10 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
       echo "Error: could not locate or download plugins/registry.tsv." >&2
       exit 1
     fi
-    while IFS=$'\t' read -r _rcat _rid _rname _rdesc _rfile _rsha; do
+    while IFS=$'\t' read -r _rcat _rid _rname _rdesc _rfile _rsha _rplat; do
       [[ -n "$_rcat" && -n "$_rid" ]] || continue
       echo "Caching ${_rcat}/${_rid}.sh..."
-      load_plugin "$_rcat" "$_rid" || exit 1
+      _fetch_verified_plugin "$_rcat" "$_rid" || exit 1
     done < "$_reg"
     echo "All plugins cached in ${PLUGIN_CACHE_DIR}."
     exit 0
