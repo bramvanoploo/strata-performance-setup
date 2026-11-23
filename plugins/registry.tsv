@@ -4,7 +4,7 @@ hosts	localai	LocalAI	Install, update, manage service, and benchmark LocalAI ser
 hosts	mlx-lm	MLX LM	Install, update, manage service, and benchmark MLX LM on Apple Silicon	plugins/hosts/mlx-lm.sh	fd3285b330f8cd24bb946c123e433b6dd00e3d5d7a6beb957e3559ee2ce039a2	macos-arm64
 hosts	ollama	Ollama	Install, update, manage service, and benchmark Ollama LLM server	plugins/hosts/ollama.sh	f1f16f7c886f7fdb78dbe515176e5762e45f86a66a85e8f84e85190c964aca8f	all
 hosts	sglang	SGLang	Install, update, manage service, and benchmark SGLang inference server	plugins/hosts/sglang.sh	5ec7799b10038bedc5404fc8ec5c0cd3d8415529314baf837c13ce247d25cb48	linux
-hosts	strata	Strata	Install, update, launch, and benchmark Strata LLM server	plugins/hosts/strata.sh	d9cf4bc480dbf4960c41f96ab71d8c9abfe390929dbcb1d6a72191613b5de3b1	all
+hosts	strata	Strata	Install, update, launch, and benchmark Strata LLM server	plugins/hosts/strata.sh	c9b1d72a7009c971d0fb4ed569051446a3662d1a9d7c0fc1ba4aba2a36aa1c39	all
 hosts	vllm	vLLM	Install, update, manage service, and benchmark vLLM inference server	plugins/hosts/vllm.sh	0459e6d4338b8c6b96454161aaea44878e2ee96ff10b4785ec9770c29c4bd5b6	linux
 tweaks	amd	amd	AMD GPU/APU, Instinct, Ryzen TDP, and X3D tweaks	plugins/tweaks/amd.sh	1d93cd63c84e454be783b11b8120f91172b344f05c8cefbd71b0a1c6b569944c	all
 tweaks	common	common	Cross-platform host tweaks (Linux & macOS)	plugins/tweaks/common.sh	e43d914b60768f564a5d7be0b36f118f713220dd251c62061490b9e504e4cf47	all
