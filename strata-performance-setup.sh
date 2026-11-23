@@ -4807,12 +4807,16 @@ read_line_with_live_stats() {
           fi
         fi
       else
+        if [[ -z "$buf" && ( "$ch" == "q" || "$ch" == "Q" ) ]]; then
+          _cleanup_line_live; trap - INT TERM; printf "\n"
+          _line_out="$ch"; return 0
+        fi
         if (( total_rows > 0 )) && [[ -z "$buf" && ( "$ch" == "e" || "$ch" == "E" || "$ch" == " " ) ]]; then
           _cleanup_line_live; trap - INT TERM; printf "\n"
           _line_out="__toggle__"; return 0
         fi
         local _accept=false
-        if [[ -z "$buf" && "$ch" =~ ^[bBqQ]$ ]]; then
+        if [[ -z "$buf" && "$ch" =~ ^[bB]$ ]]; then
           _accept=true
         elif [[ "$ch" =~ ^[0-9]$ ]] && [[ -z "$buf" || "$buf" =~ ^[0-9]+$ ]]; then
           local _cand="${buf}${ch}"
@@ -4874,7 +4878,10 @@ read_step_action() {
           _restore_step_tty; trap - INT TERM; printf "\n"
           _act_out="__esc__"; return 0
         fi
-      elif [[ -z "$buf" && "$ch" =~ ^[aArRuUhHnNbBiIqQ]$ ]]; then
+      elif [[ -z "$buf" && ( "$ch" == "q" || "$ch" == "Q" ) ]]; then
+        _restore_step_tty; trap - INT TERM; printf "\n"
+        _act_out="$ch"; return 0
+      elif [[ -z "$buf" && "$ch" =~ ^[aArRuUhHnNbBiI]$ ]]; then
         buf="$ch"; printf "%s" "$ch"
       fi
     elif (( rc > 128 )); then
@@ -5074,9 +5081,16 @@ read_choice_with_live_stats() {
           fi
         fi
       else
+        if [[ -z "$buf" && ( "$ch" == "q" || "$ch" == "Q" ) ]]; then
+          _restore_index_tty
+          trap - INT TERM
+          printf "\n"
+          _out_var="$ch"
+          return 0
+        fi
         local accept=false
         if [[ -z "$buf" ]]; then
-          if [[ "$ch" =~ ^[wWcCuUhHaAlLxXrRqQ]$ ]] || [[ "$ch" =~ ^[1-9]$ ]]; then
+          if [[ "$ch" =~ ^[wWcCuUhHaAlLxXrR]$ ]] || [[ "$ch" =~ ^[1-9]$ ]]; then
             accept=true
           fi
         elif [[ "$buf" =~ ^[0-9]{1,2}$ ]] && [[ "$ch" =~ ^[0-9]$ ]]; then

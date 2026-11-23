@@ -3206,9 +3206,16 @@ read_strata_page_choice() {
           fi
         fi
       else
+        if [[ -z "$buf" && ( "$ch" == "q" || "$ch" == "Q" ) ]]; then
+          _cleanup_strata_tty
+          trap - INT TERM
+          printf "\n"
+          _out_var="$ch"
+          return 0
+        fi
         local accept=false
         if [[ -z "$buf" ]]; then
-          if [[ "$ch" =~ ^[uUhHiIbBqQsS]$ ]] || { [[ "$ch" =~ ^[1-9]$ ]] && (( 10#$ch <= n_str )); }; then
+          if [[ "$ch" =~ ^[uUhHiIbBsS]$ ]] || { [[ "$ch" =~ ^[1-9]$ ]] && (( 10#$ch <= n_str )); }; then
             accept=true
           fi
         elif [[ "$buf" =~ ^[sS]$ ]]; then
