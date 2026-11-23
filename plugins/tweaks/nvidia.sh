@@ -15,6 +15,7 @@ register_tweak --id "nvidia_clock_lock" --stars 1 --tier "high_idle" --os "linux
 register_tweak --id "nvidia_ecc" --stars 4 --tier "recommended" --os "linux" --laptop-recommended true --vm-supported true --experimental-non-arch false
 register_tweak --id "nvidia_compute_mode" --stars 3 --tier "recommended" --os "linux" --laptop-recommended true --vm-supported true --experimental-non-arch false
 register_tweak --id "nvidia_mig_disable" --stars 4 --tier "recommended" --os "linux" --laptop-recommended false --vm-supported true --experimental-non-arch false
+register_tweak --id "nvidia_p2p_open" --stars 5 --tier "experimental" --os "linux" --laptop-recommended false --vm-supported false --experimental-non-arch false
 
 # 7. NVIDIA Persistenced
 applicable_nvidia_persistenced() {
@@ -463,7 +464,6 @@ apply_gpu_unlock() {
       fi
       local build_dir build_ok=false
       build_dir="$(mktemp -d /tmp/gpu-unlock.XXXXXX)"
-      trap "rm -rf $(printf '%q' "$build_dir")" RETURN
       [[ $EUID -eq 0 && "$TARGET_USER" != "root" ]] && chown "$TARGET_USER" "$build_dir" 2>/dev/null || true
       echo -e "${C_CYAN}Cloning and building gpu-unlock from source...${C_RESET}"
       if ! run_as_user_exec git clone --depth 1 https://github.com/Zagitta/gpu-unlock.git "$build_dir/src"; then
@@ -1069,6 +1069,105 @@ revert_nvidia_mig_disable() {
   else
     echo -e "${C_YELLOW}Previous MIG state was not recorded by this script; leaving MIG disabled.${C_RESET}"
   fi
+}
+
+# 11f. NVIDIA Multi-GPU P2P Open Kernel Module
+NVIDIA_P2P_MARKER="/etc/strata-nvidia-p2p-open.enabled"
+
+applicable_nvidia_p2p_open() {
+  [[ -f "$NVIDIA_P2P_MARKER" ]] && return 0
+  [[ "$HAS_NVIDIA" == true && "$HAS_NVIDIA_NON_TESLA" == true && "$HAS_NVIDIA_NVSWITCH" == false ]] || return 1
+  secure_boot_enabled && return 1
+  (( ${#NVIDIA_GPU_INDICES[@]} >= 2 || ${DISCRETE_GPU_COUNT:-0} >= 2 ))
+}
+title_nvidia_p2p_open() { echo "NVIDIA Multi-GPU P2P Open Kernel Module (tinygrad / aikitoria)"; }
+note_nvidia_p2p_open() { echo -e "${C_MAGENTA}[EXP]${C_RESET}"; }
+status_nvidia_p2p_open() {
+  [[ -f "$NVIDIA_P2P_MARKER" ]] && return 0
+  command -v dkms >/dev/null 2>&1 && dkms status 2>/dev/null | grep -qiE 'nvidia.*p2p'
+}
+explain_nvidia_p2p_open() {
+  cat <<EOF
+Impact:
+  Installs the P2P-patched NVIDIA open kernel modules (tinygrad or aikitoria
+  fork) so consumer RTX 3090 / 4090 / 5090 GPUs can perform direct PCIe P2P
+  transfers instead of bouncing through host RAM (major speedup for tensor-
+  parallel vLLM, SGLang, and ExLlama). Driver detected: ${NVIDIA_DRIVER_VER:-unknown}.
+EOF
+  echo -e "\n${C_MAGENTA}[EXPERIMENTAL] Replaces the kernel's nvidia modules from a third-party fork${C_RESET}"
+  echo -e "${C_MAGENTA}               and requires Secure Boot disabled + kernel headers.${C_RESET}"
+}
+apply_nvidia_p2p_open() {
+  if [[ "$DISTRO_FAMILY" == "arch" ]] && { pkg_available aur nvidia-open-p2p-dkms 2>/dev/null || pkg_available repo nvidia-open-p2p-dkms 2>/dev/null; }; then
+    prompt_install_repo_or_aur nvidia-open-p2p-dkms || return 1
+  else
+    local repo_choice="" repo_url="https://github.com/tinygrad/open-gpu-kernel-modules.git"
+    echo -e "\n${C_BOLD}Select P2P-patched NVIDIA open-gpu-kernel-modules fork:${C_RESET}"
+    echo "  1) tinygrad/open-gpu-kernel-modules (recommended, broad driver branch tags)"
+    echo "  2) aikitoria/open-gpu-kernel-modules"
+    read -r -p "Choose [1-2, default 1]: " repo_choice
+    [[ "$repo_choice" == "2" ]] && repo_url="https://github.com/aikitoria/open-gpu-kernel-modules.git"
+
+    local -a deps=()
+    read -r -a deps <<< "$(gpu_unlock_build_deps)"
+    (( ${#deps[@]} > 0 )) && { prompt_install_deps repo "${deps[@]}" || return 1; }
+
+    local build_dir branch_arg="" build_rc=0
+    build_dir="$(mktemp -d /tmp/nvidia-p2p-open.XXXXXX)"
+    [[ $EUID -eq 0 && "$TARGET_USER" != "root" ]] && chown "$TARGET_USER" "$build_dir" 2>/dev/null || true
+    echo -e "${C_CYAN}Cloning ${repo_url}...${C_RESET}"
+    if [[ -n "${NVIDIA_DRIVER_VER:-}" ]] && git ls-remote --tags "$repo_url" 2>/dev/null | grep -qE "refs/tags/${NVIDIA_DRIVER_VER}(\^{})?$"; then
+      branch_arg="--branch ${NVIDIA_DRIVER_VER}"
+    fi
+    if ! run_as_user_exec git clone --depth 1 ${branch_arg} "$repo_url" "$build_dir/src"; then
+      echo -e "${C_RED}Failed to clone ${repo_url}.${C_RESET}"
+      rm -rf "$build_dir"
+      return 1
+    fi
+    echo -e "${C_CYAN}Building NVIDIA open kernel modules (this may take a few minutes)...${C_RESET}"
+    if ! run_as_user_exec make -C "$build_dir/src" modules -j"$(nproc 2>/dev/null || echo 4)"; then
+      echo -e "${C_RED}Build failed. Ensure your installed NVIDIA userspace version (${NVIDIA_DRIVER_VER:-unknown}) matches a supported branch/tag.${C_RESET}"
+      rm -rf "$build_dir"
+      return 1
+    fi
+    run_root make -C "$build_dir/src" modules_install || build_rc=$?
+    rm -rf "$build_dir"
+    (( build_rc == 0 )) || return 1
+    run_root depmod -a || true
+  fi
+  run_root mkdir -p /etc/modprobe.d
+  echo "options nvidia NVreg_OpenRmEnableUnsupportedGpus=1" | run_root tee /etc/modprobe.d/strata-nvidia-p2p.conf >/dev/null
+  echo "1" | run_root tee "$NVIDIA_P2P_MARKER" >/dev/null
+  REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
+  echo -e "${C_GREEN}Installed P2P-enabled NVIDIA open kernel module (reboot required).${C_RESET}"
+}
+revert_nvidia_p2p_open() {
+  local restored=false
+  run_root rm -f /etc/modprobe.d/strata-nvidia-p2p.conf
+  if [[ "$DISTRO_FAMILY" == "arch" ]]; then
+    local pkg
+    for pkg in nvidia-open nvidia-open-dkms nvidia-dkms nvidia; do
+      if pkg_available repo "$pkg" 2>/dev/null && pkg_installed "$pkg" 2>/dev/null; then
+        pkg_install "$pkg" && restored=true
+        break
+      fi
+    done
+    if [[ "$restored" == false ]] && pkg_installed nvidia-open-p2p-dkms 2>/dev/null; then
+      run_root pacman -Rdd --noconfirm nvidia-open-p2p-dkms 2>/dev/null || true
+      pkg_available repo nvidia-open-dkms 2>/dev/null && pkg_install nvidia-open-dkms && restored=true
+    fi
+  elif command -v dkms >/dev/null 2>&1 && dkms status 2>/dev/null | grep -qiE '^nvidia'; then
+    run_root dkms autoinstall && restored=true || true
+  fi
+  if [[ "$restored" == true ]]; then
+    run_root depmod -a || true
+    run_root rm -f "$NVIDIA_P2P_MARKER"
+    REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
+    echo -e "${C_GREEN}Restored stock NVIDIA kernel modules (reboot required).${C_RESET}"
+    return 0
+  fi
+  echo -e "${C_YELLOW}Could not automatically reinstall stock NVIDIA modules; reinstall your distro's nvidia-open / nvidia-dkms package and remove ${NVIDIA_P2P_MARKER}, then reboot.${C_RESET}"
+  return 1
 }
 
 # 12j. AMD APU Unified Memory Limit

@@ -414,16 +414,28 @@ EOF
 # 13. Host plugin platform filtering (Linux vs Intel macOS vs Apple Silicon macOS)
 (
   # Linux: ollama, llamacpp, localai, vllm, sglang shown; mlx-lm hidden
-  IS_MACOS=false IS_APPLE_SILICON=false
+  IS_MACOS=false IS_APPLE_SILICON=false HAS_NVIDIA=false HAS_AMD=false HAS_INTEL_GPU=false
   AVAILABLE_HOST_PLUGINS=("strata")
   discover_host_plugins
   linux_hosts="${AVAILABLE_HOST_PLUGINS[*]}"
   assert_contains "$linux_hosts" "ollama" "Linux shows ollama host plugin"
   assert_contains "$linux_hosts" "llamacpp" "Linux shows llamacpp host plugin"
+  assert_contains "$linux_hosts" "ik-llamacpp" "Linux shows ik-llamacpp host plugin"
   assert_contains "$linux_hosts" "localai" "Linux shows localai host plugin"
   assert_contains "$linux_hosts" "vllm" "Linux shows vllm host plugin"
   assert_contains "$linux_hosts" "sglang" "Linux shows sglang host plugin"
+  assert_contains "$linux_hosts" "lemonade" "Linux shows lemonade host plugin"
+  assert_contains "$linux_hosts" "openvino" "Linux shows openvino host plugin"
+  assert_contains "$linux_hosts" "exo" "Linux shows exo host plugin"
   assert_not_contains "$linux_hosts" "mlx-lm" "Linux hides mlx-lm host plugin"
+  assert_not_contains "$linux_hosts" "tensorrt-llm" "Linux without NVIDIA hides tensorrt-llm host plugin"
+
+  HAS_NVIDIA=true
+  AVAILABLE_HOST_PLUGINS=("strata")
+  discover_host_plugins
+  assert_contains "${AVAILABLE_HOST_PLUGINS[*]}" "tensorrt-llm" "Linux with NVIDIA shows tensorrt-llm host plugin"
+  assert_contains "${AVAILABLE_HOST_PLUGINS[*]}" "tabbyapi" "Linux with NVIDIA shows tabbyapi host plugin"
+  HAS_NVIDIA=false
 
   # Intel macOS: ollama, llamacpp, localai shown; vllm, sglang, mlx-lm hidden
   IS_MACOS=true IS_APPLE_SILICON=false
@@ -483,12 +495,50 @@ EOF
 
   opts_uninst="$(_host_build_options_list false)"
   assert_eq "$opts_uninst" "install" "uninstalled server only shows install option"
-  opts_inst="$(_host_build_options_list true false)"
-  assert_eq "$opts_inst" "update service bench latest" "installed server hides install and shows update/service/bench/latest"
-  opts_docker="$(_host_build_options_list false true)"
-  assert_eq "$opts_docker" "bench latest" "Docker-only server shows bench and latest options"
+  opts_inst_idle="$(_host_build_options_list true false "" false)"
+  assert_eq "$opts_inst_idle" "update service latest uninstall" "installed server hides bench when not serving models"
+  opts_inst="$(_host_build_options_list true false "" true)"
+  assert_eq "$opts_inst" "update service bench latest uninstall" "installed server shows update/service/bench/latest/uninstall when serving a model"
+  opts_docker_idle="$(_host_build_options_list false true "" false)"
+  assert_eq "$opts_docker_idle" "latest" "Docker-only server hides bench when not serving models"
+  opts_docker="$(_host_build_options_list false true "" true)"
+  assert_eq "$opts_docker" "bench latest" "Docker-only server shows bench and latest when serving a model"
   opt_row="$(_host_option_row 0 "install" "Ollama" "ollama.service" "" false true)"
   assert_contains "$opt_row" "Install Ollama" "_host_option_row formats install option"
+  uninst_row="$(_host_option_row 0 "uninstall" "llama.cpp" "llamacpp.service" "" false false)"
+  assert_contains "$uninst_row" "Uninstall llama.cpp" "_host_option_row formats uninstall option"
+  _host_http_get() { echo '{"data":[]}'; }
+  if _host_has_served_model "http://127.0.0.1:8080"; then
+    fail "_host_has_served_model should return 1 for empty model list"
+  else
+    pass "_host_has_served_model returns 1 when no model is served"
+  fi
+  _host_http_get() { echo '{"data":[{"id":"qwen3-8b"}]}'; }
+  _host_has_served_model "http://127.0.0.1:8080" && pass "_host_has_served_model returns 0 when model is served" || fail "_host_has_served_model"
+
+  fake_bin="${TMP_DIR}/fake-llama-server"
+  touch "$fake_bin"
+  service_installed() { return 1; }
+  _host_standard_uninstall "llamacpp" "llama.cpp" "llamacpp.service" "$fake_bin" "manual" "llama.cpp" <<< "y" >/dev/null
+  [[ ! -e "$fake_bin" ]] && pass "_host_standard_uninstall removes manual binary after confirmation" || fail "_host_standard_uninstall"
+
+  # _host_endpoint_running ignores another server (e.g. Strata) sharing port 8080
+  _host_http_get() { echo '{"status":"ok"}'; }
+  unit_active() { return 1; }
+  _host_proc_running() { return 1; }
+  LLAMACPP_DOCKER=""
+  if _llamacpp_running; then
+    fail "_llamacpp_running should not match another server on port 8080 without llama-server process"
+  else
+    pass "_llamacpp_running ignores port 8080 collision when llama-server is not running"
+  fi
+  _host_proc_running() { return 0; }
+  _llamacpp_running && pass "_llamacpp_running returns 0 when llama-server process and endpoint are active" || fail "_llamacpp_running"
+
+  # Custom port detection (_host_extract_port_from_text & _host_detect_url)
+  assert_eq "$(_host_extract_port_from_text "/usr/bin/llama-server -m foo.gguf --port 9090")" "9090" "_host_extract_port_from_text parses --port"
+  assert_eq "$(_host_extract_port_from_text "Environment=OLLAMA_HOST=0.0.0.0:11435")" "11435" "_host_extract_port_from_text parses OLLAMA_HOST"
+  assert_eq "$(_host_detect_url "http://127.0.0.1:8080" "__unlikely_proc_pattern_12345__" "" "")" "http://127.0.0.1:8080" "_host_detect_url falls back to default URL when not running"
 
   STRATA_UPDATE_CACHE_DIR="${TMP_DIR}/ucache"
   mkdir -p "$STRATA_UPDATE_CACHE_DIR"
@@ -541,13 +591,13 @@ EOF
   HOST_UPDATE_AVAIL[llamacpp]="true"
   _host_check_update_by_source "llamacpp" "manual" "0.6.0-dev" "llama.cpp" "ggml-org/llama.cpp"
   assert_eq "${HOST_UPDATE_AVAIL[llamacpp]}" "false" "_host_check_update_by_source does not flag manual builds from GitHub"
-  opts_manual="$(_host_build_options_list true false "manual")"
-  assert_eq "$opts_manual" "service bench latest" "manual build hides update option"
+  opts_manual="$(_host_build_options_list true false "manual" true)"
+  assert_eq "$opts_manual" "service bench latest uninstall" "manual build hides update option and keeps uninstall"
   HOST_INSTALL_SOURCE[llamacpp]="manual"
   HOST_UPDATE_AVAIL[llamacpp]="false"
   AVAILABLE_HOST_PLUGINS=("llamacpp")
   srv_manual_row="$(format_server_row 0 false | sed -E $'s/\033\\[[0-9;]*m//g')"
-  assert_contains "$srv_manual_row" "| -   | ✓" "manual install hides Upd checkmark in Servers table"
+  assert_contains "$srv_manual_row" "| -       | ✓" "manual install hides Updates checkmark in Servers table"
   LLAMACPP_SOURCE="$src_manual"
   rc_ll=0; _llamacpp_install_or_update >/dev/null 2>&1 || rc_ll=$?
   assert_eq "$rc_ll" "1" "_llamacpp_install_or_update returns 1 cleanly without unbound variable when no package exists"
@@ -564,6 +614,125 @@ if command -v curl >/dev/null 2>&1; then
     [[ -f "${dl_cache}/hosts/mlx-lm.sh" ]] && pass "--download-plugins caches hosts/mlx-lm.sh" || fail "--download-plugins caches hosts/mlx-lm.sh"
   fi
 fi
+
+# 15. Raspberry Pi cmdline.txt, rpm-ostree, NixOS, WSL2, and NPU/accelerator detection
+(
+  # 15a. Raspberry Pi cmdline.txt
+  BR="${TMP_DIR}/boot_rpi"
+  mkdir -p "${BR}/boot/firmware" "${BR}/proc"
+  : > "${BR}/proc/cmdline"
+  printf 'console=serial0,115200 root=/dev/mmcblk0p2 rw\n' > "${BR}/boot/firmware/cmdline.txt"
+  STRATA_BOOT_ROOT="$BR" DISTRO_FAMILY="debian" IS_OSTREE=false IS_NIXOS=false
+  add_kernel_param "init_on_alloc=0"
+  has_kernel_param "init_on_alloc=0" && pass "Raspberry Pi cmdline.txt updated & detected" || fail "Raspberry Pi cmdline.txt"
+  remove_kernel_param "init_on_alloc=0"
+  assert_not_contains "$(cat "${BR}/boot/firmware/cmdline.txt")" "init_on_alloc=0" "remove_kernel_param cleans Raspberry Pi cmdline.txt"
+
+  # 15b. rpm-ostree kargs
+  mkdir -p "${TMP_DIR}/ostree_bin"
+  OSTREE_KARGS_FILE="${TMP_DIR}/ostree_kargs.txt"
+  printf 'rhgb quiet mitigations=off\n' > "$OSTREE_KARGS_FILE"
+  cat > "${TMP_DIR}/ostree_bin/rpm-ostree" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "${TMP_DIR}/ostree_calls"
+if [[ "\$1" == "kargs" && \$# -eq 1 ]]; then
+  cat "${OSTREE_KARGS_FILE}"
+elif [[ "\$1" == "kargs" && "\$2" == --delete-if-present=* ]]; then
+  tok="\${2#--delete-if-present=}"
+  sed -i "s/ \${tok}//g; s/\${tok} //g" "${OSTREE_KARGS_FILE}"
+fi
+EOF
+  chmod +x "${TMP_DIR}/ostree_bin/rpm-ostree"
+  PATH="${TMP_DIR}/ostree_bin:${PATH}" IS_OSTREE=true IS_NIXOS=false DISTRO_FAMILY="fedora"
+  STRATA_BOOT_ROOT="${TMP_DIR}/boot_ostree"
+  mkdir -p "${STRATA_BOOT_ROOT}/proc"
+  printf 'rhgb quiet mitigations=off\n' > "${STRATA_BOOT_ROOT}/proc/cmdline"
+  add_kernel_param "iommu=pt"
+  assert_contains "$(cat "${TMP_DIR}/ostree_calls")" "--append-if-missing=iommu=pt" "IS_OSTREE uses rpm-ostree kargs --append-if-missing"
+  has_kernel_param "mitigations=off" && pass "has_kernel_param reads rpm-ostree kargs" || fail "has_kernel_param rpm-ostree"
+  REBOOT_REQUIRED=false
+  remove_kernel_param "not_present=1"
+  assert_eq "$REBOOT_REQUIRED" "false" "IS_OSTREE remove_kernel_param is no-op when param absent"
+  remove_kernel_param "mitigations=off"
+  assert_contains "$(cat "${TMP_DIR}/ostree_calls")" "--delete-if-present=mitigations=off" "IS_OSTREE uses rpm-ostree kargs --delete-if-present"
+  if has_kernel_param "mitigations=off"; then
+    fail "has_kernel_param should return 1 after rpm-ostree deletion before reboot"
+  else
+    pass "has_kernel_param clears immediately after rpm-ostree removal"
+  fi
+
+  # 15c. NixOS guard
+  IS_OSTREE=false IS_NIXOS=true DISTRO_FAMILY="nixos"
+  rc_nix=0; add_kernel_param "iommu=pt" >/dev/null 2>&1 || rc_nix=$?
+  assert_eq "$rc_nix" "1" "NixOS refuses imperative add_kernel_param cleanly"
+
+  # 15d. WSL2 active step gating
+  IS_MACOS=false IS_WSL2=true IS_VIRT="wsl" IS_NIXOS=false IS_OSTREE=false
+  STRATA_WSLCONFIG_PATH="${TMP_DIR}/wslconfig"
+  touch "$STRATA_WSLCONFIG_PATH"
+  build_active_steps
+  wsl_steps="${ACTIVE_STEPS[*]}"
+  assert_contains "$wsl_steps" "wsl2_windows_config" "WSL2 enables wsl2_windows_config"
+  assert_contains "$wsl_steps" "wsl2_linux_tuning" "WSL2 enables wsl2_linux_tuning"
+  assert_contains "$wsl_steps" "memlock_realtime" "WSL2 enables memlock_realtime"
+  assert_not_contains "$wsl_steps" "cpu_performance" "WSL2 hides bare-metal cpu_performance"
+  assert_not_contains "$wsl_steps" "kernel_mitigations_off" "WSL2 hides kernel_mitigations_off"
+
+  # 15e. Accelerator & NPU applicability flags
+  HAS_TENSTORRENT=true; applicable_tenstorrent_setup && pass "tenstorrent_setup applicable when HAS_TENSTORRENT=true" || fail "tenstorrent_setup"
+  HAS_AMD_NPU=true; applicable_amd_xdna_npu && pass "amd_xdna_npu applicable when HAS_AMD_NPU=true" || fail "amd_xdna_npu"
+  HAS_INTEL_NPU=true; applicable_intel_npu_stack && pass "intel_npu_stack applicable when HAS_INTEL_NPU=true" || fail "intel_npu_stack"
+  HAS_ROCKCHIP_NPU=true; applicable_rockchip_rk3588_npu && pass "rockchip_rk3588_npu applicable when HAS_ROCKCHIP_NPU=true" || fail "rockchip_rk3588_npu"
+  HAS_HAILO=true; applicable_hailo_npu_setup && pass "hailo_npu_setup applicable when HAS_HAILO=true" || fail "hailo_npu_setup"
+  HAS_ASCEND=true; applicable_huawei_ascend_cann && pass "huawei_ascend_cann applicable when HAS_ASCEND=true" || fail "huawei_ascend_cann"
+  HAS_MTHREADS=true; applicable_moore_threads_musa && pass "moore_threads_musa applicable when HAS_MTHREADS=true" || fail "moore_threads_musa"
+
+  # 15f. Regression checks for review findings
+  if is_recommended_step amd_compute_profile; then
+    fail "amd_compute_profile should be opt_in, not recommended"
+  else
+    pass "amd_compute_profile is opt_in (avoids race with amd_gpu_perf)"
+  fi
+  assert_eq "${HOST_PLUGIN_CAPS[ik-llamacpp]}" "install,service,bench,stats" "ik-llamacpp caps omit unimplemented updates"
+
+  STRATA_WSLCONFIG_PATH="${TMP_DIR}/reapply_wslconfig"
+  printf '[wsl2]\nkernel=C:\\custom\\bzImage\n' > "$STRATA_WSLCONFIG_PATH"
+  apply_wsl2_windows_config <<< "24" >/dev/null
+  apply_wsl2_windows_config <<< "32" >/dev/null
+  assert_contains "$(cat "$STRATA_WSLCONFIG_PATH")" "kernel=C:\\custom\\bzImage" "wsl2_windows_config preserves custom keys"
+  assert_contains "$(cat "$STRATA_WSLCONFIG_PATH")" "memory=32GB" "wsl2_windows_config updates memory on reapply"
+  revert_wsl2_windows_config >/dev/null
+  assert_not_contains "$(cat "$STRATA_WSLCONFIG_PATH")" "memory=32GB" "revert_wsl2_windows_config restores original .wslconfig even after reapply"
+
+  MACOS_TM_LIST="${TMP_DIR}/tm_missing.list"
+  printf '%s/does-not-exist\n' "$TMP_DIR" > "$MACOS_TM_LIST"
+  if status_macos_timemachine_exclude; then
+    fail "status_macos_timemachine_exclude should fail when no listed dirs exist"
+  else
+    pass "status_macos_timemachine_exclude rejects empty/missing dir list"
+  fi
+
+  # 16. Inference server warnings appear on Inference Servers page, not Index page
+  (
+    LOADED_HOST_PLUGINS=("testhost")
+    AVAILABLE_HOST_PLUGINS=("testhost")
+    HOST_PLUGIN_LOADED=([testhost]=1)
+    HOST_PLUGIN_NAMES=([testhost]="TestHost")
+    HOST_PLUGIN_CAPS=([testhost]="install")
+    testhost_hw_warnings() { echo "  [TestHost] Simulated inference server warning"; }
+    testhost_table_status() { echo "NOT INSTALLED|—"; }
+    print_header() { :; }
+    discover_host_plugins() { :; }
+    IS_NIXOS=false
+
+    read_choice_with_live_stats() { printf -v "$1" '%s' "q"; }
+    idx_out="$(show_index)"
+    assert_not_contains "$idx_out" "Simulated inference server warning" "show_index omits inference server hw_warnings"
+
+    srv_out="$(show_inference_servers_page <<< "q")"
+    assert_contains "$srv_out" "Simulated inference server warning" "show_inference_servers_page displays inference server hw_warnings"
+  )
+)
 
 PASS="$(grep -c '^P$' "$RESULTS_FILE" || true)"
 FAIL="$(grep -c '^F$' "$RESULTS_FILE" || true)"

@@ -6,7 +6,9 @@
 register_tweak --id "macos_wired_limit" --stars 5 --tier "opt_in" --os "macos" --laptop-recommended false --vm-supported false --experimental-non-arch false
 register_tweak --id "macos_power_mode" --stars 4 --tier "recommended" --os "macos" --laptop-recommended false --vm-supported false --experimental-non-arch false
 register_tweak --id "macos_spotlight_exclude" --stars 4 --tier "recommended" --os "macos" --laptop-recommended true --vm-supported true --experimental-non-arch false
+register_tweak --id "macos_timemachine_exclude" --stars 2 --tier "recommended" --os "macos" --laptop-recommended true --vm-supported true --experimental-non-arch false
 register_tweak --id "macos_metal_tuning" --stars 4 --tier "opt_in" --os "macos" --laptop-recommended true --vm-supported true --experimental-non-arch false
+register_tweak --id "macos_rdma_tb5" --stars 4 --tier "opt_in" --os "macos" --laptop-recommended false --vm-supported false --experimental-non-arch false
 
 applicable_macos_wired_limit() {
   [[ "$IS_MACOS" == true && "$IS_APPLE_SILICON" == true ]] && (( RAM_GB >= 24 ))
@@ -176,13 +178,14 @@ Impact:
   expert files and introduce SSD latency spikes during SSD expert streaming.
 EOF
 }
-apply_macos_spotlight_exclude() {
-  local -a raw_dirs=() dirs=()
+_macos_prompt_exclude_dirs() {
+  local label="$1" list_fn="$2"
+  local -a raw_dirs=()
   local d extra_dir=""
   while IFS= read -r d; do
     [[ -n "$d" ]] && raw_dirs+=("$d")
-  done < <(_macos_spotlight_dirs)
-  read -r -p "Optional extra Strata model folder to exclude from Spotlight (blank to skip): " extra_dir || true
+  done < <("$list_fn")
+  read -r -p "Optional extra model folder to exclude from ${label} (blank to skip): " extra_dir || true
   if [[ -n "$extra_dir" ]]; then
     extra_dir="${extra_dir%\"}"; extra_dir="${extra_dir#\"}"
     extra_dir="${extra_dir%\'}"; extra_dir="${extra_dir#\'}"
@@ -195,12 +198,17 @@ apply_macos_spotlight_exclude() {
     if [[ -d "$extra_dir" ]]; then
       raw_dirs+=("$extra_dir")
     else
-      echo -e "${C_YELLOW}Directory not found (${extra_dir}); skipping custom path.${C_RESET}"
+      echo -e "${C_YELLOW}Directory not found (${extra_dir}); skipping custom path.${C_RESET}" >&2
     fi
   fi
+  printf '%s\n' "${raw_dirs[@]}" | awk '!seen[$0]++'
+}
+apply_macos_spotlight_exclude() {
+  local -a dirs=()
+  local d
   while IFS= read -r d; do
     [[ -n "$d" ]] && dirs+=("$d")
-  done < <(printf '%s\n' "${raw_dirs[@]}" | awk '!seen[$0]++')
+  done < <(_macos_prompt_exclude_dirs "Spotlight" "_macos_spotlight_dirs")
   run_as_user_exec mkdir -p "$(dirname "$MACOS_SPOTLIGHT_LIST")"
   : | run_as_user_exec tee "$MACOS_SPOTLIGHT_LIST" >/dev/null
   for d in "${dirs[@]}"; do
@@ -327,4 +335,102 @@ revert_macos_metal_tuning() {
     fi
   fi
   echo -e "${C_GREEN}Removed Strata Metal engine environment overrides.${C_RESET}"
+}
+
+# 12ac. macOS Time Machine Exclusion for Model & Cache Directories
+MACOS_TM_LIST="${TARGET_HOME}/.local/share/strata-performance-setup/timemachine-excluded.list"
+
+_macos_tm_dirs() {
+  local d
+  _macos_spotlight_dirs
+  for d in "$TARGET_HOME/.cache/huggingface" "$TARGET_HOME/.ollama"; do
+    [[ -d "$d" ]] && echo "$d"
+  done
+}
+applicable_macos_timemachine_exclude() {
+  [[ "$IS_MACOS" == true ]] && command -v tmutil >/dev/null 2>&1
+}
+title_macos_timemachine_exclude() { echo "Exclude Model & Cache Folders from Time Machine (tmutil)"; }
+status_macos_timemachine_exclude() {
+  [[ -r "$MACOS_TM_LIST" ]] || return 1
+  local d checked=0
+  while IFS= read -r d; do
+    [[ -n "$d" && -d "$d" ]] || continue
+    tmutil isexcluded "$d" 2>/dev/null | grep -q "\[Excluded\]" || return 1
+    ((checked++))
+  done < "$MACOS_TM_LIST"
+  (( checked > 0 ))
+}
+explain_macos_timemachine_exclude() {
+  cat <<'EOF'
+Impact:
+  Runs 'tmutil addexclusion' on Strata, HuggingFace, and Ollama model/cache
+  folders (plus an optional custom folder) so Time Machine snapshots and
+  background backups do not contend for SSD bandwidth during model loads.
+EOF
+}
+apply_macos_timemachine_exclude() {
+  local -a dirs=()
+  local d
+  while IFS= read -r d; do
+    [[ -n "$d" ]] && dirs+=("$d")
+  done < <(_macos_prompt_exclude_dirs "Time Machine" "_macos_tm_dirs")
+  run_as_user_exec mkdir -p "$(dirname "$MACOS_TM_LIST")"
+  : | run_as_user_exec tee "$MACOS_TM_LIST" >/dev/null
+  for d in "${dirs[@]}"; do
+    run_as_user_exec mkdir -p "$d"
+    if run_as_user_exec tmutil addexclusion "$d" 2>/dev/null; then
+      printf '%s\n' "$d" | run_as_user_exec tee -a "$MACOS_TM_LIST" >/dev/null
+      echo -e "  ${C_GREEN}Excluded:${C_RESET} ${d}"
+    fi
+  done
+}
+revert_macos_timemachine_exclude() {
+  local d
+  if [[ -r "$MACOS_TM_LIST" ]]; then
+    while IFS= read -r d; do
+      [[ -n "$d" && -d "$d" ]] && run_as_user_exec tmutil removeexclusion "$d" 2>/dev/null || true
+    done < "$MACOS_TM_LIST"
+    run_as_user_exec rm -f "$MACOS_TM_LIST"
+  fi
+  echo -e "${C_GREEN}Removed Time Machine exclusions for model/cache directories.${C_RESET}"
+}
+
+# 12ad. macOS RDMA over Thunderbolt 5 (Distributed Mac Clusters)
+applicable_macos_rdma_tb5() {
+  [[ "$IS_MACOS" == true && "$IS_APPLE_SILICON" == true ]] || return 1
+  (( MACOS_MAJOR >= 26 )) && return 0
+  command -v rdma_ctl >/dev/null 2>&1
+}
+title_macos_rdma_tb5() { echo "macOS RDMA over Thunderbolt 5 (exo / MLX Distributed Clusters)"; }
+note_macos_rdma_tb5() { echo -e "${C_BLUE}[OPT]${C_RESET}"; }
+status_macos_rdma_tb5() {
+  command -v rdma_ctl >/dev/null 2>&1 && rdma_ctl status 2>/dev/null | grep -qiE 'enabled|active'
+}
+explain_macos_rdma_tb5() {
+  cat <<'EOF'
+Impact:
+  Enables RDMA over Thunderbolt 5 (macOS 26.2+ / rdma_ctl enable) for low-
+  latency, high-bandwidth tensor/pipeline parallelism across clustered Macs
+  (exo, mlx.distributed). Only relevant when networking multiple Macs via TB5.
+EOF
+  echo -e "\n${C_YELLOW}[NOTE] On Apple Silicon Macs, enabling RDMA may require confirming 'rdma_ctl enable'${C_RESET}"
+  echo -e "${C_YELLOW}       from macOS Recovery Terminal if not already authorized.${C_RESET}"
+}
+apply_macos_rdma_tb5() {
+  if ! command -v rdma_ctl >/dev/null 2>&1; then
+    echo -e "${C_YELLOW}rdma_ctl was not found (requires macOS 26.2+ on Apple Silicon with Thunderbolt 5).${C_RESET}"
+    return 1
+  fi
+  if ! run_root rdma_ctl enable; then
+    echo -e "${C_YELLOW}Could not enable RDMA from live macOS. Boot into macOS Recovery -> Terminal and run 'rdma_ctl enable', then reboot.${C_RESET}"
+    return 1
+  fi
+  echo -e "${C_GREEN}Enabled RDMA over Thunderbolt 5.${C_RESET}"
+}
+revert_macos_rdma_tb5() {
+  if command -v rdma_ctl >/dev/null 2>&1; then
+    run_root rdma_ctl disable 2>/dev/null || true
+  fi
+  echo -e "${C_GREEN}Disabled RDMA over Thunderbolt 5.${C_RESET}"
 }

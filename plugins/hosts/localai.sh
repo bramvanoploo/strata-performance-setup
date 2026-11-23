@@ -32,10 +32,13 @@ _localai_refresh() {
     LOCALAI_DOCKER="$(_host_find_docker 'local-ai|localai' || true)"
   fi
   LOCALAI_SOURCE="$(_host_detect_install_source "localai" "$LOCALAI_BIN" "localai" true)"
+  LOCALAI_URL="$(_host_detect_url "http://127.0.0.1:${LOCALAI_PORT}" '(^|/)(local-ai|localai)([[:space:]]|$)' "$LOCALAI_DOCKER" "localai.service")"
 }
 
 _localai_running() {
-  _host_http_ok "${LOCALAI_URL}/readyz" 1 || _host_http_ok "${LOCALAI_URL}/v1/models" 1
+  local pat='(^|/)(local-ai|localai)([[:space:]]|$)'
+  _host_endpoint_running "${LOCALAI_URL}/readyz" "$pat" "$LOCALAI_DOCKER" "localai.service" ||
+    _host_endpoint_running "${LOCALAI_URL}/v1/models" "$pat" "$LOCALAI_DOCKER" "localai.service"
 }
 
 localai_init() {
@@ -122,6 +125,11 @@ _localai_dispatch() {
     bench)
       _host_openai_bench "LocalAI" "$LOCALAI_URL"
       ;;
+    uninstall)
+      _host_standard_uninstall "localai" "LocalAI" "localai.service" "$LOCALAI_BIN" "$LOCALAI_SOURCE" "localai"
+      _localai_refresh
+      _host_clear_update_cache "localai"
+      ;;
   esac
 }
 
@@ -135,6 +143,7 @@ localai_open() {
     --docker-var "LOCALAI_DOCKER" \
     --source-var "LOCALAI_SOURCE" \
     --url "$LOCALAI_URL" \
+    --url-var "LOCALAI_URL" \
     --is-running "_localai_running" \
     --dispatch "_localai_dispatch"
 }

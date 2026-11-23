@@ -100,6 +100,7 @@ STRATA_API_KEY="${STRATA_API_KEY:-}"
 [[ -n "$STRATA_API_KEY" ]] && export STRATA_API_KEY
 CHECK_ONLY=false
 DISTRO_FAMILY="unknown" DISTRO_ID="unknown" OS_PRETTY="" KERNEL_VER="" AUR_HELPER="" HAS_SYSTEMD=true HAS_LAUNCHD=false IS_UNRAID=false IS_TRUENAS=false IS_SYNOLOGY=false
+IS_WSL2=false IS_OSTREE=false IS_NIXOS=false IS_RASPBERRY_PI=false
 IS_APPLE_SILICON=false IS_APPLE_LINUX=false IS_ASAHI_LINUX=false HAS_APPLESMC=false
 MACOS_VER="" MACOS_MAJOR=0 MACOS_CHIP="" MACOS_GPU_CORES="" MACOS_METAL_VER="" MACOS_MODEL_ID="" MACOS_WIRED_LIMIT_MB="" MACOS_POWER_MODE_SUPPORTED=false
 MACOS_CPU_THREADS="" MACOS_RAM_BYTES=0
@@ -111,6 +112,8 @@ MACOS_METAL_ENV_SH="$TARGET_HOME/.config/strata/macos-metal-env.sh"
 MACOS_SPOTLIGHT_LIST="$TARGET_HOME/.local/share/strata-performance-setup/spotlight-excluded.list"
 APPLESMC_MBPFAN_MARKER="/etc/strata-applesmc-mbpfan.conf"
 HAS_NVIDIA=false HAS_NVIDIA_POWERD=false HAS_AMD=false HAS_INTEL_GPU=false HAS_INTEL_ARC=false
+HAS_AMD_NPU=false HAS_INTEL_NPU=false HAS_TENSTORRENT=false HAS_MTHREADS=false HAS_ASCEND=false HAS_ROCKCHIP_NPU=false HAS_HAILO=false
+NPU_SUMMARY=""
 HAS_AMD_APU=false HAS_AMD_PREBUILT_GFX=false AMD_GTT_TOTAL_MB=0
 HAS_AMD_INSTINCT=false HAS_AMD_NON_INSTINCT=false
 HAS_NVIDIA_TESLA=false HAS_NVIDIA_NON_TESLA=false NVIDIA_COMPUTE_MODE_NON_DEFAULT=false
@@ -155,7 +158,7 @@ STRATA_UPDATE_AVAILABLE=false STRATA_UPDATE_SUMMARY="" STRATA_UPDATE_CACHE_FILE=
 UNIT_FILES_CACHE=""
 declare -A PKG_AVAIL_CACHE PKG_INST_CACHE
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT_VERSION="1.9.3"
+SCRIPT_VERSION="1.9.5"
 PLUGIN_BASE_URL="${STRATA_PLUGIN_BASE_URL:-https://raw.githubusercontent.com/bramvanoploo/strata-performance-setup/main}"
 PLUGIN_CACHE_DIR="${STRATA_PLUGIN_CACHE_DIR:-${XDG_CACHE_HOME:-$TARGET_HOME/.cache}/strata-performance-setup/plugins}"
 NO_PLUGINS=false
@@ -167,7 +170,7 @@ declare -A HOST_PLUGIN_DESCS=([strata]="Install, update, launch, and benchmark S
 declare -A HOST_PLUGIN_CAPS=([strata]="install,service,updates,bench,stats")
 declare -A HOST_UPDATE_AVAIL=() HOST_UPDATE_LATEST=() HOST_INSTALL_SOURCE=()
 SERVER_UPDATE_POLLER_PID=""
-declare -A TWEAK_REGISTERED=() STEP_TIER=() STEP_OS=() STEP_LAPTOP_REC=() STEP_VM_SUPPORTED=() STEP_EXP_NON_ARCH=()
+declare -A TWEAK_REGISTERED=() STEP_TIER=() STEP_OS=() STEP_LAPTOP_REC=() STEP_VM_SUPPORTED=() STEP_EXP_NON_ARCH=() STEP_WSL_SUPPORTED=()
 
 # ------------------------------------------------------------------------------
 # Core Helpers (Privileges, Packages, Services, Bootloader)
@@ -705,7 +708,13 @@ pkg_available() {
           pacman -Si "$pkg" >/dev/null 2>&1 && rc=0
         fi
         ;;
-      fedora)    [[ "$mode" == "repo" ]] && dnf info --available "$pkg" >/dev/null 2>&1 && rc=0 ;;
+      fedora)
+        if [[ "$IS_OSTREE" == true ]] && ! command -v dnf >/dev/null 2>&1; then
+          pkg_installed "$pkg" && rc=0
+        else
+          [[ "$mode" == "repo" ]] && dnf info --available "$pkg" >/dev/null 2>&1 && rc=0
+        fi
+        ;;
       debian)    [[ "$mode" == "repo" && ! ( "$IS_TRUENAS" == true && ! "$(command -v apt-get 2>/dev/null)" ) ]] && apt-cache show "$pkg" >/dev/null 2>&1 && rc=0 ;;
       suse)      [[ "$mode" == "repo" ]] && zypper --non-interactive info "$pkg" 2>/dev/null | grep -i "^Repository" >/dev/null && rc=0 ;;
       slackware)
@@ -730,7 +739,17 @@ pkg_install() {
   local rc=0
   case "$DISTRO_FAMILY" in
     arch)      run_root pacman -S --needed --noconfirm "$@" || rc=$? ;;
-    fedora)    run_root dnf install -y "$@" || rc=$? ;;
+    fedora)
+      if [[ "$IS_OSTREE" == true ]] && command -v rpm-ostree >/dev/null 2>&1; then
+        run_root rpm-ostree install --apply-live -y "$@" || run_root rpm-ostree install -y "$@" || rc=$?
+      else
+        run_root dnf install -y "$@" || rc=$?
+      fi
+      ;;
+    nixos)
+      echo -e "${C_YELLOW}NixOS is declarative; add packages ($*) to /etc/nixos/configuration.nix or your flake.${C_RESET}"
+      return 1
+      ;;
     debian)
       if [[ "$IS_TRUENAS" == true ]] && ! command -v apt-get >/dev/null 2>&1; then
         echo -e "${C_YELLOW}TrueNAS SCALE appliance mode restricts apt; skipping package install ($*).${C_RESET}"; return 1
@@ -825,6 +844,8 @@ _kernel_param_files() {
     "${br}/etc/default/limine" \
     "${br}/etc/default/grub" \
     "${br}/etc/kernel/cmdline" \
+    "${br}/boot/firmware/cmdline.txt" \
+    "${br}/boot/cmdline.txt" \
     "${br}/boot/refind_linux.conf" \
     "${br}"/boot/loader/entries/*.conf \
     "${br}"/efi/loader/entries/*.conf \
@@ -954,7 +975,15 @@ PYEOF
 }
 
 has_kernel_param() {
-  local param="$1" f br="${STRATA_BOOT_ROOT:-}"
+  local param="$1" f br="${STRATA_BOOT_ROOT:-}" esc cur_kargs=""
+  if [[ "$IS_OSTREE" == true ]] && command -v rpm-ostree >/dev/null 2>&1; then
+    cur_kargs="$(rpm-ostree kargs 2>/dev/null || true)"
+    if [[ -n "$cur_kargs" ]]; then
+      esc="$(_escape_ere "$param")"
+      grep -qE "(^|[[:space:]])${esc}([[:space:]]|\$)" <<<"$cur_kargs"
+      return $?
+    fi
+  fi
   _file_has_kparam "$param" "${br}/proc/cmdline" && return 0
   while IFS= read -r f; do
     _file_has_kparam "$param" "$f" && return 0
@@ -965,12 +994,36 @@ has_kernel_param() {
 add_kernel_param() {
   local br="${STRATA_BOOT_ROOT:-}"
   local -a params=() missing=()
-  local param bls_dir=""
+  local param bls_dir="" cur_kargs="" esc=""
+  if [[ "$IS_OSTREE" == true ]] && command -v rpm-ostree >/dev/null 2>&1; then
+    cur_kargs="$(rpm-ostree kargs 2>/dev/null || true)"
+  fi
   for param in "$@"; do
     [[ -n "$param" ]] || continue
-    _file_has_kparam "$param" "${br}/proc/cmdline" || params+=("$param")
+    if [[ -n "$cur_kargs" ]]; then
+      esc="$(_escape_ere "$param")"
+      grep -qE "(^|[[:space:]])${esc}([[:space:]]|\$)" <<<"$cur_kargs" || params+=("$param")
+    else
+      _file_has_kparam "$param" "${br}/proc/cmdline" || params+=("$param")
+    fi
   done
   (( ${#params[@]} > 0 )) || return 0
+
+  if [[ "$IS_NIXOS" == true ]]; then
+    echo -e "${C_YELLOW}NixOS is declarative; add '${params[*]}' to boot.kernelParams in /etc/nixos/configuration.nix (or your flake) and run 'nixos-rebuild switch'.${C_RESET}"
+    return 1
+  fi
+
+  if [[ "$IS_OSTREE" == true ]] && command -v rpm-ostree >/dev/null 2>&1; then
+    local -a kargs_flags=()
+    for param in "${params[@]}"; do
+      kargs_flags+=("--append-if-missing=${param}")
+    done
+    run_root rpm-ostree kargs "${kargs_flags[@]}" || return 1
+    REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
+    echo -e "${C_GREEN}Added '${params[*]}' via rpm-ostree kargs (reboot required).${C_RESET}"
+    return 0
+  fi
 
   if [[ "$DISTRO_FAMILY" == "fedora" || "$DISTRO_FAMILY" == "suse" ]] && command -v grubby >/dev/null 2>&1 && [[ ! -f "${br}/etc/default/limine" ]]; then
     run_root grubby --update-kernel=ALL --args="${params[*]}" || true
@@ -1085,6 +1138,12 @@ add_kernel_param() {
     fi
     REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
     echo -e "${C_GREEN}Added '${params[*]}' to ${elilo_f} (reboot required).${C_RESET}"
+  elif [[ -f "${br}/boot/firmware/cmdline.txt" || -f "${br}/boot/cmdline.txt" ]]; then
+    local rpi_cmd="${br}/boot/firmware/cmdline.txt"
+    [[ -f "$rpi_cmd" ]] || rpi_cmd="${br}/boot/cmdline.txt"
+    _append_kparam_to_cmdline_file "$rpi_cmd" "${params[@]}" || true
+    REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
+    echo -e "${C_GREEN}Added '${params[*]}' to ${rpi_cmd} (reboot required).${C_RESET}"
   elif [[ -f "${br}/etc/lilo.conf" ]]; then
     missing=()
     for param in "${params[@]}"; do
@@ -1112,6 +1171,28 @@ add_kernel_param() {
 remove_kernel_param() {
   local br="${STRATA_BOOT_ROOT:-}" changed=false
   local param ef limine_changed=false grub_changed=false cmdline_changed=false lilo_changed=false
+  if [[ "$IS_NIXOS" == true ]]; then
+    echo -e "${C_YELLOW}NixOS is declarative; remove '$*' from boot.kernelParams in /etc/nixos/configuration.nix and run 'nixos-rebuild switch'.${C_RESET}"
+    return 1
+  fi
+  if [[ "$IS_OSTREE" == true ]] && command -v rpm-ostree >/dev/null 2>&1; then
+    local cur_kargs esc
+    local -a del_flags=()
+    cur_kargs="$(rpm-ostree kargs 2>/dev/null || true)"
+    for param in "$@"; do
+      [[ -n "$param" ]] || continue
+      esc="$(_escape_ere "$param")"
+      if [[ -z "$cur_kargs" ]] || grep -qE "(^|[[:space:]])${esc}([[:space:]]|\$)" <<<"$cur_kargs"; then
+        del_flags+=("--delete-if-present=${param}")
+      fi
+    done
+    if (( ${#del_flags[@]} > 0 )); then
+      run_root rpm-ostree kargs "${del_flags[@]}" || return 1
+      REBOOT_REQUIRED=true REBOOT_PROMPT_PENDING=true
+      echo -e "${C_GREEN}Removed '$*' via rpm-ostree kargs (reboot required).${C_RESET}"
+    fi
+    return 0
+  fi
   for param in "$@"; do
     [[ -n "$param" ]] || continue
     if _file_has_kparam "$param" "${br}/etc/default/limine"; then
@@ -1126,6 +1207,12 @@ remove_kernel_param() {
       _remove_kparam_from_file "$param" "${br}/etc/kernel/cmdline"
       cmdline_changed=true changed=true
     fi
+    for ef in "${br}/boot/firmware/cmdline.txt" "${br}/boot/cmdline.txt"; do
+      if [[ -f "$ef" ]] && _file_has_kparam "$param" "$ef"; then
+        _remove_kparam_from_file "$param" "$ef"
+        changed=true
+      fi
+    done
     if [[ "$DISTRO_FAMILY" == "fedora" || "$DISTRO_FAMILY" == "suse" ]] && command -v grubby >/dev/null 2>&1; then
       run_root grubby --update-kernel=ALL --remove-args="$param" >/dev/null 2>&1 && changed=true || true
     fi
@@ -1750,6 +1837,12 @@ detect_platform_basics() {
 
   IS_MACOS=false
   HAS_LAUNCHD=false
+  IS_WSL2=false
+  IS_OSTREE=false
+  IS_NIXOS=false
+  if [[ "${STRATA_IS_WSL2:-}" == "true" || -n "${WSL_DISTRO_NAME:-}" || -n "${WSL_INTEROP:-}" || -e /dev/dxg ]] || grep -qiE 'microsoft|wsl' /proc/version /proc/sys/kernel/osrelease 2>/dev/null; then
+    IS_WSL2=true
+  fi
   if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
     HAS_SYSTEMD=true
   else
@@ -1759,6 +1852,8 @@ detect_platform_basics() {
   if command -v systemd-detect-virt >/dev/null 2>&1; then
     IS_VIRT="$(systemd-detect-virt 2>/dev/null || true)"
     [[ "$IS_VIRT" == "none" ]] && IS_VIRT=""
+  elif [[ "$IS_WSL2" == true ]]; then
+    IS_VIRT="wsl"
   elif grep -qiE "QEMU|KVM|VMware|VirtualBox|Xen|Bochs|Hyper-V" /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name 2>/dev/null; then
     IS_VIRT="vm"
   elif grep -q "^flags.*\bhypervisor\b" /proc/cpuinfo 2>/dev/null; then
@@ -1774,19 +1869,30 @@ detect_platform_basics() {
     local id_like="${ID_LIKE:-}"
     if [[ "$DISTRO_ID" =~ ^(arch|cachyos|endeavouros|manjaro|garuda)$ ]] || [[ "$id_like" == *arch* ]]; then
       DISTRO_FAMILY="arch"
-    elif [[ "$DISTRO_ID" =~ ^(fedora|nobara|rhel|centos|rocky|alma)$ ]] || [[ "$id_like" == *fedora* || "$id_like" == *rhel* ]]; then
+    elif [[ "$DISTRO_ID" =~ ^(fedora|nobara|bazzite|silverblue|kinoite|aurora|bluefin|rhel|centos|rocky|alma)$ ]] || [[ "$id_like" == *fedora* || "$id_like" == *rhel* ]]; then
       DISTRO_FAMILY="fedora"
-    elif [[ "$DISTRO_ID" =~ ^(debian|ubuntu|pop|linuxmint|neon)$ ]] || [[ "$id_like" == *debian* || "$id_like" == *ubuntu* ]]; then
+    elif [[ "$DISTRO_ID" =~ ^(debian|ubuntu|pop|linuxmint|neon|raspbian)$ ]] || [[ "$id_like" == *debian* || "$id_like" == *ubuntu* ]]; then
       DISTRO_FAMILY="debian"
     elif [[ "$DISTRO_ID" =~ ^(opensuse.*|sles|sled|suse)$ ]] || [[ "$id_like" == *suse* ]]; then
       DISTRO_FAMILY="suse"
     elif [[ "$DISTRO_ID" =~ ^(slackware|unraid)$ ]] || [[ "$id_like" == *slackware* ]]; then
       DISTRO_FAMILY="slackware"
+    elif [[ "$DISTRO_ID" == "nixos" ]]; then
+      DISTRO_FAMILY="nixos"
     fi
   elif [[ -r /etc/slackware-version ]]; then
     DISTRO_ID="slackware"
     DISTRO_FAMILY="slackware"
     OS_PRETTY="$(cat /etc/slackware-version 2>/dev/null || echo "Slackware Linux")"
+  fi
+
+  if [[ -e /run/ostree-booted ]] || { command -v rpm-ostree >/dev/null 2>&1 && [[ -d /ostree ]]; }; then
+    IS_OSTREE=true
+    [[ "$DISTRO_FAMILY" == "unknown" ]] && DISTRO_FAMILY="fedora"
+  fi
+  if [[ "$DISTRO_ID" == "nixos" || -f /etc/NIXOS ]]; then
+    IS_NIXOS=true
+    DISTRO_FAMILY="nixos"
   fi
 
   if [[ -r /etc/unraid-version ]] || [[ "$DISTRO_ID" == "unraid" ]]; then
@@ -1930,6 +2036,10 @@ detect_environment() {
   TOTAL_VRAM_MB=0
   NVIDIA_VRAM_MB=0
   HAS_NVIDIA=false HAS_NVIDIA_POWERD=false HAS_AMD=false HAS_INTEL_GPU=false HAS_INTEL_ARC=false
+  HAS_AMD_NPU=false HAS_INTEL_NPU=false HAS_TENSTORRENT=false HAS_MTHREADS=false HAS_ASCEND=false HAS_ROCKCHIP_NPU=false HAS_HAILO=false
+  IS_RASPBERRY_PI=false NPU_SUMMARY=""
+HAS_AMD_NPU=false HAS_INTEL_NPU=false HAS_TENSTORRENT=false HAS_MTHREADS=false HAS_ASCEND=false HAS_ROCKCHIP_NPU=false HAS_HAILO=false
+NPU_SUMMARY=""
   HAS_AMD_APU=false HAS_AMD_PREBUILT_GFX=false AMD_GTT_TOTAL_MB=0
   HAS_AMD_INSTINCT=false HAS_AMD_NON_INSTINCT=false
   AMD_GFX_SUMMARY="" AMD_MISSING_GFX_SUMMARY="" AMD_GFX_ARCHS=() AMD_MISSING_GFX_ARCHS=()
@@ -2008,6 +2118,14 @@ detect_environment() {
   if [[ "${STRATA_ARCH_UNAME:-$(uname -m 2>/dev/null || echo unknown)}" == "aarch64" ]] && grep -qi "apple," "$dt_dir/compatible" 2>/dev/null; then
     IS_APPLE_LINUX=true
     IS_ASAHI_LINUX=true
+  fi
+  if [[ -r "$dt_dir/model" ]] && tr -d '\0' < "$dt_dir/model" 2>/dev/null | grep -qi "Raspberry Pi"; then
+    IS_RASPBERRY_PI=true
+  fi
+  if [[ -r "$dt_dir/compatible" ]] && tr -d '\0' < "$dt_dir/compatible" 2>/dev/null | grep -qi "rockchip,rk3588"; then
+    HAS_ROCKCHIP_NPU=true
+  elif [[ -e /dev/rknpu || -d /sys/class/devfreq/fdab0000.npu ]]; then
+    HAS_ROCKCHIP_NPU=true
   fi
 
   if command -v nvidia-smi >/dev/null 2>&1; then
@@ -2288,6 +2406,64 @@ detect_environment() {
   (( DISCRETE_GPU_COUNT < ${#NVIDIA_GPU_INDICES[@]} )) && DISCRETE_GPU_COUNT="${#NVIDIA_GPU_INDICES[@]}"
 
   unit_exists nvidia-powerd.service && HAS_NVIDIA_POWERD=true
+
+  # Detect NPUs & AI Accelerators (AMD XDNA, Intel NPU, Tenstorrent, Moore Threads, Huawei Ascend, Rockchip, Hailo)
+  local -a accel_list=()
+  local _all_pci="" _ad="" _drv=""
+  _all_pci="$(lspci -nn 2>/dev/null || true)"
+  if [[ -d /sys/bus/pci/drivers/amdxdna ]] || grep -qiE '1022:(1502|17f0|17f1|17f2|17f3|17f4|17f5|17f6|17f7)|AMD.*(IPU|NPU|XDNA|Ryzen AI)' <<<"$_all_pci"; then
+    HAS_AMD_NPU=true
+  fi
+  if [[ -d /sys/bus/pci/drivers/intel_vpu ]] || grep -qiE '8086:(7d1d|ad0d|643e|b03e)|Intel.*(NPU|VPU|Neural|AI Boost)' <<<"$_all_pci"; then
+    HAS_INTEL_NPU=true
+  fi
+  for _ad in /sys/class/accel/accel*; do
+    [[ -e "$_ad" ]] || continue
+    _drv="$(basename "$(readlink -f "$_ad/device/driver" 2>/dev/null || true)" 2>/dev/null || true)"
+    case "$_drv" in
+      amdxdna) HAS_AMD_NPU=true ;;
+      intel_vpu) HAS_INTEL_NPU=true ;;
+    esac
+  done
+  if compgen -G "/dev/tenstorrent*" >/dev/null 2>&1 || grep -qiE '1e52:|Tenstorrent' <<<"$_all_pci"; then
+    HAS_TENSTORRENT=true
+  fi
+  if compgen -G "/dev/musa*" >/dev/null 2>&1 || grep -qiE '1ed5:|Moore Threads' <<<"$_all_pci"; then
+    HAS_MTHREADS=true
+  fi
+  if compgen -G "/dev/davinci*" >/dev/null 2>&1 || grep -qiE '19e5:(d100|d500|d801|d802)|Huawei.*Ascend' <<<"$_all_pci"; then
+    HAS_ASCEND=true
+  fi
+  if compgen -G "/dev/hailo*" >/dev/null 2>&1 || grep -qiE '1e60:|Hailo' <<<"$_all_pci"; then
+    HAS_HAILO=true
+  fi
+  if [[ -d "$pci_dir" ]]; then
+    for dev in "$pci_dir"/*; do
+      [[ -d "$dev" ]] || continue
+      ven="$(tr '[:upper:]' '[:lower:]' < "$dev/vendor" 2>/dev/null || true)"
+      case "$ven" in
+        0x1e52) HAS_TENSTORRENT=true ;;
+        0x1ed5) HAS_MTHREADS=true ;;
+        0x1e60) HAS_HAILO=true ;;
+        0x19e5)
+          cls="$(cat "$dev/class" 2>/dev/null || true)"
+          [[ "$cls" == 0x12* || "$cls" == 0x03* ]] && HAS_ASCEND=true
+          ;;
+      esac
+    done
+  fi
+  [[ "$HAS_AMD_NPU" == true ]] && accel_list+=("AMD Ryzen AI NPU (XDNA)")
+  [[ "$HAS_INTEL_NPU" == true ]] && accel_list+=("Intel NPU (intel_vpu)")
+  [[ "$HAS_TENSTORRENT" == true ]] && accel_list+=("Tenstorrent")
+  [[ "$HAS_MTHREADS" == true ]] && accel_list+=("Moore Threads (MUSA)")
+  [[ "$HAS_ASCEND" == true ]] && accel_list+=("Huawei Ascend (CANN)")
+  [[ "$HAS_ROCKCHIP_NPU" == true ]] && accel_list+=("Rockchip RK3588 NPU")
+  [[ "$HAS_HAILO" == true ]] && accel_list+=("Hailo NPU")
+  if (( ${#accel_list[@]} > 0 )); then
+    local _aj=""
+    printf -v _aj ', %s' "${accel_list[@]}"
+    NPU_SUMMARY="${_aj:2}"
+  fi
   if [[ -d /sys/class/power_supply/BAT0 || -d /sys/class/power_supply/BAT1 ]] || [[ "$(cat /sys/class/dmi/id/chassis_type 2>/dev/null || true)" =~ ^(8|9|10|14)$ ]]; then
     IS_LAPTOP=true
   fi
@@ -2306,6 +2482,10 @@ kernel_param_value() {
   esc="$(_escape_ere "$name")"
   v="$(tr ' ' '\n' <"${br}/proc/cmdline" 2>/dev/null | grep -m1 -E "^${esc}=" | cut -d= -f2- || true)"
   [[ -n "$v" ]] && { echo "$v"; return 0; }
+  if [[ "$IS_OSTREE" == true ]] && command -v rpm-ostree >/dev/null 2>&1; then
+    v="$(rpm-ostree kargs 2>/dev/null | tr ' ' '\n' | grep -m1 -E "^${esc}=" | cut -d= -f2- || true)"
+    [[ -n "$v" ]] && { echo "$v"; return 0; }
+  fi
   while IFS= read -r f; do
     [[ -r "$f" ]] || continue
     v="$(grep -v '^[[:space:]]*#' "$f" 2>/dev/null | grep -oE "(^|[[:space:]\"'])${esc}=[^ \"']+" | head -n1 | sed -E 's/^[[:space:]"'\'']+//' | cut -d= -f2- || true)"
@@ -2860,6 +3040,7 @@ _host_plugin_supported() {
     ""|all) return 0 ;;
     linux) [[ "$IS_MACOS" != true ]] ;;
     linux-gpu) [[ "$IS_MACOS" != true && ( "$HAS_NVIDIA" == true || "$HAS_AMD" == true || "$HAS_INTEL_GPU" == true ) ]] ;;
+    linux-nvidia) [[ "$IS_MACOS" != true && "$HAS_NVIDIA" == true ]] ;;
     macos) [[ "$IS_MACOS" == true ]] ;;
     macos-arm64) [[ "$IS_MACOS" == true && "$IS_APPLE_SILICON" == true ]] ;;
     *) return 0 ;;
@@ -2925,7 +3106,7 @@ register_host_plugin() {
 }
 
 register_tweak() {
-  local id="" stars="3" tier="recommended" os="linux" laptop_rec="true" vm_sup="true" exp_non_arch="false"
+  local id="" stars="3" tier="recommended" os="linux" laptop_rec="true" vm_sup="true" exp_non_arch="false" wsl_sup="false"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --id) id="$2"; shift 2 ;;
@@ -2935,6 +3116,7 @@ register_tweak() {
       --laptop-recommended) laptop_rec="$2"; shift 2 ;;
       --vm-supported) vm_sup="$2"; shift 2 ;;
       --experimental-non-arch) exp_non_arch="$2"; shift 2 ;;
+      --wsl-supported) wsl_sup="$2"; shift 2 ;;
       *) shift ;;
     esac
   done
@@ -2949,6 +3131,7 @@ register_tweak() {
   STEP_LAPTOP_REC[$id]="$laptop_rec"
   STEP_VM_SUPPORTED[$id]="$vm_sup"
   STEP_EXP_NON_ARCH[$id]="$exp_non_arch"
+  STEP_WSL_SUPPORTED[$id]="$wsl_sup"
 }
 
 _FETCHED_PLUGIN_FILE=""
@@ -3030,20 +3213,26 @@ load_applicable_tweak_packs() {
     return 0
   fi
   load_plugin tweaks linux-core || true
+  if [[ "$IS_WSL2" == true ]]; then
+    load_plugin tweaks wsl2 || true
+  fi
   if [[ "$IS_LAPTOP" == true || "$IS_APPLE_LINUX" == true ]]; then
     load_plugin tweaks linux-laptop || true
   fi
   if [[ "$HAS_NVIDIA" == true ]]; then
     load_plugin tweaks nvidia || true
   fi
-  if [[ "$HAS_AMD" == true || "${CPU_SUMMARY:-}" == *AMD* || "${CPU_SUMMARY:-}" == *Ryzen* || "${CPU_SUMMARY:-}" == *EPYC* ]]; then
+  if [[ "$HAS_AMD" == true || "$HAS_AMD_NPU" == true || "${CPU_SUMMARY:-}" == *AMD* || "${CPU_SUMMARY:-}" == *Ryzen* || "${CPU_SUMMARY:-}" == *EPYC* ]]; then
     load_plugin tweaks amd || true
   fi
-  if [[ "$HAS_INTEL_GPU" == true || "${CPU_SUMMARY:-}" == *Intel* || -d /sys/class/powercap/intel-rapl ]]; then
+  if [[ "$HAS_INTEL_GPU" == true || "$HAS_INTEL_NPU" == true || "${CPU_SUMMARY:-}" == *Intel* || -d /sys/class/powercap/intel-rapl ]]; then
     load_plugin tweaks intel || true
   fi
   if [[ "$IS_JETSON" == true ]]; then
     load_plugin tweaks jetson || true
+  fi
+  if [[ "$HAS_TENSTORRENT" == true || "$HAS_MTHREADS" == true || "$HAS_ASCEND" == true || "$HAS_ROCKCHIP_NPU" == true || "$HAS_HAILO" == true || "$IS_RASPBERRY_PI" == true ]]; then
+    load_plugin tweaks accelerators || true
   fi
 }
 
@@ -3093,7 +3282,9 @@ build_active_steps() {
     else
       [[ "$os_scope" == "linux" || "$os_scope" == "both" ]] || continue
     fi
-    if [[ -n "$IS_VIRT" && "${STEP_VM_SUPPORTED[$step]:-true}" == "false" ]]; then
+    if [[ "$IS_WSL2" == true ]]; then
+      [[ "${STEP_WSL_SUPPORTED[$step]:-false}" == "true" ]] || continue
+    elif [[ -n "$IS_VIRT" && "${STEP_VM_SUPPORTED[$step]:-true}" == "false" ]]; then
       continue
     fi
     "applicable_${step}" && candidates+=("$step")
@@ -3101,9 +3292,10 @@ build_active_steps() {
   ACTIVE_STEPS=()
   for (( pts = 5; pts >= 1; pts-- )); do
     for step in "${candidates[@]}"; do
-      (( ${STEP_GAIN_PTS[$step]:-1} == pts )) && ACTIVE_STEPS+=("$step")
+      (( ${STEP_GAIN_PTS[$step]:-1} == pts )) && ACTIVE_STEPS+=("$step") || true
     done
   done
+  return 0
 }
 
 is_experimental_step() {
@@ -5250,11 +5442,11 @@ format_server_row() {
   label_txt="$(printf "%-18s" "$raw_label")"
   svc_col="$(_pad_ansi_col "$svc_txt" 16)"
   if [[ "$has_upd" == true ]]; then
-    upd_cell="$(_pad_ansi_col "${C_BGREEN}↑${C_RESET}" 3)"
+    upd_cell="$(_pad_ansi_col "${C_BGREEN}↑${C_RESET}" 7)"
   elif [[ "$inst" == true && "${HOST_INSTALL_SOURCE[$pid]:-}" == "manual" ]]; then
-    upd_cell="$(_pad_ansi_col "${C_DIM}-${C_RESET}" 3)"
+    upd_cell="$(_pad_ansi_col "${C_DIM}-${C_RESET}" 7)"
   else
-    upd_cell="$(_server_cap_cell "$caps" "updates" 3)"
+    upd_cell="$(_server_cap_cell "$caps" "updates" 7)"
   fi
   if [[ "$selected" == true ]]; then
     ptr="${C_CYAN}>${C_RESET}"
@@ -5266,10 +5458,10 @@ format_server_row() {
   fi
   printf "%b %b  | %b | %b | %b | %b | %b | %b | %b | %b" \
     "$ptr" "$row_num" "$badge" "$label_txt" "$svc_col" \
-    "$(_server_cap_cell "$caps" "install" 4)" \
-    "$(_server_cap_cell "$caps" "service" 3)" \
+    "$(_server_cap_cell "$caps" "install" 7)" \
+    "$(_server_cap_cell "$caps" "service" 7)" \
     "$upd_cell" \
-    "$(_server_cap_cell "$caps" "bench" 5)" \
+    "$(_server_cap_cell "$caps" "bench" 9)" \
     "$(_server_cap_cell "$caps" "stats" 5)"
 }
 
@@ -5304,10 +5496,15 @@ show_inference_servers_page() {
     done < <(_list_outdated_servers)
 
     print_header
+    local srv_hw_warns=""
+    srv_hw_warns="$(run_host_hook hw_warnings)"
+    if [[ -n "$srv_hw_warns" ]]; then
+      printf "%s\n\n" "$srv_hw_warns"
+    fi
     echo -e "${C_BOLD}Inference Servers (Applicable to this machine):${C_RESET}"
     echo ""
-    printf "  ${C_BOLD}%-3s | %-15s | %-18s | %-16s | %-4s | %-3s | %-3s | %-5s | %-5s${C_RESET}\n" "#" "Status" "Inference Server" "Service" "Inst" "Svc" "Upd" "Bench" "Stats"
-    printf "  %s\n" "----+-----------------+--------------------+------------------+------+-----+-----+-------+------"
+    printf "  ${C_BOLD}%-3s | %-15s | %-18s | %-16s | %-7s | %-7s | %-7s | %-9s | %-5s${C_RESET}\n" "#" "Status" "Inference Server" "Service" "Install" "Service" "Updates" "Benchmark" "Stats"
+    printf "  %s\n" "----+-----------------+--------------------+------------------+---------+---------+---------+-----------+------"
     local i is_sel
     for (( i = 0; i < total; i++ )); do
       is_sel=false
@@ -5437,7 +5634,9 @@ show_index() {
     print_header toggle
 
     local body="" hw_warns=""
-    hw_warns="$(run_host_hook hw_warnings)"
+    if [[ "$IS_NIXOS" == true ]]; then
+      hw_warns="$(echo -e "  ${C_YELLOW}[NixOS]${C_RESET} Declarative OS detected: imperative /etc, systemd, and kernel param edits may be overwritten on nixos-rebuild.")"
+    fi
     if [[ -n "$hw_warns" ]]; then
       body+="${hw_warns}"$'\n'
       body+="$(echo -e "${C_DIM}          You can still apply any host optimizations applicable to this machine below.${C_RESET}")"$'\n\n'
@@ -5671,6 +5870,10 @@ print_check_summary() {
   [[ "$IS_UNRAID" == true ]] && platform_tags+=("Unraid")
   [[ "$IS_TRUENAS" == true ]] && platform_tags+=("TrueNAS")
   [[ "$IS_SYNOLOGY" == true ]] && platform_tags+=("Synology")
+  [[ "$IS_WSL2" == true ]] && platform_tags+=("WSL2")
+  [[ "$IS_OSTREE" == true ]] && platform_tags+=("ostree")
+  [[ "$IS_NIXOS" == true ]] && platform_tags+=("NixOS")
+  [[ "$IS_RASPBERRY_PI" == true ]] && platform_tags+=("Raspberry Pi")
   [[ "$IS_JETSON" == true ]] && platform_tags+=("Jetson")
   [[ "$IS_LAPTOP" == true ]] && platform_tags+=("laptop")
   [[ -n "$IS_VIRT" ]] && platform_tags+=("VM:${IS_VIRT}")
@@ -5686,6 +5889,10 @@ print_check_summary() {
   echo "  CPU:      ${CPU_SUMMARY:-Unknown} (sockets: ${CPU_SOCKETS}, NUMA nodes: ${NUMA_NODES})"
   echo "  RAM:      ${RAM_GB} GiB${RAM_DETAILS}"
   echo "  GPU(s):   ${GPU_SUMMARY:-Unknown}"
+  [[ -n "$NPU_SUMMARY" ]] && echo "  Accel:    ${NPU_SUMMARY}"
+  if [[ "$IS_NIXOS" == true ]]; then
+    echo -e "  ${C_YELLOW}[NixOS] Declarative system: configure boot.kernelParams and systemPackages in NixOS config for persistent changes.${C_RESET}"
+  fi
   if [[ "$IS_MACOS" == true && "$IS_APPLE_SILICON" == true ]]; then
     echo "    Platform: Apple Silicon (${MACOS_CHIP:-Apple}, ${MACOS_MODEL_ID:-Mac}, macOS ${MACOS_VER:-unknown})"
   fi

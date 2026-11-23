@@ -4,24 +4,28 @@
 # PLUGIN_DESC: Core Linux kernel, memory, CPU, PCIe, and storage tweaks
 
 register_tweak --id "cpu_performance" --stars 1 --tier "high_idle" --os "linux" --laptop-recommended true --vm-supported false --experimental-non-arch false
-register_tweak --id "memlock_realtime" --stars 3 --tier "recommended" --os "linux" --laptop-recommended true --vm-supported true --experimental-non-arch false
+register_tweak --id "memlock_realtime" --stars 3 --tier "recommended" --os "linux" --laptop-recommended true --vm-supported true --wsl-supported true --experimental-non-arch false
 register_tweak --id "pcie_aspm" --stars 1 --tier "high_idle" --os "linux" --laptop-recommended true --vm-supported false --experimental-non-arch false
 register_tweak --id "lact_overclock" --stars 4 --tier "recommended" --os "linux" --laptop-recommended true --vm-supported true --experimental-non-arch false
-register_tweak --id "sysctl_tuning" --stars 3 --tier "recommended" --os "linux" --laptop-recommended true --vm-supported true --experimental-non-arch false
+register_tweak --id "sysctl_tuning" --stars 3 --tier "recommended" --os "linux" --laptop-recommended true --vm-supported true --wsl-supported true --experimental-non-arch false
 register_tweak --id "zram_swap" --stars 3 --tier "recommended" --os "linux" --laptop-recommended true --vm-supported true --experimental-non-arch false
 register_tweak --id "irq_balance" --stars 2 --tier "recommended" --os "linux" --laptop-recommended true --vm-supported true --experimental-non-arch false
 register_tweak --id "numa_balancing" --stars 2 --tier "recommended" --os "linux" --laptop-recommended true --vm-supported true --experimental-non-arch false
 register_tweak --id "headless_target" --stars 4 --tier "recommended" --os "linux" --laptop-recommended true --vm-supported true --experimental-non-arch false
 register_tweak --id "cstate_limit" --stars 1 --tier "high_idle" --os "linux" --laptop-recommended true --vm-supported false --experimental-non-arch false
-register_tweak --id "gpu_groups" --stars 4 --tier "recommended" --os "linux" --laptop-recommended true --vm-supported true --experimental-non-arch false
+register_tweak --id "gpu_groups" --stars 4 --tier "recommended" --os "linux" --laptop-recommended true --vm-supported true --wsl-supported true --experimental-non-arch false
 register_tweak --id "nvme_tuning" --stars 3 --tier "recommended" --os "linux" --laptop-recommended true --vm-supported true --experimental-non-arch false
-register_tweak --id "net_tuning" --stars 2 --tier "recommended" --os "linux" --laptop-recommended true --vm-supported true --experimental-non-arch false
+register_tweak --id "net_tuning" --stars 2 --tier "recommended" --os "linux" --laptop-recommended true --vm-supported true --wsl-supported true --experimental-non-arch false
 register_tweak --id "tuned_profile" --stars 1 --tier "high_idle" --os "linux" --laptop-recommended true --vm-supported false --experimental-non-arch false
 register_tweak --id "iommu_pt" --stars 2 --tier "recommended" --os "linux" --laptop-recommended true --vm-supported true --experimental-non-arch false
 register_tweak --id "pcie_acs_disable" --stars 3 --tier "experimental" --os "linux" --laptop-recommended true --vm-supported false --experimental-non-arch false
 register_tweak --id "numactl_interleave" --stars 3 --tier "recommended" --os "linux" --laptop-recommended true --vm-supported true --experimental-non-arch false
 register_tweak --id "hugepages_1g" --stars 1 --tier "opt_in" --os "linux" --laptop-recommended true --vm-supported true --experimental-non-arch false
 register_tweak --id "scx_scheduler" --stars 2 --tier "recommended" --os "linux" --laptop-recommended true --vm-supported true --experimental-non-arch false
+register_tweak --id "kernel_mitigations_off" --stars 3 --tier "opt_in" --os "linux" --laptop-recommended false --vm-supported false --experimental-non-arch false
+register_tweak --id "kernel_init_on_alloc_off" --stars 2 --tier "opt_in" --os "linux" --laptop-recommended true --vm-supported true --experimental-non-arch false
+register_tweak --id "kernel_split_lock_off" --stars 1 --tier "opt_in" --os "linux" --laptop-recommended true --vm-supported true --experimental-non-arch false
+register_tweak --id "vm_overcommit" --stars 2 --tier "opt_in" --os "linux" --laptop-recommended true --vm-supported true --wsl-supported true --experimental-non-arch false
 
 # 4. CPU Performance
 applicable_cpu_performance() { [[ -d /sys/devices/system/cpu/cpu0/cpufreq ]] || command -v powerprofilesctl >/dev/null 2>&1; }
@@ -1117,4 +1121,94 @@ revert_scx_scheduler() {
   [[ -n "$u" ]] && run_root systemctl disable --now "$u" 2>/dev/null || true
 }
 
-# 12w. AMD X3D V-Cache Mode
+# 12w. CPU/Kernel Opt-In Performance Trade-offs
+applicable_kernel_mitigations_off() {
+  [[ -d /sys/devices/system/cpu/vulnerabilities ]] || has_kernel_param "mitigations=off"
+}
+title_kernel_mitigations_off() { echo "Disable CPU Vulnerability Mitigations (mitigations=off)"; }
+note_kernel_mitigations_off() { echo -e "${C_BLUE}[OPT]${C_RESET}"; }
+status_kernel_mitigations_off() { has_kernel_param "mitigations=off"; }
+explain_kernel_mitigations_off() {
+  cat <<'EOF'
+Impact:
+  Adds 'mitigations=off' to the bootloader kernel command line, disabling
+  Spectre, Meltdown, Retbleed, and GDS CPU mitigations. Can improve CPU/hybrid
+  inference and syscall-heavy throughput by 5-15% on older Zen 1/2 and pre-Ice
+  Lake Intel CPUs (smaller impact on Zen 4/5 and newer CPUs). Requires a reboot.
+EOF
+  echo -e "\n${C_YELLOW}[WARNING] Disables hardware side-channel security mitigations.${C_RESET}"
+  echo -e "${C_YELLOW}          Only use on isolated/trusted single-tenant inference hosts.${C_RESET}"
+}
+apply_kernel_mitigations_off() { add_kernel_param "mitigations=off"; }
+revert_kernel_mitigations_off() { remove_kernel_param "mitigations=off"; }
+
+applicable_kernel_init_on_alloc_off() {
+  [[ "$IS_MACOS" == false ]] && { [[ -r /proc/cmdline ]] || has_kernel_param "init_on_alloc=0"; }
+}
+title_kernel_init_on_alloc_off() { echo "Disable Kernel Page Zeroing on Alloc (init_on_alloc=0)"; }
+note_kernel_init_on_alloc_off() { echo -e "${C_BLUE}[OPT]${C_RESET}"; }
+status_kernel_init_on_alloc_off() { has_kernel_param "init_on_alloc=0"; }
+explain_kernel_init_on_alloc_off() {
+  cat <<'EOF'
+Impact:
+  Adds 'init_on_alloc=0 init_on_free=0' to the kernel command line, skipping
+  kernel page/slab zeroing defaults enabled by Arch, Fedora, and Ubuntu.
+  Speeds up large model loads, mmap page faults, and hugepage allocations
+  with zero idle power impact. Requires a reboot.
+EOF
+  echo -e "\n${C_YELLOW}[NOTE] Trade-off: relaxes kernel memory info-leak hardening defaults.${C_RESET}"
+}
+apply_kernel_init_on_alloc_off() { add_kernel_param "init_on_alloc=0" "init_on_free=0"; }
+revert_kernel_init_on_alloc_off() { remove_kernel_param "init_on_alloc=0" "init_on_free=0"; }
+
+applicable_kernel_split_lock_off() {
+  has_kernel_param "split_lock_detect=off" && return 0
+  grep -qi "GenuineIntel" /proc/cpuinfo 2>/dev/null && [[ -e /proc/sys/kernel/split_lock_mitigate || -n "$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null | grep -oE '\bsplit_lock_detect\b' || true)" ]]
+}
+title_kernel_split_lock_off() { echo "Disable Intel Split-Lock Detection Penalty (split_lock_detect=off)"; }
+note_kernel_split_lock_off() { echo -e "${C_BLUE}[OPT]${C_RESET}"; }
+status_kernel_split_lock_off() {
+  has_kernel_param "split_lock_detect=off" && return 0
+  [[ "$(sysctl -n kernel.split_lock_mitigate 2>/dev/null || echo 1)" == "0" ]]
+}
+explain_kernel_split_lock_off() {
+  cat <<'EOF'
+Impact:
+  Sets 'split_lock_detect=off' on the kernel command line (and sets
+  kernel.split_lock_mitigate=0 via sysctl when exposed). Prevents the kernel
+  from sleeping threads that emit unaligned split-lock atomics.
+EOF
+  echo -e "\n${C_DIM}[MINIMAL GAIN] Native LLM engines rarely trigger split locks; mostly helps legacy binaries.${C_RESET}"
+}
+apply_kernel_split_lock_off() {
+  if sysctl -n kernel.split_lock_mitigate >/dev/null 2>&1; then
+    write_sysctl_with_prev /etc/sysctl.d/99-strata-split-lock.conf "kernel.split_lock_mitigate=0"
+  fi
+  add_kernel_param "split_lock_detect=off"
+}
+revert_kernel_split_lock_off() {
+  restore_sysctl_prev /etc/sysctl.d/99-strata-split-lock.conf
+  remove_kernel_param "split_lock_detect=off"
+}
+
+applicable_vm_overcommit() { [[ "$IS_MACOS" == false ]] && sysctl -n vm.overcommit_memory >/dev/null 2>&1; }
+title_vm_overcommit() { echo "Allow Unbounded Virtual Memory Overcommit (vm.overcommit_memory=1)"; }
+note_vm_overcommit() { echo -e "${C_BLUE}[OPT]${C_RESET}"; }
+status_vm_overcommit() {
+  [[ -f /etc/sysctl.d/99-strata-overcommit.conf ]] && [[ "$(sysctl -n vm.overcommit_memory 2>/dev/null || echo 0)" == "1" ]]
+}
+explain_vm_overcommit() {
+  cat <<'EOF'
+Impact:
+  Sets vm.overcommit_memory=1 in /etc/sysctl.d/99-strata-overcommit.conf so
+  large mmap/KV-cache reservations near system RAM size do not fail with
+  ENOMEM before pages are actually faulted in.
+EOF
+  echo -e "\n${C_YELLOW}[NOTE] Trade-off: disables kernel virtual memory commit accounting; OOM killer triggers only if RAM+swap is exhausted.${C_RESET}"
+}
+apply_vm_overcommit() {
+  write_sysctl_with_prev /etc/sysctl.d/99-strata-overcommit.conf "vm.overcommit_memory=1"
+}
+revert_vm_overcommit() {
+  restore_sysctl_prev /etc/sysctl.d/99-strata-overcommit.conf
+}

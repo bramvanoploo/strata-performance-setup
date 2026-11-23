@@ -34,10 +34,11 @@ _llamacpp_refresh() {
     LLAMACPP_DOCKER="$(_host_find_docker 'llama[.]?cpp|llama-server' || true)"
   fi
   LLAMACPP_SOURCE="$(_host_detect_install_source "llamacpp" "$LLAMACPP_BIN" "llama.cpp" false)"
+  LLAMACPP_URL="$(_host_detect_url "http://127.0.0.1:${LLAMACPP_PORT}" '(^|/)llama-server([[:space:]]|$)' "$LLAMACPP_DOCKER" "llamacpp.service")"
 }
 
 _llamacpp_running() {
-  _host_http_ok "${LLAMACPP_URL}/health" 1
+  _host_endpoint_running "${LLAMACPP_URL}/health" '(^|/)llama-server([[:space:]]|$)' "$LLAMACPP_DOCKER" "llamacpp.service"
 }
 
 llamacpp_init() {
@@ -136,6 +137,13 @@ _llamacpp_dispatch() {
         echo -e "${C_YELLOW}Start llama-server or install llama-bench first.${C_RESET}"
       fi
       ;;
+    uninstall)
+      local -a _ll_extra=()
+      [[ "$LLAMACPP_SOURCE" == "manual" && -n "$LLAMACPP_BENCH_BIN" ]] && _ll_extra+=("$LLAMACPP_BENCH_BIN")
+      _host_standard_uninstall "llamacpp" "llama.cpp" "llamacpp.service" "$LLAMACPP_BIN" "$LLAMACPP_SOURCE" "llama.cpp" "${_ll_extra[@]}"
+      _llamacpp_refresh
+      _host_clear_update_cache "llamacpp"
+      ;;
   esac
 }
 
@@ -149,6 +157,7 @@ llamacpp_open() {
     --docker-var "LLAMACPP_DOCKER" \
     --source-var "LLAMACPP_SOURCE" \
     --url "$LLAMACPP_URL" \
+    --url-var "LLAMACPP_URL" \
     --is-running "_llamacpp_running" \
     --dispatch "_llamacpp_dispatch"
 }

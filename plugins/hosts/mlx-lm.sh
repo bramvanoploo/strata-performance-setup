@@ -27,10 +27,11 @@ _mlx_lm_refresh() {
     [[ -z "$MLX_LM_VERSION" ]] && MLX_LM_VERSION="installed"
   fi
   MLX_LM_SOURCE="$(_host_detect_install_source "mlx-lm" "$MLX_LM_BIN" "mlx-lm" false)"
+  MLX_LM_URL="$(_host_detect_url "http://127.0.0.1:${MLX_LM_PORT}" 'mlx_lm\.server' "" "mlx-lm.service")"
 }
 
 _mlx_lm_running() {
-  _host_http_ok "${MLX_LM_URL}/v1/models" 1
+  _host_endpoint_running "${MLX_LM_URL}/v1/models" 'mlx_lm\.server' "" "mlx-lm.service"
 }
 
 mlx-lm_init() {
@@ -112,6 +113,11 @@ _mlx_lm_dispatch() {
         fi
       fi
       ;;
+    uninstall)
+      _host_standard_uninstall "mlx-lm" "MLX LM" "mlx-lm.service" "$MLX_LM_BIN" "$MLX_LM_SOURCE" "mlx-lm"
+      _mlx_lm_refresh
+      _host_clear_update_cache "mlx-lm"
+      ;;
   esac
 }
 
@@ -124,6 +130,7 @@ mlx-lm_open() {
     --ver-var "MLX_LM_VERSION" \
     --source-var "MLX_LM_SOURCE" \
     --url "$MLX_LM_URL" \
+    --url-var "MLX_LM_URL" \
     --is-running "_mlx_lm_running" \
     --dispatch "_mlx_lm_dispatch"
 }
