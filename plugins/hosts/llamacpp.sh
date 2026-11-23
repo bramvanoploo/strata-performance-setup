@@ -66,6 +66,14 @@ llamacpp_table_status() {
   _host_std_table_status "$LLAMACPP_BIN" "$LLAMACPP_DOCKER" "$running" "llamacpp.service"
 }
 
+llamacpp_check_update() {
+  [[ -n "$LLAMACPP_BIN" ]] && _host_check_update_cached "llamacpp" "$LLAMACPP_VERSION" "ggml-org/llama.cpp"
+}
+
+llamacpp_update() {
+  _llamacpp_dispatch update
+}
+
 _llamacpp_install_or_update() {
   if [[ "$IS_MACOS" == true ]] && command -v brew >/dev/null 2>&1; then
     if [[ -n "$LLAMACPP_BIN" ]]; then
@@ -86,7 +94,10 @@ _llamacpp_install_or_update() {
 
 _llamacpp_dispatch() {
   case "$1" in
-    install|update) _llamacpp_install_or_update ;;
+    install|update)
+      _llamacpp_install_or_update
+      _host_clear_update_cache "llamacpp"
+      ;;
     latest)
       local latest
       latest="$(_host_github_latest_tag "ggml-org/llama.cpp" || true)"

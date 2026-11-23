@@ -489,6 +489,35 @@ EOF
   assert_eq "$opts_docker" "bench latest" "Docker-only server shows bench and latest options"
   opt_row="$(_host_option_row 0 "install" "Ollama" "ollama.service" "" false true)"
   assert_contains "$opt_row" "Install Ollama" "_host_option_row formats install option"
+
+  STRATA_UPDATE_CACHE_DIR="${TMP_DIR}/ucache"
+  mkdir -p "$STRATA_UPDATE_CACHE_DIR"
+  printf "%s|v0.9.0\n" "$(date +%s)" > "${STRATA_UPDATE_CACHE_DIR}/ollama.cache"
+  _host_github_latest_tag() { echo "should_not_fetch"; }
+  _host_check_update_cached "ollama" "0.8.0" "ollama/ollama" 7200
+  assert_eq "${HOST_UPDATE_AVAIL[ollama]}" "true" "_host_check_update_cached detects available update from TTL cache"
+  _host_check_update_cached "ollama" "0.9.0" "ollama/ollama" 7200
+  assert_eq "${HOST_UPDATE_AVAIL[ollama]}" "false" "_host_check_update_cached clears update flag when up to date"
+  _host_check_update_cached "ollama" "0.10.0" "ollama/ollama" 7200
+  assert_eq "${HOST_UPDATE_AVAIL[ollama]}" "false" "_host_check_update_cached does not flag newer local version as outdated"
+
+  AVAILABLE_HOST_PLUGINS=("strata" "ollama")
+  STRATA_UPDATE_AVAILABLE=true
+  HOST_UPDATE_AVAIL[ollama]=true
+  srv_tgl="$(format_servers_toggle_row false)"
+  assert_contains "$srv_tgl" "2 updates available" "format_servers_toggle_row shows total update count"
+  OLLAMA_BIN="/usr/bin/ollama"
+  srv_upd="$(format_server_row 1 false)"
+  assert_contains "$srv_upd" "[UPDATE AVAIL]" "format_server_row shows UPDATE AVAIL badge"
+  assert_contains "$srv_upd" "↑" "format_server_row shows ↑ in Upd column"
+
+  HOST_UPDATE_AVAIL[llamacpp]="false"
+  printf "llamacpp|true|b5000\nollama|true|v0.9.0\n" > "${STRATA_UPDATE_CACHE_DIR}/summary.state"
+  load_server_update_states
+  assert_eq "${HOST_UPDATE_AVAIL[llamacpp]}" "true" "load_server_update_states loads background update summary"
+  _host_clear_update_cache "llamacpp"
+  assert_not_contains "$(cat "${STRATA_UPDATE_CACHE_DIR}/summary.state")" "llamacpp|" "_host_clear_update_cache removes server entry from summary.state"
+  assert_contains "$(cat "${STRATA_UPDATE_CACHE_DIR}/summary.state")" "ollama|true|v0.9.0" "_host_clear_update_cache preserves other entries in summary.state"
 )
 
 if command -v curl >/dev/null 2>&1; then

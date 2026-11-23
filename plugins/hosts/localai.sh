@@ -64,6 +64,14 @@ localai_table_status() {
   _host_std_table_status "$LOCALAI_BIN" "$LOCALAI_DOCKER" "$running" "localai.service"
 }
 
+localai_check_update() {
+  [[ -n "$LOCALAI_BIN" ]] && _host_check_update_cached "localai" "$LOCALAI_VERSION" "mudler/LocalAI"
+}
+
+localai_update() {
+  _localai_dispatch update
+}
+
 _localai_install_or_update() {
   if [[ "$IS_MACOS" == true ]] && command -v brew >/dev/null 2>&1; then
     if [[ -n "$LOCALAI_BIN" ]]; then
@@ -83,7 +91,10 @@ _localai_install_or_update() {
 
 _localai_dispatch() {
   case "$1" in
-    install|update) _localai_install_or_update ;;
+    install|update)
+      _localai_install_or_update
+      _host_clear_update_cache "localai"
+      ;;
     latest)
       local latest
       latest="$(_host_github_latest_tag "mudler/LocalAI" || true)"

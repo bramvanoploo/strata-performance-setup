@@ -70,6 +70,14 @@ vllm_table_status() {
   _host_std_table_status "$VLLM_BIN" "$VLLM_DOCKER" "$running" "vllm.service"
 }
 
+vllm_check_update() {
+  [[ -n "$VLLM_BIN" ]] && _host_check_update_cached "vllm" "$VLLM_VERSION" "vllm-project/vllm"
+}
+
+vllm_update() {
+  _vllm_dispatch update
+}
+
 _vllm_dispatch() {
   case "$1" in
     install|update)
@@ -77,6 +85,7 @@ _vllm_dispatch() {
       [[ -n "$VLLM_BIN" ]] && upgrade=true
       _host_venv_install_or_upgrade "vllm" "vllm" "$upgrade"
       _vllm_refresh
+      _host_clear_update_cache "vllm"
       ;;
     latest)
       local latest

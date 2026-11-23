@@ -82,6 +82,14 @@ ollama_table_status() {
   _host_std_table_status "$OLLAMA_BIN" "$OLLAMA_DOCKER" "$running" "ollama.service"
 }
 
+ollama_check_update() {
+  [[ -n "$OLLAMA_BIN" ]] && _host_check_update_cached "ollama" "$OLLAMA_VERSION" "ollama/ollama"
+}
+
+ollama_update() {
+  _ollama_dispatch update
+}
+
 _ollama_install_or_update() {
   if [[ "$IS_MACOS" == true ]] && command -v brew >/dev/null 2>&1; then
     if [[ -n "$OLLAMA_BIN" ]]; then
@@ -105,7 +113,10 @@ _ollama_install_or_update() {
 
 _ollama_dispatch() {
   case "$1" in
-    install|update) _ollama_install_or_update ;;
+    install|update)
+      _ollama_install_or_update
+      _host_clear_update_cache "ollama"
+      ;;
     latest)
       local latest
       latest="$(_host_github_latest_tag "ollama/ollama" || true)"

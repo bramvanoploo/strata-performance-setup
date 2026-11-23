@@ -155,7 +155,7 @@ STRATA_UPDATE_AVAILABLE=false STRATA_UPDATE_SUMMARY="" STRATA_UPDATE_CACHE_FILE=
 UNIT_FILES_CACHE=""
 declare -A PKG_AVAIL_CACHE PKG_INST_CACHE
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT_VERSION="1.9.2"
+SCRIPT_VERSION="1.9.3"
 PLUGIN_BASE_URL="${STRATA_PLUGIN_BASE_URL:-https://raw.githubusercontent.com/bramvanoploo/strata-performance-setup/main}"
 PLUGIN_CACHE_DIR="${STRATA_PLUGIN_CACHE_DIR:-${XDG_CACHE_HOME:-$TARGET_HOME/.cache}/strata-performance-setup/plugins}"
 NO_PLUGINS=false
@@ -165,6 +165,8 @@ declare -A HOST_PLUGIN_LOADED=() TWEAK_PACK_LOADED=()
 declare -A HOST_PLUGIN_NAMES=([strata]="Strata")
 declare -A HOST_PLUGIN_DESCS=([strata]="Install, update, launch, and benchmark Strata LLM server")
 declare -A HOST_PLUGIN_CAPS=([strata]="install,service,updates,bench,stats")
+declare -A HOST_UPDATE_AVAIL=() HOST_UPDATE_LATEST=()
+SERVER_UPDATE_POLLER_PID=""
 declare -A TWEAK_REGISTERED=() STEP_TIER=() STEP_OS=() STEP_LAPTOP_REC=() STEP_VM_SUPPORTED=() STEP_EXP_NON_ARCH=()
 
 # ------------------------------------------------------------------------------
@@ -4365,15 +4367,94 @@ format_stats_toggle_row() {
   fi
 }
 
+_server_update_summary_file() {
+  echo "${STRATA_UPDATE_CACHE_DIR:-${TARGET_HOME:-$HOME}/.cache/strata-performance-setup/updates}/summary.state"
+}
+
+load_server_update_states() {
+  local sfile pid avail latest
+  sfile="$(_server_update_summary_file)"
+  [[ -r "$sfile" ]] || return 0
+  while IFS='|' read -r pid avail latest; do
+    [[ -n "$pid" ]] || continue
+    HOST_UPDATE_AVAIL[$pid]="${avail:-false}"
+    HOST_UPDATE_LATEST[$pid]="${latest:-}"
+  done < "$sfile"
+}
+
+start_server_update_poller() {
+  [[ "$NO_PLUGINS" != true && "$CHECK_ONLY" != true ]] || return 0
+  discover_host_plugins
+  (( ${#AVAILABLE_HOST_PLUGINS[@]} > 0 )) || return 0
+  local sfile sdir
+  sfile="$(_server_update_summary_file)"
+  sdir="$(dirname "$sfile")"
+  (
+    local _IN_SERVER_UPDATE_POLLER=true
+    local pid tmp_sfile="${sfile}.tmp.$$"
+    mkdir -p "$sdir" 2>/dev/null || exit 0
+    : > "$tmp_sfile" 2>/dev/null || exit 0
+    for pid in "${AVAILABLE_HOST_PLUGINS[@]}"; do
+      if [[ -z "${HOST_PLUGIN_LOADED[$pid]:-}" ]]; then
+        load_plugin hosts "$pid" >/dev/null 2>&1 || continue
+      fi
+      if [[ "$pid" == "strata" ]] && declare -F check_strata_update_sync >/dev/null 2>&1; then
+        check_strata_update_sync >/dev/null 2>&1 || true
+        declare -F load_strata_update_state >/dev/null 2>&1 && load_strata_update_state
+        printf "strata|%s|%s\n" "${STRATA_UPDATE_AVAILABLE:-false}" "${STRATA_UPDATE_SUMMARY:-}" >> "$tmp_sfile" 2>/dev/null || true
+      elif declare -F "${pid}_check_update" >/dev/null 2>&1; then
+        "${pid}_check_update" >/dev/null 2>&1 || true
+        printf "%s|%s|%s\n" "$pid" "${HOST_UPDATE_AVAIL[$pid]:-false}" "${HOST_UPDATE_LATEST[$pid]:-}" >> "$tmp_sfile" 2>/dev/null || true
+      fi
+    done
+    mv -f "$tmp_sfile" "$sfile" 2>/dev/null || rm -f "$tmp_sfile" 2>/dev/null || true
+    [[ $EUID -eq 0 && "${TARGET_USER:-root}" != "root" ]] && chown "$TARGET_USER" "$sdir" "$sfile" 2>/dev/null || true
+  ) >/dev/null 2>&1 &
+  SERVER_UPDATE_POLLER_PID=$!
+}
+
+_server_has_update() {
+  local pid="$1"
+  if [[ "$pid" == "strata" && "${STRATA_UPDATE_AVAILABLE:-false}" == true ]]; then
+    return 0
+  fi
+  [[ "${HOST_UPDATE_AVAIL[$pid]:-false}" == true ]]
+}
+
+_list_outdated_servers() {
+  local pid
+  for pid in "${AVAILABLE_HOST_PLUGINS[@]}"; do
+    _server_has_update "$pid" && echo "$pid"
+  done
+}
+
+_count_server_updates() {
+  local pid n=0
+  for pid in "${AVAILABLE_HOST_PLUGINS[@]}"; do
+    _server_has_update "$pid" && ((n++)) || true
+  done
+  echo "$n"
+}
+
 format_servers_toggle_row() {
   local selected="${1:-false}"
+  load_server_update_states
   local count=${#AVAILABLE_HOST_PLUGINS[@]}
+  local upd_count upd_txt=""
+  upd_count="$(_count_server_updates)"
+  if (( upd_count == 1 )); then
+    upd_txt=", 1 update available"
+  elif (( upd_count > 1 )); then
+    upd_txt=", ${upd_count} updates available"
+  fi
   local prefix="  "
   [[ "$selected" == true ]] && prefix="▶ "
   if [[ "$selected" == true ]]; then
-    printf "%b%s[SERVERS]  Inference Servers — Install, configure, and benchmark (%d available)%b" "${C_BOLD}${C_CYAN}" "$prefix" "$count" "$C_RESET"
+    printf "%b%s[SERVERS]  Inference Servers — Install, configure, and benchmark (%d available%s)%b" "${C_BOLD}${C_CYAN}" "$prefix" "$count" "$upd_txt" "$C_RESET"
   else
-    printf "%s%b[SERVERS]%b  %bInference Servers — Install, configure, and benchmark (%d available)%b" "$prefix" "${C_MAGENTA}" "${C_RESET}" "${C_DIM}" "$count" "${C_RESET}"
+    local upd_col=""
+    [[ -n "$upd_txt" ]] && upd_col="${C_BGREEN}${upd_txt}${C_RESET}${C_DIM}"
+    printf "%s%b[SERVERS]%b  %bInference Servers — Install, configure, and benchmark (%d available%b)%b" "$prefix" "${C_MAGENTA}" "${C_RESET}" "${C_DIM}" "$count" "$upd_col" "${C_RESET}"
   fi
 }
 
@@ -5057,9 +5138,14 @@ format_server_row() {
     fi
   fi
 
-  local badge
+  local badge has_upd=false
   if [[ "$inst" == true ]]; then
-    badge="${C_GREEN}[INSTALLED]    ${C_RESET}"
+    if _server_has_update "$pid"; then
+      has_upd=true
+      badge="${C_BGREEN}[UPDATE AVAIL] ${C_RESET}"
+    else
+      badge="${C_GREEN}[INSTALLED]    ${C_RESET}"
+    fi
   else
     badge="${C_DIM}[NOT INSTALLED]${C_RESET}"
     svc_txt="${C_DIM}-${C_RESET}"
@@ -5067,9 +5153,14 @@ format_server_row() {
 
   local raw_label="$pname"
   (( ${#raw_label} > 18 )) && raw_label="${raw_label:0:15}..."
-  local label_txt ptr row_num svc_col
+  local label_txt ptr row_num svc_col upd_cell
   label_txt="$(printf "%-18s" "$raw_label")"
   svc_col="$(_pad_ansi_col "$svc_txt" 16)"
+  if [[ "$has_upd" == true ]]; then
+    upd_cell="$(_pad_ansi_col "${C_BGREEN}↑${C_RESET}" 3)"
+  else
+    upd_cell="$(_server_cap_cell "$caps" "updates" 3)"
+  fi
   if [[ "$selected" == true ]]; then
     ptr="${C_CYAN}>${C_RESET}"
     row_num="${C_CYAN}${C_BOLD}$(printf "%2d" "$num")${C_RESET}"
@@ -5082,7 +5173,7 @@ format_server_row() {
     "$ptr" "$row_num" "$badge" "$label_txt" "$svc_col" \
     "$(_server_cap_cell "$caps" "install" 4)" \
     "$(_server_cap_cell "$caps" "service" 3)" \
-    "$(_server_cap_cell "$caps" "updates" 3)" \
+    "$upd_cell" \
     "$(_server_cap_cell "$caps" "bench" 5)" \
     "$(_server_cap_cell "$caps" "stats" 5)"
 }
@@ -5094,6 +5185,7 @@ show_inference_servers_page() {
     if [[ -z "${HOST_PLUGIN_LOADED[$_p]:-}" ]]; then
       load_plugin hosts "$_p" >/dev/null 2>&1 || true
     fi
+    declare -F "${_p}_check_update" >/dev/null 2>&1 && "${_p}_check_update"
   done
   while true; do
     local total=${#AVAILABLE_HOST_PLUGINS[@]}
@@ -5108,6 +5200,14 @@ show_inference_servers_page() {
     (( sel >= total )) && sel=$(( total - 1 ))
     (( sel < 0 )) && sel=0
 
+    local -a outdated_pids=()
+    local _opid outdated_names=""
+    while IFS= read -r _opid; do
+      [[ -n "$_opid" ]] || continue
+      outdated_pids+=("$_opid")
+      outdated_names+="${outdated_names:+, }${HOST_PLUGIN_NAMES[$_opid]:-$_opid}"
+    done < <(_list_outdated_servers)
+
     print_header
     echo -e "${C_BOLD}Inference Servers (Applicable to this machine):${C_RESET}"
     echo ""
@@ -5120,10 +5220,15 @@ show_inference_servers_page() {
       printf "%s\n" "$(format_server_row "$i" "$is_sel")"
     done
     echo ""
+    local footer_extra=0
+    if (( ${#outdated_pids[@]} > 0 )); then
+      echo -e "  ${C_BGREEN}[u]${C_RESET} Update all outdated servers (${outdated_names})"
+      footer_extra=1
+    fi
     echo -e "  ${C_DIM}Use [↑↓] + Enter, or [1-${total}] to open, [b / Esc / 0] Back to Index, [q] Quit${C_RESET}"
     echo ""
 
-    local saved_tty="" open_pid=""
+    local saved_tty="" open_pid="" do_update_all=false
     saved_tty="$(stty -g 2>/dev/null || true)"
     stty -echo 2>/dev/null || true
     trap '_tui_restore_tty "$saved_tty"; exit 0' INT TERM
@@ -5146,8 +5251,8 @@ show_inference_servers_page() {
         fi
         if (( new_sel != old_sel )); then
           sel="$new_sel"
-          local old_up=$(( 3 + (total - old_sel) ))
-          local new_up=$(( 3 + (total - new_sel) ))
+          local old_up=$(( 3 + footer_extra + (total - old_sel) ))
+          local new_up=$(( 3 + footer_extra + (total - new_sel) ))
           local old_row new_row
           old_row="$(format_server_row "$old_sel" false)"
           new_row="$(format_server_row "$new_sel" true)"
@@ -5169,6 +5274,12 @@ show_inference_servers_page() {
             break
           fi
           ;;
+        u|U)
+          if (( ${#outdated_pids[@]} > 0 )); then
+            do_update_all=true
+            break
+          fi
+          ;;
         0|b|B|i|I)
           _tui_restore_tty "$saved_tty"; trap - INT TERM; printf "\n"; return 0
           ;;
@@ -5181,6 +5292,17 @@ show_inference_servers_page() {
     _tui_restore_tty "$saved_tty"
     trap - INT TERM
     printf "\n"
+
+    if [[ "$do_update_all" == true ]]; then
+      for _opid in "${outdated_pids[@]}"; do
+        echo -e "\n${C_CYAN}Updating ${HOST_PLUGIN_NAMES[$_opid]:-$_opid}...${C_RESET}"
+        if declare -F "${_opid}_update" >/dev/null 2>&1; then
+          "${_opid}_update" || true
+        fi
+      done
+      pause_prompt
+      continue
+    fi
 
     if [[ -z "${HOST_PLUGIN_LOADED[$open_pid]:-}" ]]; then
       echo -e "\n${C_CYAN}Loading ${open_pid} plugin...${C_RESET}"
@@ -5368,6 +5490,11 @@ show_index() {
 
 cleanup_all_on_exit() {
   run_host_hook cleanup
+  if [[ -n "${SERVER_UPDATE_POLLER_PID:-}" ]]; then
+    kill "$SERVER_UPDATE_POLLER_PID" 2>/dev/null || true
+    wait "$SERVER_UPDATE_POLLER_PID" 2>/dev/null || true
+    SERVER_UPDATE_POLLER_PID=""
+  fi
   stop_bench_power_sampler
   [[ -n "$BENCH_POWER_TMP_FILE" ]] && rm -f "$BENCH_POWER_TMP_FILE" 2>/dev/null || true
   if [[ -n "$ACTIVE_SAMPLER_PID" ]]; then
@@ -5732,5 +5859,6 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   for _req_p in "${REQUESTED_HOST_PLUGINS[@]}"; do
     load_plugin hosts "$_req_p" || true
   done
+  start_server_update_poller
   show_index
 fi

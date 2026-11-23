@@ -1,11 +1,11 @@
-hosts	_common	_common		plugins/hosts/_common.sh	9d080ecc251801ec8b0925aa5baff98ef554e0041db078876dedb7a3f624ab14	all
-hosts	llamacpp	llama.cpp	Install, update, manage service, and benchmark llama.cpp (llama-server)	plugins/hosts/llamacpp.sh	e636e2148a6e6f27840bcc57e88ba4255b05222d30f2bd774ce02985d86050d3	all
-hosts	localai	LocalAI	Install, update, manage service, and benchmark LocalAI server	plugins/hosts/localai.sh	75291a0062e2b1f306efea86eb390fa23fe865bc988341aaba51e2b513aa6230	all
-hosts	mlx-lm	MLX LM	Install, update, manage service, and benchmark MLX LM on Apple Silicon	plugins/hosts/mlx-lm.sh	6d86ae21b4fd2d7c5d9bc892d14a4addbd3544c3308a82d07fee8ab78620370d	macos-arm64
-hosts	ollama	Ollama	Install, update, manage service, and benchmark Ollama LLM server	plugins/hosts/ollama.sh	8ce98822bce5616b66c475e36f080c86c85d9627aa40be9bc0d7fbb42491ccd4	all
-hosts	sglang	SGLang	Install, update, manage service, and benchmark SGLang inference server	plugins/hosts/sglang.sh	5aa4887087563248a27c6f2df4690dee85581294f4f4a861fd72c15ee5f6051e	linux
-hosts	strata	Strata	Install, update, launch, and benchmark Strata LLM server	plugins/hosts/strata.sh	2dda0b891725f77b3375f52d4c334de128fd006d07b22df2e096892f843d2f78	all
-hosts	vllm	vLLM	Install, update, manage service, and benchmark vLLM inference server	plugins/hosts/vllm.sh	1e515f676e74cf5d2fa4887c25b61cc2fe08b8dc5ccc7e3e317538e3e8d237a5	linux
+hosts	_common	_common		plugins/hosts/_common.sh	8653757345e8a9c2a8784e4e1896f6035db4c832f2f73e89c0a3084eefb5718d	all
+hosts	llamacpp	llama.cpp	Install, update, manage service, and benchmark llama.cpp (llama-server)	plugins/hosts/llamacpp.sh	a7ec0976cde667ccd71d5446198963a87fc602f8fb2ac52f690aff1ce32bac7f	all
+hosts	localai	LocalAI	Install, update, manage service, and benchmark LocalAI server	plugins/hosts/localai.sh	0e86aa9fcb21043a2bf80cd2bf13001a775f4b06b4b533fa698fc8b4d038e001	all
+hosts	mlx-lm	MLX LM	Install, update, manage service, and benchmark MLX LM on Apple Silicon	plugins/hosts/mlx-lm.sh	09a27d15a34ff131eab06deeee74a3831e9ea3e020666ed253f6f1ffa4e0bd52	macos-arm64
+hosts	ollama	Ollama	Install, update, manage service, and benchmark Ollama LLM server	plugins/hosts/ollama.sh	cc8f2538ff3d0cabb2e7e863f8d37c15bfa8cabcce49fa7786a15c30c391a3b9	all
+hosts	sglang	SGLang	Install, update, manage service, and benchmark SGLang inference server	plugins/hosts/sglang.sh	11ad7106bded27f917a9d99a46a3dd0730224ae9879e0d7478ed194059b8e13d	linux
+hosts	strata	Strata	Install, update, launch, and benchmark Strata LLM server	plugins/hosts/strata.sh	d9cf4bc480dbf4960c41f96ab71d8c9abfe390929dbcb1d6a72191613b5de3b1	all
+hosts	vllm	vLLM	Install, update, manage service, and benchmark vLLM inference server	plugins/hosts/vllm.sh	b64b2fb94d67feedb03b7325554303a5b490a6f8c73d7e79bdd6c8462ebded62	linux
 tweaks	amd	amd	AMD GPU/APU, Instinct, Ryzen TDP, and X3D tweaks	plugins/tweaks/amd.sh	1d93cd63c84e454be783b11b8120f91172b344f05c8cefbd71b0a1c6b569944c	all
 tweaks	common	common	Cross-platform host tweaks (Linux & macOS)	plugins/tweaks/common.sh	e43d914b60768f564a5d7be0b36f118f713220dd251c62061490b9e504e4cf47	all
 tweaks	intel	intel	Intel GPU, RAPL, thermald, and P-core pinning tweaks	plugins/tweaks/intel.sh	dae87d0c2abb10fd5b3e135ff6a4ad1fc23f23325daf03ca85e846adf939503e	all

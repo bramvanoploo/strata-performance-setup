@@ -59,6 +59,14 @@ mlx-lm_table_status() {
   _host_std_table_status "$MLX_LM_BIN" "" "$running" "mlx-lm.service"
 }
 
+mlx-lm_check_update() {
+  [[ -n "$MLX_LM_BIN" ]] && _host_check_update_cached "mlx-lm" "$MLX_LM_VERSION" "ml-explore/mlx-lm"
+}
+
+mlx-lm_update() {
+  _mlx_lm_dispatch update
+}
+
 _mlx_lm_dispatch() {
   case "$1" in
     install|update)
@@ -66,6 +74,7 @@ _mlx_lm_dispatch() {
       [[ -n "$MLX_LM_BIN" ]] && upgrade=true
       _host_venv_install_or_upgrade "mlx-lm" "mlx-lm" "$upgrade"
       _mlx_lm_refresh
+      _host_clear_update_cache "mlx-lm"
       ;;
     latest)
       local latest
