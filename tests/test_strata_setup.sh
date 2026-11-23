@@ -505,7 +505,19 @@ EOF
   STRATA_UPDATE_AVAILABLE=true
   HOST_UPDATE_AVAIL[ollama]=true
   srv_tgl="$(format_servers_toggle_row false)"
-  assert_contains "$srv_tgl" "2 updates available" "format_servers_toggle_row shows total update count"
+  assert_contains "$srv_tgl" "2 updates: Strata, Ollama" "format_servers_toggle_row names outdated servers"
+  STRATA_UPDATE_AVAILABLE=false
+  HOST_UPDATE_AVAIL[strata]="false"
+  HOST_UPDATE_AVAIL[ollama]="false"
+  HOST_UPDATE_AVAIL[llamacpp]="true"
+  HOST_UPDATE_LATEST[llamacpp]="v1.0.0"
+  AVAILABLE_HOST_PLUGINS=("strata" "llamacpp")
+  banner_llama="$(format_server_update_banner 100)"
+  assert_contains "$banner_llama" "llama.cpp update ready (v1.0.0)" "format_server_update_banner names llama.cpp when only llama.cpp has update"
+  assert_not_contains "$banner_llama" "Strata" "format_server_update_banner does not blame Strata when Strata is up to date"
+  AVAILABLE_HOST_PLUGINS=("strata" "ollama")
+  STRATA_UPDATE_AVAILABLE=true
+  HOST_UPDATE_AVAIL[ollama]=true
   OLLAMA_BIN="/usr/bin/ollama"
   srv_upd="$(format_server_row 1 false)"
   assert_contains "$srv_upd" "[UPDATE AVAIL]" "format_server_row shows UPDATE AVAIL badge"
