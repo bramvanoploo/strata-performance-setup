@@ -691,7 +691,8 @@ pkg_installed() {
 }
 
 pkg_available() {
-  local mode="$1" pkg="$2" key="${1}:${2}" rc=1
+  local mode="${1:-}" pkg="${2:-}" key="${1:-}:${2:-}" rc=1
+  [[ -n "$mode" && -n "$pkg" ]] || return 1
   [[ -n "${PKG_AVAIL_CACHE[$key]+x}" ]] && return "${PKG_AVAIL_CACHE[$key]}"
   if pkg_installed "$pkg"; then
     rc=0

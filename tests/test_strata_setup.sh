@@ -530,6 +530,11 @@ EOF
   _host_clear_update_cache "llamacpp"
   assert_not_contains "$(cat "${STRATA_UPDATE_CACHE_DIR}/summary.state")" "llamacpp|" "_host_clear_update_cache removes server entry from summary.state"
   assert_contains "$(cat "${STRATA_UPDATE_CACHE_DIR}/summary.state")" "ollama|true|v0.9.0" "_host_clear_update_cache preserves other entries in summary.state"
+
+  DISTRO_FAMILY="arch" IS_MACOS=false AUR_HELPER="" LLAMACPP_BIN="/usr/local/bin/llama-server"
+  pacman() { return 1; }
+  rc_ll=0; _llamacpp_install_or_update >/dev/null 2>&1 || rc_ll=$?
+  assert_eq "$rc_ll" "1" "_llamacpp_install_or_update returns 1 cleanly without unbound variable when no package exists"
 )
 
 if command -v curl >/dev/null 2>&1; then
