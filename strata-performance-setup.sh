@@ -4436,16 +4436,96 @@ _count_server_updates() {
   echo "$n"
 }
 
+_outdated_server_names() {
+  local pid names=""
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    names+="${names:+, }${HOST_PLUGIN_NAMES[$pid]:-$pid}"
+  done < <(_list_outdated_servers)
+  echo "$names"
+}
+
+format_server_update_banner() {
+  local rule_w="${1:-117}"
+  load_server_update_states
+  local names="" count=0
+  names="$(_outdated_server_names)"
+  count="$(_count_server_updates)"
+  (( count > 0 )) || return 0
+  local msg=""
+  if (( count == 1 )); then
+    local only_pid detail=""
+    only_pid="$(_list_outdated_servers | head -n1)"
+    if [[ "$only_pid" == "strata" && -n "${STRATA_UPDATE_SUMMARY:-}" ]]; then
+      detail=" (${STRATA_UPDATE_SUMMARY})"
+    elif [[ -n "${HOST_UPDATE_LATEST[$only_pid]:-}" ]]; then
+      detail=" (${HOST_UPDATE_LATEST[$only_pid]})"
+    fi
+    msg=" [UPDATE AVAILABLE] ${names} update ready${detail} — Press [u] to update "
+  else
+    msg=" [UPDATE AVAILABLE] Updates ready for: ${names} — Press [u] to update "
+  fi
+  if (( rule_w > 10 && ${#msg} > rule_w )); then
+    msg="${msg:0:$((rule_w - 3))}..."
+  fi
+  local pad=$(( rule_w - ${#msg} ))
+  local spaces=""
+  (( pad > 0 )) && printf -v spaces "%*s" "$pad" ""
+  printf "%b%s%s%b" "${C_UPDATE_BANNER}" "$msg" "$spaces" "${C_RESET}"
+}
+
+_render_server_update_banner_inplace() {
+  local banner_up="$1" term_lines="${2:-40}"
+  (( banner_up > 0 && banner_up < term_lines )) || return 1
+  local rule_w=120
+  [[ -t 1 ]] && rule_w="$(tput cols 2>/dev/null || echo 117)"
+  (( rule_w > 117 )) && rule_w=117
+  local banner_line
+  banner_line="$(format_server_update_banner "$rule_w")"
+  [[ -n "$banner_line" ]] || return 1
+  printf "\033[?2026h\033[?25l\033[s\033[%dA\r\033[2K%s\033[u\033[?25h\033[?2026l" "$banner_up" "$banner_line"
+  return 0
+}
+
+_run_all_server_updates() {
+  local -a outdated=()
+  local pid non_strata=false
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] && outdated+=("$pid")
+  done < <(_list_outdated_servers)
+  if (( ${#outdated[@]} == 0 )); then
+    echo -e "${C_YELLOW}No server updates available.${C_RESET}"
+    sleep 1
+    return 0
+  fi
+  for pid in "${outdated[@]}"; do
+    if [[ -z "${HOST_PLUGIN_LOADED[$pid]:-}" ]]; then
+      load_plugin hosts "$pid" >/dev/null 2>&1 || continue
+    fi
+    if [[ "$pid" == "strata" ]] && declare -F run_strata_option >/dev/null 2>&1; then
+      run_strata_option "update" true
+    elif declare -F "${pid}_update" >/dev/null 2>&1; then
+      echo -e "\n${C_CYAN}Updating ${HOST_PLUGIN_NAMES[$pid]:-$pid}...${C_RESET}"
+      "${pid}_update" || true
+      non_strata=true
+    fi
+  done
+  [[ "$non_strata" == true ]] && pause_prompt
+}
+
 format_servers_toggle_row() {
   local selected="${1:-false}"
   load_server_update_states
   local count=${#AVAILABLE_HOST_PLUGINS[@]}
-  local upd_count upd_txt=""
+  local upd_count upd_names="" upd_txt=""
   upd_count="$(_count_server_updates)"
-  if (( upd_count == 1 )); then
-    upd_txt=", 1 update available"
-  elif (( upd_count > 1 )); then
-    upd_txt=", ${upd_count} updates available"
+  if (( upd_count > 0 )); then
+    upd_names="$(_outdated_server_names)"
+    if (( upd_count == 1 )); then
+      upd_txt=", update available: ${upd_names}"
+    else
+      upd_txt=", ${upd_count} updates: ${upd_names}"
+    fi
   fi
   local prefix="  "
   [[ "$selected" == true ]] && prefix="▶ "
@@ -4511,8 +4591,8 @@ print_header() {
     POST_HEADER_LINES=$((POST_HEADER_LINES - 1))
     UPDATE_BANNER_OFFSET=$((UPDATE_BANNER_OFFSET - 1))
   fi
-  if [[ "$STRATA_UPDATE_AVAILABLE" == true ]] && declare -F format_strata_update_banner >/dev/null 2>&1; then
-    printf "%s\n" "$(format_strata_update_banner "$_rule_w")"
+  if (( $(_count_server_updates) > 0 )); then
+    printf "%s\n" "$(format_server_update_banner "$_rule_w")"
   else
     echo ""
   fi
@@ -4639,11 +4719,14 @@ _tui_prepare_compact_bar() {
 
 _tui_poll_live_stats_tick() {
   local lines_up="$1" term_lines="$2" compact_bar="$3" tmp_file="$4" buf="$5"
-  local prev_upd="$STRATA_UPDATE_AVAILABLE" new_lines stats_block
+  local prev_upd_cnt new_upd_cnt new_lines stats_block
+  prev_upd_cnt="$(_count_server_updates)"
   declare -F load_strata_update_state >/dev/null 2>&1 && load_strata_update_state
-  if [[ "$prev_upd" == false && "$STRATA_UPDATE_AVAILABLE" == true ]]; then
+  load_server_update_states
+  new_upd_cnt="$(_count_server_updates)"
+  if (( prev_upd_cnt == 0 && new_upd_cnt > 0 )); then
     local _b_up=$(( lines_up - LIVE_STATS_COUNT - UPDATE_BANNER_OFFSET ))
-    if ! _render_update_banner_inplace "$_b_up" "$term_lines" && [[ -z "$buf" ]]; then
+    if ! _render_server_update_banner_inplace "$_b_up" "$term_lines" && [[ -z "$buf" ]]; then
       return 1
     fi
   fi
@@ -4829,7 +4912,9 @@ run_step_view() {
       body+="$(echo -e "  ${C_GREEN}[a]${C_RESET} Apply this optimization")"$'\n'
     fi
 
-    [[ "$STRATA_UPDATE_AVAILABLE" == true ]] && body+="$(echo -e "  ${C_BGREEN}[u]${C_RESET} Install Strata update (${STRATA_UPDATE_SUMMARY})")"$'\n'
+    local _step_upd_names
+    _step_upd_names="$(_outdated_server_names)"
+    [[ -n "$_step_upd_names" ]] && body+="$(echo -e "  ${C_BGREEN}[u]${C_RESET} Install update(s) for: ${_step_upd_names}")"$'\n'
     body+="$(echo -e "  ${C_DIM}[n]${C_RESET} Next step (Skip)   ${C_DIM}[b]${C_RESET} Previous step   ${C_DIM}[i/Esc]${C_RESET} Back to Index   ${C_DIM}[q]${C_RESET} Quit")"$'\n\n'
 
     printf "%s" "$body"
@@ -4840,13 +4925,7 @@ run_step_view() {
     case "$action" in
       __refresh__) ;;
       __esc__|i|I) return 0 ;;
-      u|U)
-        if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
-          run_strata_option "update" true
-        else
-          echo -e "${C_YELLOW}No Strata update available.${C_RESET}"; sleep 1
-        fi
-        ;;
+      u|U) _run_all_server_updates ;;
       a|A)
         if [[ "$applied" == true ]]; then
           echo -e "${C_YELLOW}This optimization is already applied.${C_RESET}"; sleep 1
@@ -4934,7 +5013,8 @@ read_choice_with_live_stats() {
   _restore_index_tty() { _tui_restore_tty "$saved_tty"; }
   trap '_restore_index_tty; exit 0' INT TERM
 
-  local buf="" ch="" rc=0 init_upd="$STRATA_UPDATE_AVAILABLE"
+  local buf="" ch="" rc=0 init_upd_cnt
+  init_upd_cnt="$(_count_server_updates)"
   printf "Select action: "
   while true; do
     rc=0
@@ -5009,17 +5089,19 @@ read_choice_with_live_stats() {
       fi
     elif (( rc > 128 )); then
       declare -F load_strata_update_state >/dev/null 2>&1 && load_strata_update_state
-      if [[ "$init_upd" == false && "$STRATA_UPDATE_AVAILABLE" == true ]]; then
-        local _b_up=$(( toggle_up - UPDATE_BANNER_OFFSET ))
-        if _render_update_banner_inplace "$_b_up" "$term_lines"; then
-          init_upd=true
-        elif [[ -z "$buf" ]]; then
+      load_server_update_states
+      local cur_upd_cnt
+      cur_upd_cnt="$(_count_server_updates)"
+      if (( cur_upd_cnt != init_upd_cnt && cur_upd_cnt > 0 )); then
+        if [[ -z "$buf" ]]; then
           _restore_index_tty
           trap - INT TERM
           printf "\n"
           _out_var="__refresh__"
           return 0
         fi
+        local _b_up=$(( toggle_up - UPDATE_BANNER_OFFSET ))
+        _render_server_update_banner_inplace "$_b_up" "$term_lines" && init_upd_cnt="$cur_upd_cnt"
       fi
     else
       _restore_index_tty
@@ -5089,11 +5171,7 @@ show_stats_page() {
       __refresh__) ;;
       __esc__|""|b|B|i|I) return 0 ;;
       q|Q) exit 0 ;;
-      u|U)
-        if [[ "$STRATA_UPDATE_AVAILABLE" == true ]] && declare -F run_strata_option >/dev/null 2>&1; then
-          run_strata_option "update" true
-        fi
-        ;;
+      u|U) _run_all_server_updates ;;
       *) ;;
     esac
   done
@@ -5400,8 +5478,10 @@ show_index() {
     declare -F count_bench_history >/dev/null 2>&1 && hist_count="$(count_bench_history)"
     body+=$'\n'"$(echo -e "  ${C_BOLD}[w]${C_RESET} Start guided wizard from Step 1")"$'\n'
     body+="$(echo -e "  ${C_CYAN}[c]${C_RESET} Check / detection summary (read-only)")"$'\n'
-    if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
-      body+="$(echo -e "  ${C_BGREEN}[u]${C_RESET} Install Strata update (${STRATA_UPDATE_SUMMARY})")"$'\n'
+    local _idx_upd_names
+    _idx_upd_names="$(_outdated_server_names)"
+    if [[ -n "$_idx_upd_names" ]]; then
+      body+="$(echo -e "  ${C_BGREEN}[u]${C_RESET} Install update(s) for: ${_idx_upd_names}")"$'\n'
       ((footer_lines++))
     fi
     if (( hist_count > 0 )); then
@@ -5448,13 +5528,7 @@ show_index() {
         fi
         ;;
       c|C) show_check_page ;;
-      u|U)
-        if [[ "$STRATA_UPDATE_AVAILABLE" == true ]] && declare -F run_strata_option >/dev/null 2>&1; then
-          run_strata_option "update" true
-        else
-          echo -e "${C_YELLOW}No Strata update available.${C_RESET}"; sleep 1
-        fi
-        ;;
+      u|U) _run_all_server_updates ;;
       h|H)
         if declare -F show_benchmark_history >/dev/null 2>&1; then
           show_benchmark_history
@@ -5731,11 +5805,7 @@ show_check_page() {
       __refresh__) ;;
       __esc__|""|b|B|i|I) return 0 ;;
       q|Q) exit 0 ;;
-      u|U)
-        if [[ "$STRATA_UPDATE_AVAILABLE" == true ]] && declare -F run_strata_option >/dev/null 2>&1; then
-          run_strata_option "update" true
-        fi
-        ;;
+      u|U) _run_all_server_updates ;;
       *) ;;
     esac
   done
