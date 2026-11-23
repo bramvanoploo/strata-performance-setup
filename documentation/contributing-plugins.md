@@ -54,7 +54,7 @@ plugins/
 6. Implement optional hooks as needed:
    - `<id>_live_stats()` — Populate `LIVE_STAT_LINES` / `LIVE_COMPACT_STRATA` for `[STATS]`.
    - `<id>_check_summary()` — Print summary lines for `--check` / `[c]`.
-   - `<id>_hw_warnings()` — Print hardware compatibility warnings above the Index.
+   - `<id>_hw_warnings()` — Print hardware compatibility warnings on the Inference Servers page.
    - `<id>_cleanup()` — Stop background pollers on exit.
 
 ### Built-in LLM Host Plugins

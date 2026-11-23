@@ -1,16 +1,28 @@
-hosts	_common	_common		plugins/hosts/_common.sh	9dd8f50fd2423c655acfa468eff6b8c118bcaf3eefbb1555614b17e5324cb829	all
-hosts	llamacpp	llama.cpp	Install, update, manage service, and benchmark llama.cpp (llama-server)	plugins/hosts/llamacpp.sh	09eadbbad2c541df1b4fa63e54d65473a61c7a98c7da2b9de63af693037e2043	all
-hosts	localai	LocalAI	Install, update, manage service, and benchmark LocalAI server	plugins/hosts/localai.sh	df9f69eb026b21c4cec0eae0377c9cf01920b8577f16c515c3644a728f9c0fe9	all
-hosts	mlx-lm	MLX LM	Install, update, manage service, and benchmark MLX LM on Apple Silicon	plugins/hosts/mlx-lm.sh	fd3285b330f8cd24bb946c123e433b6dd00e3d5d7a6beb957e3559ee2ce039a2	macos-arm64
-hosts	ollama	Ollama	Install, update, manage service, and benchmark Ollama LLM server	plugins/hosts/ollama.sh	f1f16f7c886f7fdb78dbe515176e5762e45f86a66a85e8f84e85190c964aca8f	all
-hosts	sglang	SGLang	Install, update, manage service, and benchmark SGLang inference server	plugins/hosts/sglang.sh	5ec7799b10038bedc5404fc8ec5c0cd3d8415529314baf837c13ce247d25cb48	linux
-hosts	strata	Strata	Install, update, launch, and benchmark Strata LLM server	plugins/hosts/strata.sh	c9b1d72a7009c971d0fb4ed569051446a3662d1a9d7c0fc1ba4aba2a36aa1c39	all
-hosts	vllm	vLLM	Install, update, manage service, and benchmark vLLM inference server	plugins/hosts/vllm.sh	0459e6d4338b8c6b96454161aaea44878e2ee96ff10b4785ec9770c29c4bd5b6	linux
-tweaks	amd	amd	AMD GPU/APU, Instinct, Ryzen TDP, and X3D tweaks	plugins/tweaks/amd.sh	1d93cd63c84e454be783b11b8120f91172b344f05c8cefbd71b0a1c6b569944c	all
+hosts	adamant	Adamant	Install, update, manage service, and benchmark Adamant (NVIDIA Ada/Ampere Basalt/Strata fork)	plugins/hosts/adamant.sh	5e9d041a7e41834bd5ca1bc2ad51bbeceeb4fcda300e02c761824a52dcea1750	linux-nvidia
+hosts	basalt	Basalt	Install, update, manage service, and benchmark Basalt (NVIDIA Blackwell Strata fork)	plugins/hosts/basalt.sh	af35ed4a013f82c9d23cecfb1ade02a0daddab378b50abf4e3748a1728fb6f54	linux-nvidia
+hosts	_common	_common		plugins/hosts/_common.sh	bd56cb20641133f3b0f350566e5e8f9b39859558455d5aa16bcc2c95df187676	all
+hosts	exo	exo	Install, update, manage service, and benchmark exo distributed cluster server	plugins/hosts/exo.sh	26b96404b8fe5516e53cfbf1e49ecc0f0d97e5c78d0dff079b0d7cefc968ed05	all
+hosts	ik-llamacpp	ik_llama.cpp	Install, update, manage service, and benchmark ik_llama.cpp (CPU/hybrid MoE)	plugins/hosts/ik-llamacpp.sh	7832d09eec701376b5d676a39497469afdf466532af47a85a9096003bad20932	all
+hosts	ktransformers	KTransformers	Install, update, manage service, and benchmark KTransformers hybrid MoE server	plugins/hosts/ktransformers.sh	ed4a165f6437f451ae648d687cade24dc1497a2e7f717d78f12749e90b0d538e	linux
+hosts	lemonade	Lemonade	Install, update, manage service, and benchmark AMD Lemonade (Ryzen AI NPU/iGPU)	plugins/hosts/lemonade.sh	de4b4ce546db6aa8ffb1f0942eb9ded67dfcdbe9cb6e61062d3f0fc269fc0117	linux
+hosts	llamacpp	llama.cpp	Install, update, manage service, and benchmark llama.cpp (llama-server)	plugins/hosts/llamacpp.sh	3a0e85afdb811e7c3a7ac2589521473c49fc40efd3b717d89e56aacd852afb12	all
+hosts	localai	LocalAI	Install, update, manage service, and benchmark LocalAI server	plugins/hosts/localai.sh	5fb6d3f78fcf7fe6b1f6e9391afc83553891b6f1e63b487668c461d2ca5bfeef	all
+hosts	mlx-lm	MLX LM	Install, update, manage service, and benchmark MLX LM on Apple Silicon	plugins/hosts/mlx-lm.sh	d7ee774ab923a7d58c3f6088c503a43b9fec019785431fc94da5bce42841d9f8	macos-arm64
+hosts	ollama	Ollama	Install, update, manage service, and benchmark Ollama LLM server	plugins/hosts/ollama.sh	161dbfbe286904038bd1dfd9fa653c9c6c40e40de27e1f426acde93a663b16ef	all
+hosts	openvino	OpenVINO	Install, update, manage service, and benchmark OpenVINO Model Server (Intel NPU/GPU/CPU)	plugins/hosts/openvino.sh	a41f81b5bf7c9c32b84fefec4be19e9b8bcf8ffdb37c1ca4d8a12447f8404c7d	linux
+hosts	polystrata	PolyStrata	Install, update, manage service, and benchmark PolyStrata (Strata fork, multi-engine)	plugins/hosts/polystrata.sh	d62f40cacd5d1e48a7b9c1a2dbdd69b4f37835dc5dbea51f908f3026948234b3	all
+hosts	sglang	SGLang	Install, update, manage service, and benchmark SGLang inference server	plugins/hosts/sglang.sh	b27520700fccef87b4c38ac2a03aec2190d1bb84f61ee8cee50e1ed7a4eab86c	linux
+hosts	strata	Strata	Install, update, launch, and benchmark Strata LLM server	plugins/hosts/strata.sh	d05359de118c9392c135e0ae12f8b6cf26cab05b73cdd0c23547d44c69f6fcee	all
+hosts	tabbyapi	TabbyAPI	Install, update, manage service, and benchmark TabbyAPI (ExLlamaV2/V3)	plugins/hosts/tabbyapi.sh	83ec3b978823e58bca012cdb5a3ab7ddec9f921717395882d46d083c96809209	linux-gpu
+hosts	tensorrt-llm	TensorRT-LLM	Install, update, manage service, and benchmark NVIDIA TensorRT-LLM (trtllm-serve)	plugins/hosts/tensorrt-llm.sh	92f1d13120001eb1a63b797553b0273cdae78f738ed23108058a0a1ddf31e59d	linux-nvidia
+hosts	vllm	vLLM	Install, update, manage service, and benchmark vLLM inference server	plugins/hosts/vllm.sh	d1d15b3580e3e30364ed7cea875d06c5796ac9929af57821bd0b5fd31c61515d	linux
+tweaks	accelerators	accelerators	Non-GPU AI accelerators & edge NPU tweaks (Tenstorrent, Rockchip, Hailo, Ascend, Moore Threads)	plugins/tweaks/accelerators.sh	baa662666133264bb5c939c095b3cd0fb54944c2059b847a964b91e9fe626d6b	all
+tweaks	amd	amd	AMD GPU/APU, Instinct, Ryzen TDP, and X3D tweaks	plugins/tweaks/amd.sh	d30fdb812f864b8e09ad3f98f97c91f4de947663e092e0131c25a3ea2991dc20	all
 tweaks	common	common	Cross-platform host tweaks (Linux & macOS)	plugins/tweaks/common.sh	e43d914b60768f564a5d7be0b36f118f713220dd251c62061490b9e504e4cf47	all
-tweaks	intel	intel	Intel GPU, RAPL, thermald, and P-core pinning tweaks	plugins/tweaks/intel.sh	dae87d0c2abb10fd5b3e135ff6a4ad1fc23f23325daf03ca85e846adf939503e	all
+tweaks	intel	intel	Intel GPU, RAPL, thermald, and P-core pinning tweaks	plugins/tweaks/intel.sh	bba614bb92a1e43b521e8c57871bf49178f6f1b8e73b24afbf296fdc9dfc5228	all
 tweaks	jetson	jetson	NVIDIA Jetson nvpmodel and fan tweaks	plugins/tweaks/jetson.sh	346b950919f20ad07402a8e5291811713cac8b0b38ac7ea5418e0e2e3f984f2f	all
-tweaks	linux-core	linux-core	Core Linux kernel, memory, CPU, PCIe, and storage tweaks	plugins/tweaks/linux-core.sh	617487d8850c974e692f10ceaf95ec0a75095e3d07e51c23c02b124923a4f003	all
+tweaks	linux-core	linux-core	Core Linux kernel, memory, CPU, PCIe, and storage tweaks	plugins/tweaks/linux-core.sh	9cf2c17bfeda91934246aa2e0e79b7c8d6e77edc9d6091b6ae26dcc40b25c1e6	all
 tweaks	linux-laptop	linux-laptop	Linux laptop OEM thermal & fan profile tweaks	plugins/tweaks/linux-laptop.sh	da27e53be2a68595f6af05870b81d4d79e9e4b63f232a1e88f28b91af6557e4b	all
-tweaks	macos	macos	macOS Apple Silicon wired memory, power mode, Spotlight, and Metal tweaks	plugins/tweaks/macos.sh	b7302110be79924de85bcfc79a6d2e87274c52d0bc1cedd718eaea61ac247e81	all
-tweaks	nvidia	nvidia	NVIDIA GPU driver, power, clock, ECC, and datacenter tweaks	plugins/tweaks/nvidia.sh	531273a0909e2f9b805b3971ff259b76fcb7f47cc3b32c6893f9d90b23fef0c7	all
+tweaks	macos	macos	macOS Apple Silicon wired memory, power mode, Spotlight, and Metal tweaks	plugins/tweaks/macos.sh	6bf76e376ce91f090b86845f82719c96d10714b766dbfcbcb6dd709ae4e1101f	all
+tweaks	nvidia	nvidia	NVIDIA GPU driver, power, clock, ECC, and datacenter tweaks	plugins/tweaks/nvidia.sh	d9830b42674ebfee3b05ba199f3474fbdfe44e8a75692861b90f33b3ef2b645e	all
+tweaks	wsl2	wsl2	Windows Subsystem for Linux 2 (.wslconfig, /etc/wsl.conf, native ext4) tweaks	plugins/tweaks/wsl2.sh	267ca2979166ec224da642bdf43c2c316e7cd1ace96c0fd4d3ca45c3dbd6fa70	all

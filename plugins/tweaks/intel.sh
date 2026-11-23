@@ -7,6 +7,7 @@ register_tweak --id "intel_gpu_perf" --stars 4 --tier "recommended" --os "linux"
 register_tweak --id "intel_rapl" --stars 4 --tier "recommended" --os "linux" --laptop-recommended true --vm-supported false --experimental-non-arch false
 register_tweak --id "intel_thermald" --stars 2 --tier "recommended" --os "linux" --laptop-recommended true --vm-supported false --experimental-non-arch false
 register_tweak --id "intel_compute_stack" --stars 4 --tier "recommended" --os "linux" --laptop-recommended true --vm-supported true --experimental-non-arch false
+register_tweak --id "intel_npu_stack" --stars 3 --tier "recommended" --os "linux" --laptop-recommended true --vm-supported false --experimental-non-arch false
 register_tweak --id "intel_pcore_pinning" --stars 3 --tier "recommended" --os "linux" --laptop-recommended true --vm-supported false --experimental-non-arch false
 
 applicable_intel_gpu_perf() {
@@ -14,6 +15,7 @@ applicable_intel_gpu_perf() {
   compgen -G "/sys/class/drm/card*/gt_min_freq_mhz" >/dev/null 2>&1 || compgen -G "/sys/class/drm/card*/device/tile*/gt*/freq*/min_freq" >/dev/null 2>&1
 }
 title_intel_gpu_perf() { echo "Intel Arc / iGPU Maximum Base Frequency Lock (xe / i915 / SYCL)"; }
+intel_gpu_perf_managed() { service_installed strata-intel-gpu-perf.service; }
 status_intel_gpu_perf() { service_installed strata-intel-gpu-perf.service && unit_enabled strata-intel-gpu-perf.service; }
 explain_intel_gpu_perf() { echo -e "Impact:\n  Raises Intel GPU minimum frequency to RP0/max (supports xe and i915) for SYCL."; }
 apply_intel_gpu_perf() {
@@ -192,6 +194,55 @@ revert_intel_pcore_pinning() {
   run_root rm -f /etc/systemd/system/strata.service.d/10-pcore-affinity.conf
   run_root rmdir /etc/systemd/system/strata.service.d 2>/dev/null || true
   run_root systemctl daemon-reload
+}
+
+# 12r2. Intel Core Ultra NPU (intel_vpu) Stack & Device Access
+INTEL_NPU_UDEV="/etc/udev/rules.d/66-strata-intel-vpu.rules"
+
+applicable_intel_npu_stack() {
+  [[ "$HAS_INTEL_NPU" == true ]] || [[ -f "$INTEL_NPU_UDEV" ]] || [[ -d /sys/bus/pci/drivers/intel_vpu ]]
+}
+title_intel_npu_stack() { echo "Intel Core Ultra NPU Driver & /dev/accel Permissions (OpenVINO)"; }
+status_intel_npu_stack() {
+  [[ -f "$INTEL_NPU_UDEV" ]] && (lsmod 2>/dev/null | grep -qw intel_vpu || [[ -d /sys/bus/pci/drivers/intel_vpu ]])
+}
+explain_intel_npu_stack() {
+  cat <<'EOF'
+Impact:
+  Loads the intel_vpu kernel driver, installs Level Zero / Intel NPU user-
+  space driver packages when available, and grants 'render' group access to
+  /dev/accel/accel* for OpenVINO Model Server (OVMS) NPU inference.
+EOF
+}
+apply_intel_npu_stack() {
+  run_root modprobe intel_vpu 2>/dev/null || true
+  case "$DISTRO_FAMILY" in
+    arch)
+      pkg_available repo level-zero-loader 2>/dev/null && prompt_install_deps repo level-zero-loader || true
+      pkg_available aur intel-npu-driver 2>/dev/null && prompt_install_deps aur intel-npu-driver || true
+      ;;
+    fedora)
+      pkg_available repo oneapi-level-zero 2>/dev/null && prompt_install_deps repo oneapi-level-zero || true
+      ;;
+    debian)
+      pkg_available repo libze1 2>/dev/null && prompt_install_deps repo libze1 || true
+      ;;
+  esac
+  run_root tee "$INTEL_NPU_UDEV" >/dev/null <<'EOF'
+SUBSYSTEM=="accel", KERNEL=="accel*", GROUP="render", MODE="0660"
+EOF
+  run_root udevadm control --reload >/dev/null 2>&1 || true
+  run_root udevadm trigger --subsystem-match=accel >/dev/null 2>&1 || true
+  if [[ "${TARGET_USER:-root}" != "root" ]] && getent group render >/dev/null 2>&1; then
+    run_root usermod -aG render "$TARGET_USER" 2>/dev/null || true
+  fi
+  if [[ ! -d /sys/bus/pci/drivers/intel_vpu ]]; then
+    echo -e "${C_YELLOW}Note: intel_vpu kernel driver is not active; ensure Linux 6.8+ and linux-firmware are installed.${C_RESET}"
+  fi
+}
+revert_intel_npu_stack() {
+  run_root rm -f "$INTEL_NPU_UDEV"
+  run_root udevadm control --reload >/dev/null 2>&1 || true
 }
 
 # 12y. macOS Metal GPU Wired Memory Limit (iogpu.wired_limit_mb)

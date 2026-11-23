@@ -1,6 +1,6 @@
 {
   "name": "strata-performance-setup",
-  "version": "1.9.0",
+  "version": "1.9.6",
   "description": "Interactive TUI wizard to inspect, apply, and revert host-level Linux and macOS (Apple Silicon) performance optimizations for running Strata LLM inference.",
   "author": "Bram van Oploo",
   "email": "bramvano@gmail.com",

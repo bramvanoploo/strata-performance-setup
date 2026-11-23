@@ -4,6 +4,10 @@
 # PLUGIN_DESC: AMD GPU/APU, Instinct, Ryzen TDP, and X3D tweaks
 
 register_tweak --id "amd_gpu_perf" --stars 4 --tier "recommended" --os "linux" --laptop-recommended false --vm-supported true --experimental-non-arch false
+register_tweak --id "amd_compute_profile" --stars 3 --tier "opt_in" --os "linux" --laptop-recommended false --vm-supported true --experimental-non-arch false
+register_tweak --id "amd_vulkan_radv" --stars 4 --tier "recommended" --os "linux" --laptop-recommended true --vm-supported true --experimental-non-arch false
+register_tweak --id "amd_xdna_npu" --stars 3 --tier "recommended" --os "linux" --laptop-recommended true --vm-supported false --experimental-non-arch false
+register_tweak --id "amd_runpm_disable" --stars 2 --tier "high_idle" --os "linux" --laptop-recommended false --vm-supported true --experimental-non-arch false
 register_tweak --id "amd_apu_memory" --stars 5 --tier "recommended" --os "linux" --laptop-recommended true --vm-supported true --experimental-non-arch false
 register_tweak --id "amd_cwsr_disable" --stars 4 --tier "recommended" --os "linux" --laptop-recommended true --vm-supported true --experimental-non-arch false
 register_tweak --id "ryzenadj_tdp" --stars 4 --tier "recommended" --os "linux" --laptop-recommended true --vm-supported false --experimental-non-arch false
@@ -17,6 +21,7 @@ applicable_amd_gpu_perf() {
   [[ "$HAS_AMD_INSTINCT" == true ]] && { command -v amd-smi >/dev/null 2>&1 || command -v rocm-smi >/dev/null 2>&1; }
 }
 title_amd_gpu_perf() { echo "AMD Radeon / Instinct High Performance DPM Level (amdgpu)"; }
+amd_gpu_perf_managed() { service_installed strata-amd-gpu-perf.service; }
 status_amd_gpu_perf() {
   local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}" f
   for f in "${drm_dir}"/card*/device/power_dpm_force_performance_level; do
@@ -27,6 +32,7 @@ status_amd_gpu_perf() {
 }
 explain_amd_gpu_perf() { echo -e "Impact:\n  Sets amdgpu power_dpm_force_performance_level='high' (with amd-smi / rocm-smi\n  fallback on Instinct GPUs) via persistent service for ROCm/HIP."; }
 apply_amd_gpu_perf() {
+  service_installed strata-amd-compute-profile.service && remove_service strata-amd-compute-profile.service
   install_service strata-amd-gpu-perf.service <<'EOF'
 [Unit]
 Description=Set AMD GPU DPM Performance Level to High for Strata
@@ -290,6 +296,180 @@ EOF
 revert_amd_x3d_mode() {
   remove_service strata-amd-x3d.service
   run_root sh -c 'for f in /sys/bus/platform/drivers/amd_x3d_vcache/*/amd_x3d_mode; do [ -w "$f" ] && echo frequency > "$f"; done; true' 2>/dev/null || true
+}
+
+# 12w2. AMD Compute Power Profile Mode (pp_power_profile_mode = COMPUTE)
+applicable_amd_compute_profile() {
+  [[ "$HAS_AMD" == true ]] || return 1
+  service_installed strata-amd-compute-profile.service && return 0
+  local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}" f
+  for f in "${drm_dir}"/card*/device/pp_power_profile_mode; do
+    [[ -r "$f" ]] && grep -qi "COMPUTE" "$f" 2>/dev/null && return 0
+  done
+  return 1
+}
+title_amd_compute_profile() { echo "AMD GPU COMPUTE Power Profile Mode (pp_power_profile_mode)"; }
+note_amd_compute_profile() { echo -e "${C_BLUE}[OPT]${C_RESET}"; }
+status_amd_compute_profile() {
+  local drm_dir="${STRATA_DRM_DIR:-/sys/class/drm}" f
+  for f in "${drm_dir}"/card*/device/pp_power_profile_mode; do
+    [[ -r "$f" ]] && grep -qiE 'COMPUTE\*' "$f" 2>/dev/null && return 0
+  done
+  service_installed strata-amd-compute-profile.service && unit_enabled strata-amd-compute-profile.service
+}
+explain_amd_compute_profile() {
+  cat <<'EOF'
+Impact:
+  Switches amdgpu power_dpm_force_performance_level='manual' and selects the
+  COMPUTE workload profile in pp_power_profile_mode via a persistent service.
+  Tunes DPM clock ramp-up heuristics for sustained compute/ML inference
+  instead of desktop/3D power-saving heuristics.
+EOF
+}
+apply_amd_compute_profile() {
+  service_installed strata-amd-gpu-perf.service && remove_service strata-amd-gpu-perf.service
+  install_service strata-amd-compute-profile.service <<'EOF'
+[Unit]
+Description=Set AMD GPU pp_power_profile_mode to COMPUTE for Strata
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'for d in /sys/class/drm/card*/device; do [ -r "$d/pp_power_profile_mode" ] || continue; idx=$(awk "/COMPUTE/ {gsub(/[^0-9]/,\"\",\$1); if (\$1 ~ /^[0-9]+$/) {print \$1; exit}}" "$d/pp_power_profile_mode"); [ -n "$idx" ] || continue; [ -w "$d/power_dpm_force_performance_level" ] && echo manual > "$d/power_dpm_force_performance_level" 2>/dev/null || true; [ -w "$d/pp_power_profile_mode" ] && echo "$idx" > "$d/pp_power_profile_mode" 2>/dev/null || true; done; true'
+ExecStop=/bin/sh -c 'for d in /sys/class/drm/card*/device; do [ -w "$d/pp_power_profile_mode" ] && echo 0 > "$d/pp_power_profile_mode" 2>/dev/null || true; [ -w "$d/power_dpm_force_performance_level" ] && echo auto > "$d/power_dpm_force_performance_level" 2>/dev/null || true; done; true'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+revert_amd_compute_profile() {
+  remove_service strata-amd-compute-profile.service
+  run_root sh -c 'for d in /sys/class/drm/card*/device; do [ -w "$d/pp_power_profile_mode" ] && echo 0 > "$d/pp_power_profile_mode" 2>/dev/null || true; [ -w "$d/power_dpm_force_performance_level" ] && echo auto > "$d/power_dpm_force_performance_level" 2>/dev/null || true; done; true' 2>/dev/null || true
+}
+
+# 12w3. AMD Runtime Power Management Disable (amdgpu.runpm=0)
+applicable_amd_runpm_disable() {
+  [[ "$HAS_AMD" == true ]] || return 1
+  has_kernel_param "amdgpu.runpm=0" && return 0
+  [[ "$HAS_AMD_NON_INSTINCT" == true ]] || (( ${DISCRETE_GPU_COUNT:-0} >= 1 ))
+}
+title_amd_runpm_disable() { echo "Disable AMD GPU Runtime D3 Power-Down (amdgpu.runpm=0)"; }
+note_amd_runpm_disable() { echo -e "${C_YELLOW}[!]${C_RESET}"; }
+status_amd_runpm_disable() { has_kernel_param "amdgpu.runpm=0"; }
+explain_amd_runpm_disable() {
+  cat <<'EOF'
+Impact:
+  Adds 'amdgpu.runpm=0' to the kernel command line, preventing discrete AMD GPUs
+  from entering D3cold runtime sleep between inference requests. Eliminates
+  1-3s wake stalls and D3 wake hangs on ROCm/Vulkan cold starts. Requires a reboot.
+EOF
+  echo -e "\n${C_YELLOW}[WARNING] Keeps discrete AMD GPUs awake at idle (+5-15W idle power draw)${C_RESET}"
+  echo -e "${C_YELLOW}          with no steady-state tok/s gain once the GPU is active.${C_RESET}"
+}
+apply_amd_runpm_disable() { add_kernel_param "amdgpu.runpm=0"; }
+revert_amd_runpm_disable() { remove_kernel_param "amdgpu.runpm=0"; }
+
+# 12w4. AMD Mesa RADV Vulkan Stack & ICD Preference
+AMD_RADV_MARKER="/etc/strata-amd-radv.enabled"
+
+_amd_radv_pkgs() {
+  case "$DISTRO_FAMILY" in
+    arch)   echo "vulkan-radeon vulkan-icd-loader" ;;
+    fedora) echo "mesa-vulkan-drivers vulkan-loader" ;;
+    debian) echo "mesa-vulkan-drivers libvulkan1" ;;
+    suse)   echo "libvulkan_radeon libvulkan1" ;;
+    *)      echo "" ;;
+  esac
+}
+applicable_amd_vulkan_radv() {
+  [[ -f "$AMD_RADV_MARKER" ]] && return 0
+  [[ "$HAS_AMD" == true ]] || return 1
+  local pkgs p
+  pkgs="$(_amd_radv_pkgs)"
+  [[ -n "$pkgs" ]] || return 1
+  for p in $pkgs; do pkg_available repo "$p" || return 1; done
+}
+title_amd_vulkan_radv() { echo "AMD Mesa RADV Vulkan Compute Stack & ICD Preference (llama.cpp Vulkan)"; }
+status_amd_vulkan_radv() {
+  [[ -f "$AMD_RADV_MARKER" ]] || return 1
+  local p
+  for p in $(_amd_radv_pkgs); do pkg_installed "$p" || return 1; done
+}
+explain_amd_vulkan_radv() {
+  cat <<'EOF'
+Impact:
+  Installs Mesa RADV Vulkan compute drivers and pins VK_DRIVER_FILES /
+  VK_ICD_FILENAMES to radeon_icd in /etc/profile.d/strata-radv.sh so AMDVLK
+  (if present) does not hijack Vulkan. On RDNA3/3.5 APUs (Strix Halo, Phoenix)
+  and Radeon GPUs, llama.cpp Vulkan often beats ROCm in token decode speed.
+EOF
+}
+apply_amd_vulkan_radv() {
+  local pkgs
+  pkgs="$(_amd_radv_pkgs)"
+  [[ -n "$pkgs" ]] && { prompt_install_deps repo $pkgs || return 1; }
+  local icd_list="" icd
+  for icd in /usr/share/vulkan/icd.d/radeon_icd*.json; do
+    [[ -f "$icd" ]] || continue
+    icd_list+="${icd_list:+:}${icd}"
+  done
+  if [[ -n "$icd_list" ]]; then
+    run_root tee /etc/profile.d/strata-radv.sh >/dev/null <<EOF
+export VK_ICD_FILENAMES="${icd_list}"
+export VK_DRIVER_FILES="${icd_list}"
+EOF
+    run_root chmod 0644 /etc/profile.d/strata-radv.sh 2>/dev/null || true
+  fi
+  echo "1" | run_root tee "$AMD_RADV_MARKER" >/dev/null
+  echo -e "${C_GREEN}Configured Mesa RADV Vulkan stack.${C_RESET}"
+}
+revert_amd_vulkan_radv() {
+  run_root rm -f "$AMD_RADV_MARKER" /etc/profile.d/strata-radv.sh
+  echo -e "${C_GREEN}Removed Strata RADV Vulkan ICD override (shared Mesa packages retained).${C_RESET}"
+}
+
+# 12w5. AMD Ryzen AI XDNA NPU Runtime & Device Access
+AMD_XDNA_UDEV="/etc/udev/rules.d/66-strata-amdxdna.rules"
+
+applicable_amd_xdna_npu() {
+  [[ "$HAS_AMD_NPU" == true ]] || [[ -f "$AMD_XDNA_UDEV" ]] || [[ -d /sys/bus/pci/drivers/amdxdna ]]
+}
+title_amd_xdna_npu() { echo "AMD Ryzen AI XDNA NPU Driver & /dev/accel Permissions (Lemonade)"; }
+status_amd_xdna_npu() {
+  [[ -f "$AMD_XDNA_UDEV" ]] && (lsmod 2>/dev/null | grep -qw amdxdna || [[ -d /sys/bus/pci/drivers/amdxdna ]])
+}
+explain_amd_xdna_npu() {
+  cat <<'EOF'
+Impact:
+  Loads the amdxdna kernel driver, installs XDNA NPU firmware/XRT packages
+  when packaged by your distro, and adds udev rules granting 'render' group
+  access to /dev/accel/accel* for Ryzen AI NPU inference (Lemonade / FastFlowLM).
+EOF
+}
+apply_amd_xdna_npu() {
+  run_root modprobe amdxdna 2>/dev/null || true
+  if [[ "$DISTRO_FAMILY" == "arch" ]]; then
+    pkg_available repo linux-firmware-amdgpu 2>/dev/null && prompt_install_deps repo linux-firmware-amdgpu || true
+    pkg_available aur xrt 2>/dev/null && prompt_install_deps aur xrt || true
+  elif pkg_available repo linux-firmware 2>/dev/null; then
+    pkg_install linux-firmware || true
+  fi
+  run_root tee "$AMD_XDNA_UDEV" >/dev/null <<'EOF'
+SUBSYSTEM=="accel", KERNEL=="accel*", GROUP="render", MODE="0660"
+EOF
+  run_root udevadm control --reload >/dev/null 2>&1 || true
+  run_root udevadm trigger --subsystem-match=accel >/dev/null 2>&1 || true
+  if [[ "${TARGET_USER:-root}" != "root" ]] && getent group render >/dev/null 2>&1; then
+    run_root usermod -aG render "$TARGET_USER" 2>/dev/null || true
+  fi
+  if [[ ! -d /sys/bus/pci/drivers/amdxdna ]]; then
+    echo -e "${C_YELLOW}Note: amdxdna kernel module is not active (requires Linux 6.14+ or AMD xdna-driver).${C_RESET}"
+  fi
+}
+revert_amd_xdna_npu() {
+  run_root rm -f "$AMD_XDNA_UDEV"
+  run_root udevadm control --reload >/dev/null 2>&1 || true
 }
 
 # 12x. Intel Hybrid P-Core Pinning

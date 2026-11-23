@@ -11,7 +11,8 @@ register_host_plugin \
   --id "ollama" \
   --name "Ollama" \
   --description "Install, update, manage service, and benchmark Ollama LLM server" \
-  --platforms "all"
+  --platforms "all" \
+  --url "https://ollama.com"
 
 OLLAMA_BIN=""
 OLLAMA_VERSION=""
@@ -31,10 +32,13 @@ _ollama_refresh() {
     OLLAMA_DOCKER="$(_host_find_docker '(^|[/_-])ollama(:|@|$)' || true)"
   fi
   OLLAMA_SOURCE="$(_host_detect_install_source "ollama" "$OLLAMA_BIN" "ollama" true)"
+  local _ol_def="${OLLAMA_HOST:-http://127.0.0.1:11434}"
+  [[ "$_ol_def" != http* ]] && _ol_def="http://${_ol_def}"
+  OLLAMA_URL="$(_host_detect_url "$_ol_def" '(^|/)ollama([[:space:]]+serve|$)' "$OLLAMA_DOCKER" "ollama.service")"
 }
 
 _ollama_running() {
-  _host_http_ok "${OLLAMA_URL}/api/tags" 1
+  _host_endpoint_running "${OLLAMA_URL}/api/tags" '(^|/)ollama([[:space:]]+serve|$)' "$OLLAMA_DOCKER" "ollama.service"
 }
 
 _ollama_loaded_models() {
@@ -143,6 +147,11 @@ _ollama_dispatch() {
     bench)
       _host_openai_bench "Ollama" "$OLLAMA_URL"
       ;;
+    uninstall)
+      _host_standard_uninstall "ollama" "Ollama" "ollama.service" "$OLLAMA_BIN" "$OLLAMA_SOURCE" "ollama"
+      _ollama_refresh
+      _host_clear_update_cache "ollama"
+      ;;
   esac
 }
 
@@ -156,6 +165,7 @@ ollama_open() {
     --docker-var "OLLAMA_DOCKER" \
     --source-var "OLLAMA_SOURCE" \
     --url "$OLLAMA_URL" \
+    --url-var "OLLAMA_URL" \
     --is-running "_ollama_running" \
     --dispatch "_ollama_dispatch"
 }

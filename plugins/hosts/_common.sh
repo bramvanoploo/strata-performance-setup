@@ -41,11 +41,14 @@ _host_find_docker() {
 }
 
 _host_http_get() {
-  local url="$1" timeout="${2:-2}"
+  local url="$1" timeout="${2:-2}" h
+  shift 2
+  local -a hdr=()
+  for h in "$@"; do hdr+=(--header="$h"); done
   if command -v curl >/dev/null 2>&1; then
-    curl -fsS --max-time "$timeout" "$url" 2>/dev/null || return 1
+    curl -fsS --max-time "$timeout" ${hdr[@]+"${hdr[@]}"} "$url" 2>/dev/null || return 1
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO- --timeout="$timeout" "$url" 2>/dev/null || return 1
+    wget -qO- --timeout="$timeout" ${hdr[@]+"${hdr[@]}"} "$url" 2>/dev/null || return 1
   else
     return 1
   fi
@@ -55,12 +58,95 @@ _host_http_ok() {
   _host_http_get "$1" "${2:-2}" >/dev/null 2>&1
 }
 
+_host_proc_running() {
+  local pat="$1"
+  [[ -n "$pat" ]] || return 1
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -f "$pat" >/dev/null 2>&1
+  else
+    ps -eo args= 2>/dev/null | grep -E "$pat" | grep -qv grep
+  fi
+}
+
+_host_extract_port_from_text() {
+  local txt="${1:-}" port=""
+  [[ -n "$txt" ]] || return 1
+  port="$(sed -nE 's/.*(--port|--rest_port|--chatgpt-api-port|-p)[=[:space:]]+([0-9]{2,5})([[:space:]]|$).*/\2/p' <<<"$txt" | head -n1)"
+  if [[ -z "$port" ]]; then
+    port="$(sed -nE 's/.*(--address|OLLAMA_HOST)[=[:space:]]+[^[:space:]:]+:([0-9]{2,5})([[:space:]"'\'']|$).*/\2/p' <<<"$txt" | head -n1)"
+  fi
+  [[ "$port" =~ ^[0-9]+$ ]] && (( port > 0 && port <= 65535 )) || return 1
+  echo "$port"
+}
+
+_host_detect_url() {
+  local default_url="$1" proc_pat="$2" docker_val="${3:-}" unit="${4:-}"
+  local port="" pids="" p=""
+
+  if [[ -n "$docker_val" ]]; then
+    local cname="${docker_val%%|*}" cli="docker"
+    command -v docker >/dev/null 2>&1 || cli="podman"
+    if command -v "$cli" >/dev/null 2>&1; then
+      port="$("$cli" port "$cname" 2>/dev/null | sed -nE 's/.*:([0-9]+)$/\1/p' | head -n1 || true)"
+    fi
+  fi
+
+  if [[ -z "$port" && -n "$proc_pat" ]]; then
+    if command -v pgrep >/dev/null 2>&1; then
+      pids="$(pgrep -f "$proc_pat" 2>/dev/null | tr '\n' ',' | sed 's/,$//' || true)"
+    fi
+    if [[ -n "$pids" ]]; then
+      if command -v ss >/dev/null 2>&1; then
+        local ss_out=""
+        ss_out="$(ss -tlpn 2>/dev/null || true)"
+        for p in ${pids//,/ }; do
+          port="$(awk -v pid="pid=${p}," '$0 ~ pid {split($4,a,":"); pt=a[length(a)]; if (pt ~ /^[0-9]+$/) {print pt; exit}}' <<<"$ss_out" || true)"
+          [[ -n "$port" ]] && break
+        done
+      elif command -v lsof >/dev/null 2>&1; then
+        port="$(lsof -nP -a -iTCP -sTCP:LISTEN -p "$pids" 2>/dev/null | awk 'NR>1 {split($9,a,":"); pt=a[length(a)]; if (pt ~ /^[0-9]+$/) {print pt; exit}}' || true)"
+      fi
+    fi
+    if [[ -z "$port" ]]; then
+      local args_out=""
+      args_out="$(ps -eo args= 2>/dev/null | grep -E "$proc_pat" | grep -v grep | head -n1 || true)"
+      port="$(_host_extract_port_from_text "$args_out" || true)"
+    fi
+  fi
+
+  if [[ -z "$port" && -n "$unit" ]] && [[ "$HAS_SYSTEMD" == true ]] && service_installed "$unit" 2>/dev/null; then
+    local unit_txt=""
+    unit_txt="$(systemctl cat "$unit" 2>/dev/null || true)"
+    port="$(_host_extract_port_from_text "$unit_txt" || true)"
+  fi
+
+  if [[ "$port" =~ ^[0-9]+$ ]] && (( port > 0 && port <= 65535 )); then
+    echo "http://127.0.0.1:${port}"
+  else
+    echo "$default_url"
+  fi
+}
+
+_host_endpoint_running() {
+  local probe_url="$1" proc_pat="$2" docker_val="${3:-}" unit="${4:-}"
+  if [[ -z "$docker_val" ]] && { [[ -z "$unit" ]] || ! unit_active "$unit" 2>/dev/null; }; then
+    _host_proc_running "$proc_pat" || return 1
+  fi
+  _host_http_ok "$probe_url" 1
+}
+
 _host_openai_models() {
-  local base_url="${1%/}" body=""
+  local base_url="${1%/}" body="" out=""
+  # shortcut: model list cached 5s (positives only) so live-stats redraws don't re-GET the same endpoint
+  local cts="${_HOST_MODELS_TS[$base_url]:-}"
+  if [[ -n "$cts" ]]; then
+    printf '%s\n' "${_HOST_MODELS_CACHE[$base_url]}"
+    return 0
+  fi
   body="$(_host_http_get "${base_url}/v1/models" 2 || true)"
-  [[ -n "$body" ]] || return 1
-  if has_working_python3; then
-    python3 -c '
+  if [[ -n "$body" ]]; then
+    if has_working_python3; then
+      out="$(python3 -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -68,10 +154,137 @@ try:
     print(",".join(ids))
 except Exception:
     pass
-' <<< "$body" 2>/dev/null || true
-  else
-    grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]+"' <<< "$body" | sed -E 's/.*"([^"]+)"$/\1/' | paste -sd',' - || true
+' <<< "$body" 2>/dev/null || true)"
+    else
+      out="$(grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]+"' <<< "$body" | sed -E 's/.*"([^"]+)"$/\1/' | paste -sd',' - || true)"
+    fi
   fi
+  [[ -n "$out" ]] || return 1
+  _HOST_MODELS_CACHE[$base_url]="$out"
+  _HOST_MODELS_TS[$base_url]="$SECONDS"
+  printf '%s\n' "$out"
+}
+_host_has_served_model() {
+  local base_url="${1%/}" models=""
+  models="$(_host_openai_models "$base_url" || true)"
+  [[ -n "$models" ]]
+}
+
+_host_owning_pkg() {
+  local bin_path="${1:-}" owner="" real_p=""
+  [[ -n "$bin_path" ]] || return 1
+  if [[ "$IS_MACOS" == true ]] && command -v brew >/dev/null 2>&1; then
+    real_p="$(readlink -f "$bin_path" 2>/dev/null || echo "$bin_path")"
+    if [[ "$real_p" =~ /Cellar/([^/]+)/ ]]; then
+      echo "${BASH_REMATCH[1]}"
+      return 0
+    fi
+  elif [[ "$DISTRO_FAMILY" == "arch" ]] && command -v pacman >/dev/null 2>&1; then
+    owner="$(pacman -Qoq "$bin_path" 2>/dev/null | head -n1 || true)"
+  elif [[ "$DISTRO_FAMILY" == "debian" ]] && command -v dpkg-query >/dev/null 2>&1; then
+    owner="$(dpkg-query -S "$bin_path" 2>/dev/null | head -n1 | cut -d: -f1 || true)"
+  elif [[ "$DISTRO_FAMILY" == "fedora" || "$DISTRO_FAMILY" == "suse" ]] && command -v rpm >/dev/null 2>&1; then
+    owner="$(rpm -qf --qf '%{NAME}\n' "$bin_path" 2>/dev/null | head -n1 || true)"
+    [[ "$owner" == *"is not owned"* ]] && owner=""
+  fi
+  [[ -n "$owner" ]] || return 1
+  echo "$owner"
+}
+
+_host_pkg_uninstall() {
+  local pkg="$1" rc=0
+  case "$DISTRO_FAMILY" in
+    arch)   run_root pacman -R --noconfirm "$pkg" || rc=$? ;;
+    fedora)
+      if [[ "$IS_OSTREE" == true ]] && command -v rpm-ostree >/dev/null 2>&1; then
+        run_root rpm-ostree uninstall -y "$pkg" || rc=$?
+      else
+        run_root dnf remove -y "$pkg" || rc=$?
+      fi
+      ;;
+    debian) run_root env DEBIAN_FRONTEND=noninteractive apt-get remove -y "$pkg" || rc=$? ;;
+    suse)   run_root zypper --non-interactive remove "$pkg" || rc=$? ;;
+    macos)  command -v brew >/dev/null 2>&1 && run_as_user_exec brew uninstall "$pkg" || rc=$? ;;
+    *)      return 1 ;;
+  esac
+  PKG_INST_CACHE=()
+  refresh_unit_files_cache
+  return "$rc"
+}
+
+_host_standard_uninstall() {
+  local id="$1" name="$2" unit="$3" bin_path="$4" src="$5" pkg_name="$6"
+  shift 6
+  local -a extra_paths=("$@")
+  local vdir host_dir owner_pkg="" has_svc=false
+  vdir="$(_host_venv_dir "$id")"
+  host_dir="${TARGET_HOME:-$HOME}/.local/share/strata-hosts/${id}"
+  service_installed "$unit" 2>/dev/null && has_svc=true
+
+  if [[ "$src" == "manual" && -n "$bin_path" ]]; then
+    owner_pkg="$(_host_owning_pkg "$bin_path" || true)"
+  fi
+
+  echo -e "${C_YELLOW}WARNING: This will uninstall ${name} from this system.${C_RESET}"
+  [[ "$has_svc" == true ]] && echo "  - System service to stop & remove: ${unit}"
+  case "$src" in
+    venv)
+      echo "  - Managed Python environment: ${vdir}"
+      [[ -d "$host_dir" ]] && echo "  - Managed host directory: ${host_dir}"
+      ;;
+    brew|distro|aur)
+      echo "  - Package (${src}): ${pkg_name}"
+      ;;
+    installer|manual)
+      if [[ -n "$owner_pkg" ]]; then
+        echo "  - Owning system package: ${owner_pkg}"
+      elif [[ -n "$bin_path" ]]; then
+        echo "  - Binary: ${bin_path}"
+      fi
+      [[ -d "$host_dir" ]] && echo "  - Managed host directory: ${host_dir}"
+      ;;
+  esac
+  local ep
+  for ep in "${extra_paths[@]}"; do
+    [[ -e "$ep" || -L "$ep" ]] && echo "  - Extra path: ${ep}"
+  done
+  echo ""
+  confirm_yn "Proceed with uninstalling ${name}? [y/N]: " "N" || { echo "Cancelled."; return 0; }
+
+  if [[ "$has_svc" == true ]]; then
+    service_ctl stop "$unit" >/dev/null 2>&1 || true
+    remove_service "$unit" || true
+  fi
+
+  case "$src" in
+    venv)
+      rm -rf "$vdir" "$host_dir" 2>/dev/null || run_root rm -rf "$vdir" "$host_dir"
+      ;;
+    brew|distro|aur)
+      _host_pkg_uninstall "$pkg_name" || return 1
+      ;;
+    installer|manual)
+      if [[ -n "$owner_pkg" ]]; then
+        _host_pkg_uninstall "$owner_pkg" || return 1
+      elif [[ -n "$bin_path" && ( -e "$bin_path" || -L "$bin_path" ) ]]; then
+        if [[ -w "$(dirname "$bin_path")" ]]; then
+          rm -f "$bin_path"
+        else
+          run_root rm -f "$bin_path"
+        fi
+      fi
+      [[ -d "$host_dir" ]] && { rm -rf "$host_dir" 2>/dev/null || run_root rm -rf "$host_dir"; }
+      ;;
+  esac
+  for ep in "${extra_paths[@]}"; do
+    [[ -e "$ep" || -L "$ep" ]] || continue
+    if [[ -w "$(dirname "$ep")" ]]; then
+      rm -rf "$ep"
+    else
+      run_root rm -rf "$ep"
+    fi
+  done
+  echo -e "${C_GREEN}${name} uninstalled.${C_RESET}"
 }
 
 _host_github_latest_tag() {
@@ -98,7 +311,8 @@ _host_ver_older() {
   if printf '1\n2\n' | sort -V >/dev/null 2>&1; then
     [[ "$(printf '%s\n%s\n' "$inst" "$lat" | sort -V | head -n1)" == "$inst" ]]
   else
-    return 0
+    # shortcut: no sort -V available → assume current rather than nag an update banner forever
+    return 1
   fi
 }
 
@@ -569,6 +783,10 @@ _host_option_row() {
       badge="${C_CYAN}[CHECK]        ${C_RESET}"
       title="Check latest upstream release"
       ;;
+    uninstall)
+      badge="${C_RED}[UNINSTALL]    ${C_RESET}"
+      title="Uninstall ${name}"
+      ;;
   esac
   if [[ "$selected" == true ]]; then
     ptr="${C_CYAN}>${C_RESET}"
@@ -581,22 +799,24 @@ _host_option_row() {
 }
 
 _host_build_options_list() {
-  local installed="$1" has_docker="${2:-false}" src="${3:-}"
+  local installed="$1" has_docker="${2:-false}" src="${3:-}" can_bench="${4:-false}"
+  local -a opts=()
   if [[ "$installed" == true ]]; then
-    if [[ "$src" == "manual" ]]; then
-      echo "service bench latest"
-    else
-      echo "update service bench latest"
-    fi
+    [[ "$src" != "manual" ]] && opts+=("update")
+    opts+=("service")
+    [[ "$can_bench" == true ]] && opts+=("bench")
+    opts+=("latest" "uninstall")
   elif [[ "$has_docker" == true ]]; then
-    echo "bench latest"
+    [[ "$can_bench" == true ]] && opts+=("bench")
+    opts+=("latest")
   else
-    echo "install"
+    opts+=("install")
   fi
+  echo "${opts[*]}"
 }
 
 _host_run_options_page() {
-  local name="" unit="" refresh_fn="" bin_var="" ver_var="" docker_var="" source_var="" url="" is_running_fn="" dispatch_fn=""
+  local name="" unit="" refresh_fn="" bin_var="" ver_var="" docker_var="" source_var="" url="" url_var="" is_running_fn="" dispatch_fn=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --name) name="$2"; shift 2 ;;
@@ -607,27 +827,36 @@ _host_run_options_page() {
       --docker-var) docker_var="$2"; shift 2 ;;
       --source-var) source_var="$2"; shift 2 ;;
       --url) url="$2"; shift 2 ;;
+      --url-var) url_var="$2"; shift 2 ;;
       --is-running) is_running_fn="$2"; shift 2 ;;
       --dispatch) dispatch_fn="$2"; shift 2 ;;
       *) shift ;;
     esac
   done
 
-  local sel=0
+  local sel=0 last_probe=-99
+  local bin_val="" ver_val="" docker_val="" src_val="" cur_url="$url"
+  local installed=false has_docker=false running=false can_bench=false
   while true; do
-    [[ -n "$refresh_fn" ]] && "$refresh_fn"
-    local bin_val="${!bin_var:-}" ver_val="${!ver_var:-}" docker_val="" src_val=""
-    [[ -n "$docker_var" ]] && docker_val="${!docker_var:-}"
-    [[ -n "$source_var" ]] && src_val="${!source_var:-}"
-    local installed=false has_docker=false running=false
-    [[ -n "$bin_val" ]] && installed=true
-    [[ -n "$docker_val" ]] && has_docker=true
-    if [[ -n "$is_running_fn" ]] && "$is_running_fn"; then
-      running=true
+    # shortcut: probes cached 3s to keep the menu responsive; forced fresh after every action below.
+    if (( SECONDS - last_probe >= 3 )); then
+      last_probe=$SECONDS
+      [[ -n "$refresh_fn" ]] && "$refresh_fn"
+      bin_val="${!bin_var:-}"; ver_val="${!ver_var:-}"; docker_val=""; src_val=""; cur_url="$url"
+      [[ -n "$docker_var" ]] && docker_val="${!docker_var:-}"
+      [[ -n "$source_var" ]] && src_val="${!source_var:-}"
+      [[ -n "$url_var" && -n "${!url_var:-}" ]] && cur_url="${!url_var}"
+      installed=false; has_docker=false; running=false; can_bench=false
+      [[ -n "$bin_val" ]] && installed=true
+      [[ -n "$docker_val" ]] && has_docker=true
+      if [[ -n "$is_running_fn" ]] && "$is_running_fn"; then
+        running=true
+        _host_has_served_model "$cur_url" && can_bench=true
+      fi
     fi
 
     local -a opts=()
-    read -ra opts <<< "$(_host_build_options_list "$installed" "$has_docker" "$src_val")"
+    read -ra opts <<< "$(_host_build_options_list "$installed" "$has_docker" "$src_val" "$can_bench")"
     local total=${#opts[@]}
     (( sel >= total )) && sel=$(( total - 1 ))
     (( sel < 0 )) && sel=0
@@ -641,7 +870,7 @@ _host_run_options_page() {
       echo -e "  Binary:   ${bin_val:-not installed}${src_val:+ (${src_val})}"
       echo -e "  Version:  ${ver_val:-n/a}"
     fi
-    echo -e "  Endpoint: ${url}"
+    echo -e "  Endpoint: ${cur_url}"
     if [[ "$running" == true ]]; then
       echo -e "  Status:   ${C_GREEN}running${C_RESET}"
     else
@@ -726,5 +955,241 @@ _host_run_options_page() {
     printf "\n"
     "$dispatch_fn" "$chosen_opt"
     pause_prompt
+    last_probe=-99
   done
+}
+
+declare -gA _HOST_VP_TAG=() _HOST_VP_NAME=() _HOST_VP_BIN_NAME=() _HOST_VP_PIP_PKG=() _HOST_VP_PKG_SPEC=()
+declare -gA _HOST_VP_REPO=() _HOST_VP_PORT=() _HOST_VP_URL=() _HOST_VP_HEALTH=() _HOST_VP_DOCKER_PAT=()
+declare -gA _HOST_VP_SVC_DESC=() _HOST_VP_SVC_ARGS=() _HOST_VP_MODEL_PROMPT=() _HOST_VP_LIVE_LABEL=()
+declare -gA _HOST_VP_BIN=() _HOST_VP_VER=() _HOST_VP_DOCKER=() _HOST_VP_SRC=()
+declare -gA _HOST_VP_RUN=() _HOST_VP_RUN_TS=() _HOST_MODELS_CACHE=() _HOST_MODELS_TS=()
+_HOST_VP_ACTIVE_ID="" _HOST_VP_CUR_BIN="" _HOST_VP_CUR_VER="" _HOST_VP_CUR_DOCKER="" _HOST_VP_CUR_SRC="" _HOST_VP_CUR_URL=""
+
+_host_vp_setup() {
+  local id="" tag="" name="" bin_name="" pip_pkg="" pkg_spec="" repo="" port="8000" health="/v1/models"
+  local docker_pat="" svc_desc="" svc_args="" model_prompt="" live_label=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --id) id="$2"; shift 2 ;;
+      --tag) tag="$2"; shift 2 ;;
+      --name) name="$2"; shift 2 ;;
+      --bin) bin_name="$2"; shift 2 ;;
+      --pip-pkg) pip_pkg="$2"; shift 2 ;;
+      --pkg-spec) pkg_spec="$2"; shift 2 ;;
+      --repo) repo="$2"; shift 2 ;;
+      --port) port="$2"; shift 2 ;;
+      --health) health="$2"; shift 2 ;;
+      --docker-pat) docker_pat="$2"; shift 2 ;;
+      --svc-desc) svc_desc="$2"; shift 2 ;;
+      --svc-args) svc_args="$2"; shift 2 ;;
+      --model-prompt) model_prompt="$2"; shift 2 ;;
+      --live-label) live_label="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  [[ -n "$id" ]] || return 1
+  _HOST_VP_TAG[$id]="$tag"
+  _HOST_VP_NAME[$id]="$name"
+  _HOST_VP_BIN_NAME[$id]="$bin_name"
+  _HOST_VP_PIP_PKG[$id]="$pip_pkg"
+  _HOST_VP_PKG_SPEC[$id]="${pkg_spec:-$pip_pkg}"
+  _HOST_VP_REPO[$id]="$repo"
+  _HOST_VP_PORT[$id]="$port"
+  _HOST_VP_URL[$id]="http://127.0.0.1:${port}"
+  _HOST_VP_HEALTH[$id]="$health"
+  _HOST_VP_DOCKER_PAT[$id]="${docker_pat:-$id}"
+  _HOST_VP_SVC_DESC[$id]="${svc_desc:-${name} Server}"
+  _HOST_VP_SVC_ARGS[$id]="$svc_args"
+  _HOST_VP_MODEL_PROMPT[$id]="$model_prompt"
+  _HOST_VP_LIVE_LABEL[$id]="${live_label:-$name}"
+}
+
+_host_vp_refresh() {
+  local id="$1" bin_name="${_HOST_VP_BIN_NAME[$1]:-}" pip_pkg="${_HOST_VP_PIP_PKG[$1]:-}"
+  local docker_pat="${_HOST_VP_DOCKER_PAT[$1]:-$1}" bin="" ver="" docker="" src="none" vdir=""
+  if [[ "$bin_name" == "python3" ]]; then
+    vdir="$(_host_venv_dir "$id")"
+    if [[ -x "${vdir}/bin/python3" ]]; then
+      bin="${vdir}/bin/python3"
+      ver="$(_host_venv_pkg_version "$id" "$pip_pkg" || true)"
+      [[ -z "$ver" ]] && ver="installed"
+    elif has_working_python3 && python3 -c "import ${pip_pkg//-/_}" 2>/dev/null; then
+      bin="$(command -v python3)"
+      ver="$(_host_venv_pkg_version "$id" "$pip_pkg" || echo "installed")"
+    fi
+  else
+    bin="$(_host_venv_bin "$id" "$bin_name" || true)"
+    if [[ -n "$bin" ]]; then
+      ver="$(_host_venv_pkg_version "$id" "$pip_pkg" || true)"
+      [[ -z "$ver" ]] && ver="installed"
+    fi
+  fi
+  if [[ -z "$bin" && -n "$docker_pat" ]]; then
+    docker="$(_host_find_docker "$docker_pat" || true)"
+  fi
+  src="$(_host_detect_install_source "$id" "$bin" "$pip_pkg" false)"
+  _HOST_VP_BIN[$id]="$bin"
+  _HOST_VP_VER[$id]="$ver"
+  _HOST_VP_DOCKER[$id]="$docker"
+  _HOST_VP_SRC[$id]="$src"
+  local pat="$id"
+  [[ -n "$bin_name" && "$bin_name" != "python3" ]] && pat="(^|/)${bin_name}([[:space:]]|$)"
+  _HOST_VP_URL[$id]="$(_host_detect_url "http://127.0.0.1:${_HOST_VP_PORT[$id]}" "$pat" "$docker" "${id}.service")"
+}
+
+_host_vp_running() {
+  local id="$1" base="${_HOST_VP_URL[$1]:-}" ep bin_name="${_HOST_VP_BIN_NAME[$1]:-}" pat="" rc=1
+  local docker_val="${_HOST_VP_DOCKER[$1]:-}"
+  # shortcut: run state cached 5s so dashboard redraws don't repeat pgrep+HTTP probes;
+  # _host_vp_dispatch clears the cache after actions that can change server state.
+  local cts="${_HOST_VP_RUN_TS[$id]:-}"
+  if [[ -n "$cts" ]] && (( SECONDS - cts < 5 )); then
+    [[ "${_HOST_VP_RUN[$id]:-1}" == "0" ]] && return 0
+    return 1
+  fi
+  if [[ -n "$bin_name" && "$bin_name" != "python3" ]]; then
+    pat="(^|/)${bin_name}([[:space:]]|$)"
+  else
+    pat="$id"
+  fi
+  if [[ -n "$docker_val" ]] || unit_active "${id}.service" 2>/dev/null || _host_proc_running "$pat"; then
+    for ep in ${_HOST_VP_HEALTH[$id]:-/v1/models}; do
+      if _host_http_ok "${base}${ep}" 1; then rc=0; break; fi
+    done
+  fi
+  _HOST_VP_RUN[$id]="$rc"
+  _HOST_VP_RUN_TS[$id]="$SECONDS"
+  return "$rc"
+}
+
+_host_vp_menu_row() {
+  local id="$1" sel="${2:-false}" running=false ver="${_HOST_VP_VER[$1]:-}" bin="${_HOST_VP_BIN[$1]:-}"
+  _host_vp_running "$id" && running=true
+  _host_std_menu_row "${_HOST_VP_TAG[$id]}" "${_HOST_VP_NAME[$id]}" "${bin:+$ver}" "${_HOST_VP_DOCKER[$id]:-}" "$running" "$sel"
+}
+
+_host_vp_check_summary() {
+  local id="$1" running=false ver="${_HOST_VP_VER[$1]:-}" bin="${_HOST_VP_BIN[$1]:-}"
+  _host_vp_running "$id" && running=true
+  _host_std_check_summary "${_HOST_VP_NAME[$id]}" "${bin:+$ver}" "${_HOST_VP_URL[$id]}" "${_HOST_VP_DOCKER[$id]:-}" "$running" "$bin"
+}
+
+_host_vp_live_stats() {
+  local id="$1" running=false
+  _host_vp_running "$id" && running=true
+  _host_std_live_stats "${_HOST_VP_LIVE_LABEL[$id]}" "${_HOST_VP_BIN[$id]:-}" "${_HOST_VP_URL[$id]}" "$running"
+}
+
+_host_vp_table_status() {
+  local id="$1" running=false
+  _host_vp_running "$id" && running=true
+  _host_std_table_status "${_HOST_VP_BIN[$id]:-}" "${_HOST_VP_DOCKER[$id]:-}" "$running" "${id}.service"
+}
+
+_host_vp_check_update() {
+  local id="$1"
+  [[ -n "${_HOST_VP_BIN[$id]:-}" ]] && _host_check_update_by_source "$id" "${_HOST_VP_SRC[$id]:-none}" "${_HOST_VP_VER[$id]:-}" "${_HOST_VP_PIP_PKG[$id]}" "${_HOST_VP_REPO[$id]}" "${_HOST_VP_PIP_PKG[$id]}"
+}
+
+_host_vp_dispatch() {
+  local id="$1" action="$2"
+  local name="${_HOST_VP_NAME[$id]}" url="${_HOST_VP_URL[$id]}" port="${_HOST_VP_PORT[$id]}"
+  unset "_HOST_VP_RUN_TS[$id]" "_HOST_VP_RUN[$id]"
+  case "$action" in
+    install|update)
+      local upgrade=false
+      [[ -n "${_HOST_VP_BIN[$id]:-}" ]] && upgrade=true
+      _host_venv_install_or_upgrade "$id" "${_HOST_VP_PKG_SPEC[$id]}" "$upgrade"
+      _host_vp_refresh "$id"
+      _host_clear_update_cache "$id"
+      ;;
+    latest)
+      local latest
+      latest="$(_host_github_latest_tag "${_HOST_VP_REPO[$id]}" || true)"
+      echo "  Installed: ${_HOST_VP_VER[$id]:-none}"
+      echo "  Latest:    ${latest:-unavailable}"
+      ;;
+    service)
+      local prompt="${_HOST_VP_MODEL_PROMPT[$id]:-}" model_id="" unit="${id}.service"
+      if [[ -n "$prompt" ]] && ! service_installed "$unit"; then
+        read -r -p "${prompt}: " model_id
+        [[ -n "$model_id" ]] || return 0
+      fi
+      local q_bin q_model cmd="${_HOST_VP_SVC_ARGS[$id]}"
+      q_bin="$(_host_shell_quote "${_HOST_VP_BIN[$id]:-}")"
+      q_model="$(_host_shell_quote "$model_id")"
+      cmd="${cmd//\{BIN\}/$q_bin}"
+      cmd="${cmd//\{MODEL\}/$q_model}"
+      cmd="${cmd//\{PORT\}/$port}"
+      _host_manage_service_action "$name" "$unit" "${_HOST_VP_SVC_DESC[$id]}" "$cmd"
+      ;;
+    bench)
+      _host_openai_bench "$name" "$url"
+      ;;
+    uninstall)
+      _host_standard_uninstall "$id" "$name" "${id}.service" "${_HOST_VP_BIN[$id]:-}" "${_HOST_VP_SRC[$id]:-none}" "${_HOST_VP_PIP_PKG[$id]}"
+      _host_vp_refresh "$id"
+      _host_clear_update_cache "$id"
+      ;;
+  esac
+}
+
+_host_vp_cur_refresh() {
+  local id="$_HOST_VP_ACTIVE_ID"
+  _host_vp_refresh "$id"
+  _HOST_VP_CUR_BIN="${_HOST_VP_BIN[$id]:-}"
+  _HOST_VP_CUR_VER="${_HOST_VP_VER[$id]:-}"
+  _HOST_VP_CUR_DOCKER="${_HOST_VP_DOCKER[$id]:-}"
+  _HOST_VP_CUR_SRC="${_HOST_VP_SRC[$id]:-none}"
+  _HOST_VP_CUR_URL="${_HOST_VP_URL[$id]:-}"
+}
+
+_host_vp_cur_running() { _host_vp_running "$_HOST_VP_ACTIVE_ID"; }
+_host_vp_cur_dispatch() { _host_vp_dispatch "$_HOST_VP_ACTIVE_ID" "$1"; }
+
+_host_vp_open() {
+  local id="$1"
+  _HOST_VP_ACTIVE_ID="$id"
+  _host_run_options_page \
+    --name "${_HOST_VP_NAME[$id]}" \
+    --unit "${id}.service" \
+    --refresh "_host_vp_cur_refresh" \
+    --bin-var "_HOST_VP_CUR_BIN" \
+    --ver-var "_HOST_VP_CUR_VER" \
+    --docker-var "_HOST_VP_CUR_DOCKER" \
+    --source-var "_HOST_VP_CUR_SRC" \
+    --url "${_HOST_VP_URL[$id]}" \
+    --url-var "_HOST_VP_CUR_URL" \
+    --is-running "_host_vp_cur_running" \
+    --dispatch "_host_vp_cur_dispatch"
+}
+
+_host_git_venv_install_or_update() {
+  local id="$1" repo_url="$2" mode="$3" target="${4:-.}"
+  command -v git >/dev/null 2>&1 || { echo -e "${C_RED}git is required to install ${id}.${C_RESET}"; return 1; }
+  local pfx src_dir vdir
+  pfx="${TARGET_HOME:-$HOME}/.local/share/strata-hosts/${id}"
+  src_dir="${pfx}/src"
+  vdir="$(_host_venv_dir "$id")"
+  run_as_user_exec mkdir -p "$pfx" "$(dirname "$vdir")"
+  if [[ -d "${src_dir}/.git" ]]; then
+    run_as_user_exec git -C "$src_dir" pull --ff-only || return 1
+  else
+    run_as_user_exec git clone --depth 1 "$repo_url" "$src_dir" || return 1
+  fi
+  local -a pip_args=()
+  if [[ "$mode" == "req" ]]; then
+    pip_args=(-r "${src_dir}/${target}")
+  else
+    pip_args=(-e "$src_dir")
+  fi
+  if command -v uv >/dev/null 2>&1; then
+    [[ -x "${vdir}/bin/python3" ]] || run_as_user_exec uv venv "$vdir" || return 1
+    run_as_user_exec uv pip install --python "${vdir}/bin/python3" "${pip_args[@]}"
+  else
+    has_working_python3 || { echo -e "${C_RED}python3 is required to install ${id}.${C_RESET}"; return 1; }
+    [[ -x "${vdir}/bin/python3" ]] || run_as_user_exec python3 -m venv "$vdir" || return 1
+    run_as_user_exec "${vdir}/bin/pip" install "${pip_args[@]}"
+  fi
 }

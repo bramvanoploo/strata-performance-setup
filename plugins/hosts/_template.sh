@@ -47,7 +47,7 @@ example_open() {
 # Print summary lines during `--check` / [c] Check Summary:
 # example_check_summary() { echo "  Example:  not installed"; }
 
-# Print hardware/compatibility warnings above the Optimization Index:
+# Print hardware/compatibility warnings on the Inference Servers page:
 # example_hw_warnings() { :; }
 
 # Stop any background pollers started by example_init:

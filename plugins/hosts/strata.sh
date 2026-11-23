@@ -6,7 +6,8 @@
 register_host_plugin \
   --id "strata" \
   --name "Strata" \
-  --description "Install, update, launch, and benchmark Strata LLM server"
+  --description "Install, update, launch, and benchmark Strata LLM server" \
+  --url "https://github.com/Niko1221/Strata"
 
 strata_init() {
   refresh_strata_bin
@@ -379,13 +380,17 @@ stop_strata_update_poller() {
 
 start_strata_update_poller() {
   [[ -n "$STRATA_BIN" && -z "$STRATA_POLLER_PID" ]] || return 0
-  [[ -n "$STRATA_UPDATE_CACHE_FILE" ]] || STRATA_UPDATE_CACHE_FILE="$(mktemp /tmp/strata-update-check.XXXXXX 2>/dev/null || echo "")"
+  if [[ -z "$STRATA_UPDATE_CACHE_FILE" ]]; then
+    mkdir -p "$(_host_update_cache_dir)" 2>/dev/null || return 0
+    STRATA_UPDATE_CACHE_FILE="$(_host_update_cache_dir)/strata-update-check.$$"
+  fi
   [[ -n "$STRATA_UPDATE_CACHE_FILE" ]] || return 0
   (
     trap 'kill $(jobs -p) 2>/dev/null || true; exit 0' TERM INT
     while true; do
       check_strata_update_sync >/dev/null 2>&1 || true
-      sleep 60 &
+      # shortcut: 2h matches the update-cache TTL in _host_check_update_cached; polling faster only burns requests
+      sleep 7200 &
       wait $! 2>/dev/null || exit 0
     done
   ) &
@@ -2878,10 +2883,10 @@ collect_strata_stats_lines() {
   fi
 
   local model="" live_str="0.0 tok/s (idle)" avg_str="—"
-  if [[ -n "$STRATA_RUNNING_URL" ]] && command -v curl >/dev/null 2>&1 && has_working_python3; then
-    local m_json curl_args=(-fsS --max-time 1)
-    [[ -n "${STRATA_API_KEY:-}" ]] && curl_args+=(-H "Authorization: Bearer ${STRATA_API_KEY}" -H "X-API-Key: ${STRATA_API_KEY}")
-    m_json="$(curl "${curl_args[@]}" "${STRATA_RUNNING_URL}/metrics" 2>/dev/null || true)"
+  if [[ -n "$STRATA_RUNNING_URL" ]] && (command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1) && has_working_python3; then
+    local m_json hdr=()
+    [[ -n "${STRATA_API_KEY:-}" ]] && hdr=("Authorization: Bearer ${STRATA_API_KEY}" "X-API-Key: ${STRATA_API_KEY}")
+    m_json="$(_host_http_get "${STRATA_RUNNING_URL}/metrics" 1 ${hdr[@]+"${hdr[@]}"})"
     if [[ -n "$m_json" ]]; then
       local parsed=""
       parsed="$(python3 -c '
@@ -3098,6 +3103,7 @@ format_strata_row() {
   printf "%b %b  | %b | %b" "$ptr" "$row_tag" "$badge" "$title_txt"
 }
 
+# shortcut: near-duplicate raw-key loop (see read_line_with_live_stats in core)
 read_strata_page_choice() {
   local -n _out_var="$1"
   local footer_lines="${2:-0}"
