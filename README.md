@@ -58,8 +58,8 @@ Inspect detected OS/init, hardware, Strata installation or Docker container, and
 
 The core script works standalone via the one-liner above and lazy-loads plugins on demand (with SHA-256 verification against `plugins/registry.tsv` and local caching in `~/.cache/strata-performance-setup/plugins`). The plugin system and non-Strata inference server plugins are **experimental** — see [Supported Inference Servers](documentation/supported-inference-servers.md).
 
-- **System-tuning-only by default**: Host plugins (`strata`, `ollama`, `llamacpp`, `localai`, `vllm`, `sglang`, `mlx-lm`) are lazy-loaded only when selected on the Index page or passed via `--plugin`, and are automatically filtered by detected OS/hardware (e.g., `mlx-lm` is only shown on Apple Silicon macOS; `vllm` and `sglang` are only shown on Linux)
-- **Pre-load an LLM host plugin**: `./strata-performance-setup.sh --plugin strata` (or `ollama`, `llamacpp`, `localai`, `vllm`, `sglang`, `mlx-lm`)
+- **System-tuning-only by default**: 17 host plugins (`strata`, `adamant`, `basalt`, `exo`, `ik-llamacpp`, `ktransformers`, `lemonade`, `llamacpp`, `localai`, `mlx-lm`, `ollama`, `openvino`, `polystrata`, `sglang`, `tabbyapi`, `tensorrt-llm`, `vllm`) are lazy-loaded only when opened from `[SERVERS]` or passed via `--plugin`, and are automatically filtered by detected OS/hardware (e.g., `mlx-lm` is only shown on Apple Silicon macOS; `adamant`, `basalt`, and `tensorrt-llm` are only shown on Linux with NVIDIA)
+- **Pre-load an LLM host plugin**: `./strata-performance-setup.sh --plugin strata` (or any plugin ID from `--list-plugins`)
 - **Disable all plugins** (including tweak packs): `./strata-performance-setup.sh --no-plugins`
 - **List available plugins**: `./strata-performance-setup.sh --list-plugins`
 - **Pre-cache all plugins for offline use**: `./strata-performance-setup.sh --download-plugins`

@@ -2,8 +2,8 @@
 
 `strata-performance-setup.sh` uses a modular, lazy-loaded plugin architecture with two plugin categories:
 
-1. **LLM Host Plugins (`plugins/hosts/<id>.sh`)** — Install, update, manage services, and benchmark LLM inference servers (`strata.sh`, `ollama.sh`, `llamacpp.sh`, `localai.sh`, `vllm.sh`, `sglang.sh`, `mlx-lm.sh`). Loaded on demand when selected from the Index page or passed via `--plugin <id>`, and filtered by detected OS/hardware via `# PLUGIN_PLATFORMS`.
-2. **Performance Tweak Packs (`plugins/tweaks/<pack>.sh`)** — Host/hardware optimization steps grouped by platform/vendor (`linux-core.sh`, `linux-laptop.sh`, `nvidia.sh`, `amd.sh`, `intel.sh`, `jetson.sh`, `macos.sh`, `common.sh`). Loaded automatically based on detected OS and hardware.
+1. **LLM Host Plugins (`plugins/hosts/<id>.sh`)** — Install, update, manage services, and benchmark LLM inference servers (17 built-in, including `strata.sh`, `ollama.sh`, `llamacpp.sh`, `vllm.sh`, `sglang.sh`, `mlx-lm.sh`, and more). Loaded on demand when selected from the `[SERVERS]` page or passed via `--plugin <id>`, and filtered by detected OS/hardware via `# PLUGIN_PLATFORMS`.
+2. **Performance Tweak Packs (`plugins/tweaks/<pack>.sh`)** — Host/hardware optimization steps grouped by platform/vendor (`linux-core.sh`, `linux-laptop.sh`, `nvidia.sh`, `amd.sh`, `intel.sh`, `jetson.sh`, `accelerators.sh`, `wsl2.sh`, `macos.sh`, `common.sh`). Loaded automatically based on detected OS and hardware.
 
 ---
 
@@ -34,8 +34,9 @@ plugins/
    ```
    Supported `# PLUGIN_PLATFORMS` values (also stored in `plugins/registry.tsv`):
    - `all` (default) — Shown on Linux and macOS.
-   - `linux` — Shown on Linux only (`vllm`, `sglang`).
-   - `linux-gpu` — Shown on Linux with a detected NVIDIA, AMD, or Intel GPU.
+   - `linux` — Shown on Linux only (`ktransformers`, `lemonade`, `openvino`, `sglang`, `vllm`).
+   - `linux-gpu` — Shown on Linux with a detected NVIDIA, AMD, or Intel GPU (`tabbyapi`).
+   - `linux-nvidia` — Shown on Linux with a detected NVIDIA GPU (`adamant`, `basalt`, `tensorrt-llm`).
    - `macos` — Shown on macOS only.
    - `macos-arm64` — Shown on Apple Silicon macOS only (`mlx-lm`).
 3. Call `register_host_plugin`:
@@ -62,12 +63,22 @@ plugins/
 | ID | Host | Platforms | Capabilities |
 | :--- | :--- | :--- | :--- |
 | `strata` | Strata | `all` | Install/build/update, `systemd`/`launchd` service, live stats, `strata bench` |
-| `ollama` | Ollama | `all` | Installer/`brew`, `ollama.service`, release check, `/api/ps` stats, OpenAI bench |
+| `adamant` | Adamant | `linux-nvidia` | Install/service, live stats, OpenAI bench (NVIDIA Ada/Ampere fork) |
+| `basalt` | Basalt | `linux-nvidia` | Install/service, release check, live stats, OpenAI bench (NVIDIA Blackwell fork) |
+| `exo` | exo | `all` | Install/service, release check, live stats, OpenAI bench (distributed cluster) |
+| `ik-llamacpp` | ik_llama.cpp | `all` | Install/service, live stats, `llama-bench`/OpenAI bench (CPU/hybrid MoE) |
+| `ktransformers` | KTransformers | `linux` | `uv`/`pip` venv, service, release check, live stats, OpenAI bench |
+| `lemonade` | Lemonade | `linux` | Install/service, release check, live stats, OpenAI bench (AMD Ryzen AI NPU/iGPU) |
 | `llamacpp` | llama.cpp | `all` | `brew`/distro/AUR, `llama-server` service, release check, `llama-bench`/OpenAI bench |
 | `localai` | LocalAI | `all` | Installer/`brew`, `localai.service`, release check, `/readyz` stats, OpenAI bench |
-| `vllm` | vLLM | `linux` | `uv`/`pip` venv, `vllm.service`, release check, `/health` stats, OpenAI bench |
-| `sglang` | SGLang | `linux` | `uv`/`pip` venv, `sglang.service`, release check, `/health` stats, OpenAI bench |
 | `mlx-lm` | MLX LM | `macos-arm64` | `uv`/`pip` venv, `mlx-lm` `launchd` service, release check, `mlx_lm.benchmark`/OpenAI bench |
+| `ollama` | Ollama | `all` | Installer/`brew`, `ollama.service`, release check, `/api/ps` stats, OpenAI bench |
+| `openvino` | OpenVINO | `linux` | Install/service, release check, live stats, OpenAI bench (Intel NPU/GPU/CPU) |
+| `polystrata` | PolyStrata | `all` | Install/service, release check, live stats, OpenAI bench (multi-engine Strata fork) |
+| `sglang` | SGLang | `linux` | `uv`/`pip` venv, `sglang.service`, release check, `/health` stats, OpenAI bench |
+| `tabbyapi` | TabbyAPI | `linux-gpu` | Install/service, release check, live stats, OpenAI bench (ExLlamaV2/V3) |
+| `tensorrt-llm` | TensorRT-LLM | `linux-nvidia` | Install/service, release check, live stats, OpenAI bench (`trtllm-serve`) |
+| `vllm` | vLLM | `linux` | `uv`/`pip` venv, `vllm.service`, release check, `/health` stats, OpenAI bench |
 
 ---
 
