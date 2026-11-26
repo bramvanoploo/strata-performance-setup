@@ -89,6 +89,10 @@ _tabbyapi_install_or_update() {
   local pfx src_dir req_file="requirements.txt"
   pfx="$(_tabbyapi_prefix)"
   src_dir="${pfx}/src"
+  if [[ "$HAS_AMD" == true && ! -d "${src_dir}/.git" ]] && command -v git >/dev/null 2>&1; then
+    run_as_user_exec mkdir -p "$pfx"
+    run_as_user_exec git clone --depth 1 "https://github.com/theroyallab/tabbyAPI.git" "$src_dir" || return 1
+  fi
   [[ "$HAS_AMD" == true && -f "${src_dir}/requirements-rocm.txt" ]] && req_file="requirements-rocm.txt"
   _host_git_venv_install_or_update "tabbyapi" "https://github.com/theroyallab/tabbyAPI.git" "req" "$req_file" || return 1
   _tabbyapi_refresh

@@ -116,7 +116,7 @@ status_asus_perf() { command -v asusctl >/dev/null 2>&1 && unit_active asusd.ser
 explain_asus_perf() { echo -e "Impact:\n  Enables asusd.service and switches asusctl profile to 'Performance'."; }
 apply_asus_perf() {
   command -v asusctl >/dev/null 2>&1 || prompt_install_repo_or_aur asusctl || return 0
-  run_root systemctl enable --now asusd.service 2>/dev/null || true
+  service_ctl enable-now asusd.service 2>/dev/null || true
   asusctl profile -P Performance 2>/dev/null || true
 }
 revert_asus_perf() { command -v asusctl >/dev/null 2>&1 && asusctl profile -P Balanced 2>/dev/null || true; }
@@ -157,9 +157,9 @@ status_lenovo_legion() { unit_enabled legiond.service && unit_active legiond.ser
 explain_lenovo_legion() { echo -e "Impact:\n  Enables legiond.service for Lenovo Legion custom fan curves and max TDP."; }
 apply_lenovo_legion() {
   command -v legion_cli >/dev/null 2>&1 || prompt_install_repo_or_aur lenovo-legion || prompt_install_deps aur lenovo-legion-dkms-git || return 0
-  run_root systemctl enable --now legiond.service 2>/dev/null || true
+  service_ctl enable-now legiond.service 2>/dev/null || true
 }
-revert_lenovo_legion() { run_root systemctl disable --now legiond.service 2>/dev/null || true; }
+revert_lenovo_legion() { service_ctl disable-now legiond.service 2>/dev/null || true; }
 
 # 3f. System76
 applicable_system76_perf() {
@@ -171,7 +171,7 @@ status_system76_perf() { command -v system76-power >/dev/null 2>&1 && unit_activ
 explain_system76_perf() { echo -e "Impact:\n  Enables system76-power.service and sets the active profile to 'Performance'."; }
 apply_system76_perf() {
   command -v system76-power >/dev/null 2>&1 || prompt_install_repo_or_aur system76-power || return 0
-  run_root systemctl enable --now system76-power.service 2>/dev/null || true
+  service_ctl enable-now system76-power.service 2>/dev/null || true
   run_root system76-power profile performance 2>/dev/null || true
 }
 revert_system76_perf() { command -v system76-power >/dev/null 2>&1 && run_root system76-power profile balanced 2>/dev/null || true; }
@@ -186,9 +186,9 @@ status_tuxedo_perf() { unit_enabled tccd.service && unit_active tccd.service; }
 explain_tuxedo_perf() { echo -e "Impact:\n  Enables tccd.service for high-TDP performance and fan profiles on TUXEDO laptops."; }
 apply_tuxedo_perf() {
   unit_exists tccd.service || prompt_install_repo_or_aur tuxedo-control-center || prompt_install_deps aur tuxedo-control-center-bin || return 0
-  run_root systemctl enable --now tccd.service 2>/dev/null || true
+  service_ctl enable-now tccd.service 2>/dev/null || true
 }
-revert_tuxedo_perf() { run_root systemctl disable --now tccd.service 2>/dev/null || true; }
+revert_tuxedo_perf() { service_ctl disable-now tccd.service 2>/dev/null || true; }
 
 # 3h. Apple Mac SMC Cooling (Linux on Intel Macs)
 applicable_apple_smc_cooling() {
@@ -253,7 +253,7 @@ apply_apple_smc_cooling() {
       fi
     fi
     service_installed strata-applesmc-cooling.service && remove_service strata-applesmc-cooling.service
-    run_root sh -c 'for d in "'"${STRATA_APPLESMC_DIR:-}"'" /sys/devices/platform/applesmc* /sys/devices/platform/applesmc*/hwmon/hwmon*; do [ -n "$d" ] && [ -d "$d" ] || continue; for m in "$d"/fan*_manual; do [ -w "$m" ] && echo 0 > "$m"; done; done; true' 2>/dev/null || true
+    run_root sh -c 'for d in "$1" /sys/devices/platform/applesmc* /sys/devices/platform/applesmc*/hwmon/hwmon*; do [ -n "$d" ] && [ -d "$d" ] || continue; for m in "$d"/fan*_manual; do [ -w "$m" ] && echo 0 > "$m"; done; done; true' _ "${STRATA_APPLESMC_DIR:-}" 2>/dev/null || true
     local was_active=false
     unit_active mbpfan.service && was_active=true
     if [[ -f /etc/mbpfan.conf && ! -f /etc/mbpfan.conf.bak.strata-setup ]]; then
@@ -269,8 +269,8 @@ max_temp = 82
 polling_interval = 1
 EOF
     if [[ "$HAS_SYSTEMD" == true ]]; then
-      run_root systemctl enable --now mbpfan.service
-      run_root systemctl restart mbpfan.service
+      service_ctl enable-now mbpfan.service
+      service_ctl restart mbpfan.service
     else
       local mbp_bin
       mbp_bin="$(command -v mbpfan || true)"
@@ -300,7 +300,11 @@ EOF
     echo -e "${C_RED}Invalid percentage '${pct}' (must be 50-100). Cancelled.${C_RESET}"
     return 1
   fi
-  unit_active mbpfan.service && run_root systemctl disable --now mbpfan.service 2>/dev/null || true
+  unit_active mbpfan.service && service_ctl disable-now mbpfan.service 2>/dev/null || true
+  local smc_dir_safe=""
+  if [[ -n "${STRATA_APPLESMC_DIR:-}" && "${STRATA_APPLESMC_DIR}" =~ ^[A-Za-z0-9/_.-]+$ ]]; then
+    smc_dir_safe="${STRATA_APPLESMC_DIR}"
+  fi
   install_service strata-applesmc-cooling.service <<EOF
 [Unit]
 Description=Apple Mac applesmc Fan Speed Control for Strata (${pct}%)
@@ -309,8 +313,8 @@ After=multi-user.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c 'modprobe applesmc 2>/dev/null || true; for d in "${STRATA_APPLESMC_DIR:-}" /sys/devices/platform/applesmc* /sys/devices/platform/applesmc*/hwmon/hwmon*; do [ -n "\$d" ] && [ -d "\$d" ] || continue; for m in "\$d"/fan*_manual; do [ -w "\$m" ] || continue; b="\${m%_manual}"; [ -r "\${b}_min" ] && [ -r "\${b}_max" ] && [ -w "\${b}_output" ] || continue; mn=\$(tr -d "[:space:]" < "\${b}_min" 2>/dev/null || echo 0); mx=\$(tr -d "[:space:]" < "\${b}_max" 2>/dev/null || echo 0); case "\$mn:\$mx" in *[!0-9:]*|:|*:|:* ) continue ;; esac; [ "\$mx" -gt "\$mn" ] 2>/dev/null || continue; tgt=\$(( mn + (mx - mn) * ${pct} / 100 )); echo 1 > "\$m"; echo "\$tgt" > "\${b}_output"; done; done; true'
-ExecStop=/bin/sh -c 'for d in "${STRATA_APPLESMC_DIR:-}" /sys/devices/platform/applesmc* /sys/devices/platform/applesmc*/hwmon/hwmon*; do [ -n "\$d" ] && [ -d "\$d" ] || continue; for m in "\$d"/fan*_manual; do [ -w "\$m" ] && echo 0 > "\$m"; done; done; true'
+ExecStart=/bin/sh -c 'modprobe applesmc 2>/dev/null || true; for d in "${smc_dir_safe}" /sys/devices/platform/applesmc* /sys/devices/platform/applesmc*/hwmon/hwmon*; do [ -n "\$d" ] && [ -d "\$d" ] || continue; for m in "\$d"/fan*_manual; do [ -w "\$m" ] || continue; b="\${m%_manual}"; [ -r "\${b}_min" ] && [ -r "\${b}_max" ] && [ -w "\${b}_output" ] || continue; mn=\$(tr -d "[:space:]" < "\${b}_min" 2>/dev/null || echo 0); mx=\$(tr -d "[:space:]" < "\${b}_max" 2>/dev/null || echo 0); case "\$mn:\$mx" in *[!0-9:]*|:|*:|:* ) continue ;; esac; [ "\$mx" -gt "\$mn" ] 2>/dev/null || continue; tgt=\$(( mn + (mx - mn) * ${pct} / 100 )); echo 1 > "\$m"; echo "\$tgt" > "\${b}_output"; done; done; true'
+ExecStop=/bin/sh -c 'for d in "${smc_dir_safe}" /sys/devices/platform/applesmc* /sys/devices/platform/applesmc*/hwmon/hwmon*; do [ -n "\$d" ] && [ -d "\$d" ] || continue; for m in "\$d"/fan*_manual; do [ -w "\$m" ] && echo 0 > "\$m"; done; done; true'
 
 [Install]
 WantedBy=multi-user.target
@@ -318,7 +322,7 @@ EOF
 }
 revert_apple_smc_cooling() {
   service_installed strata-applesmc-cooling.service && remove_service strata-applesmc-cooling.service
-  run_root sh -c 'for d in "'"${STRATA_APPLESMC_DIR:-}"'" /sys/devices/platform/applesmc* /sys/devices/platform/applesmc*/hwmon/hwmon*; do [ -n "$d" ] && [ -d "$d" ] || continue; for m in "$d"/fan*_manual; do [ -w "$m" ] && echo 0 > "$m"; done; done; true' 2>/dev/null || true
+  run_root sh -c 'for d in "$1" /sys/devices/platform/applesmc* /sys/devices/platform/applesmc*/hwmon/hwmon*; do [ -n "$d" ] && [ -d "$d" ] || continue; for m in "$d"/fan*_manual; do [ -w "$m" ] && echo 0 > "$m"; done; done; true' _ "${STRATA_APPLESMC_DIR:-}" 2>/dev/null || true
   if [[ -f "$APPLESMC_MBPFAN_MARKER" ]]; then
     local was_active="false"
     was_active="$(sed -n 's/^was_active=//p' "$APPLESMC_MBPFAN_MARKER" 2>/dev/null | head -n1)"
@@ -329,9 +333,9 @@ revert_apple_smc_cooling() {
     fi
     if [[ "$HAS_SYSTEMD" == true ]]; then
       if [[ "$was_active" == "true" ]]; then
-        run_root systemctl restart mbpfan.service 2>/dev/null || true
+        service_ctl restart mbpfan.service 2>/dev/null || true
       else
-        run_root systemctl disable --now mbpfan.service 2>/dev/null || true
+        service_ctl disable-now mbpfan.service 2>/dev/null || true
       fi
     fi
     run_root rm -f "$APPLESMC_MBPFAN_MARKER"

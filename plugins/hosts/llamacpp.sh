@@ -141,7 +141,7 @@ _llamacpp_dispatch() {
     uninstall)
       local -a _ll_extra=()
       [[ "$LLAMACPP_SOURCE" == "manual" && -n "$LLAMACPP_BENCH_BIN" ]] && _ll_extra+=("$LLAMACPP_BENCH_BIN")
-      _host_standard_uninstall "llamacpp" "llama.cpp" "llamacpp.service" "$LLAMACPP_BIN" "$LLAMACPP_SOURCE" "llama.cpp" "${_ll_extra[@]}"
+      _host_standard_uninstall "llamacpp" "llama.cpp" "llamacpp.service" "$LLAMACPP_BIN" "$LLAMACPP_SOURCE" "llama.cpp" ${_ll_extra[@]+"${_ll_extra[@]}"}
       _llamacpp_refresh
       _host_clear_update_cache "llamacpp"
       ;;

@@ -31,18 +31,21 @@ _openvino_write_serve_py() {
   run_as_user_exec mkdir -p "$(dirname "$srv")"
   run_as_user_exec tee "$srv" >/dev/null <<'PY'
 #!/usr/bin/env python3
-import argparse, json, os, time
+import argparse, json, os, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import openvino_genai as ov_genai
+
+MAX_BODY_BYTES = 10 * 1024 * 1024
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", required=True)
     p.add_argument("--device", default="NPU")
-    p.add_argument("--host", default="0.0.0.0")
+    p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)
     args = p.parse_args()
     pipe = ov_genai.LLMPipeline(args.model, args.device)
+    gen_lock = threading.Lock()
     model_id = os.path.basename(os.path.abspath(args.model)) or "openvino-genai"
 
     class Handler(BaseHTTPRequestHandler):
@@ -67,17 +70,23 @@ def main():
                 self._send(404, {"error": "not found"})
                 return
             ln = int(self.headers.get("Content-Length", "0") or 0)
+            if ln < 0 or ln > MAX_BODY_BYTES:
+                self._send(413, {"error": "payload too large"})
+                return
             req = json.loads(self.rfile.read(ln).decode("utf-8"))
             msgs = req.get("messages") or []
             prompt = "\n".join(f"{m.get('role', 'user')}: {m.get('content', '')}" for m in msgs)
             cfg = ov_genai.GenerationConfig()
             cfg.max_new_tokens = int(req.get("max_tokens") or 128)
-            text = pipe.generate(prompt, cfg)
+            with gen_lock:
+                text = pipe.generate(prompt, cfg)
+            comp_toks = max(1, len(str(text).split()))
             self._send(200, {
                 "id": f"ov-{int(time.time())}",
                 "object": "chat.completion",
                 "model": model_id,
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": max(1, len(prompt.split())), "completion_tokens": comp_toks, "total_tokens": max(1, len(prompt.split())) + comp_toks},
             })
 
     ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()

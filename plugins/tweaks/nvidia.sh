@@ -42,7 +42,7 @@ status_nvidia_persistenced() {
 explain_nvidia_persistenced() { echo -e "Impact:\n  Keeps the NVIDIA driver initialized on headless hosts to avoid cold-start\n  delays and ensures persistent power/clock settings stay applied (no-op on\n  container/appliance hosts where the driver already stays resident)."; }
 apply_nvidia_persistenced() {
   if unit_exists nvidia-persistenced.service; then
-    run_root systemctl enable --now nvidia-persistenced.service
+    service_ctl enable-now nvidia-persistenced.service
   elif [[ "$HAS_SYSTEMD" == true ]] && command -v nvidia-persistenced >/dev/null 2>&1; then
     local npd_bin
     npd_bin="$(command -v nvidia-persistenced)"
@@ -86,7 +86,7 @@ revert_nvidia_persistenced() {
     run_root nvidia-smi -pm 0 >/dev/null 2>&1 || true
   fi
   if unit_exists nvidia-persistenced.service; then
-    run_root systemctl disable --now nvidia-persistenced.service 2>/dev/null || true
+    service_ctl disable-now nvidia-persistenced.service 2>/dev/null || true
   fi
 }
 
@@ -126,13 +126,13 @@ apply_nvidia_fabricmanager() {
     fi
   fi
   if unit_exists nvidia-fabricmanager.service; then
-    run_root systemctl enable --now nvidia-fabricmanager.service
+    service_ctl enable-now nvidia-fabricmanager.service
   else
     echo -e "${C_YELLOW}nvidia-fabricmanager.service is not available; install the matching nvidia-fabricmanager package for driver ${NVIDIA_DRIVER_VER:-installed}.${C_RESET}"
     return 1
   fi
 }
-revert_nvidia_fabricmanager() { run_root systemctl disable --now nvidia-fabricmanager.service 2>/dev/null || true; }
+revert_nvidia_fabricmanager() { service_ctl disable-now nvidia-fabricmanager.service 2>/dev/null || true; }
 
 # 8. NVIDIA Dynamic Boost
 applicable_nvidia_powerd() {
@@ -142,8 +142,8 @@ applicable_nvidia_powerd() {
 title_nvidia_powerd() { echo "NVIDIA Dynamic Boost Daemon (nvidia-powerd)"; }
 status_nvidia_powerd() { unit_enabled nvidia-powerd.service && unit_active nvidia-powerd.service; }
 explain_nvidia_powerd() { echo -e "Impact:\n  Enables Dynamic Boost to shift power budget to mobile RTX GPUs under load."; }
-apply_nvidia_powerd() { run_root systemctl enable --now nvidia-powerd.service; }
-revert_nvidia_powerd() { run_root systemctl disable --now nvidia-powerd.service; }
+apply_nvidia_powerd() { service_ctl enable-now nvidia-powerd.service; }
+revert_nvidia_powerd() { service_ctl disable-now nvidia-powerd.service; }
 
 # 9. NVIDIA Power Limit
 nvidia_tunable_pl_indices() {
@@ -152,6 +152,15 @@ nvidia_tunable_pl_indices() {
     [[ "${NVIDIA_GPU_PL_SUPPORTED[$i]}" == true ]] && echo "$i"
   done
 }
+batch_skip_nvidia_power_limit() {
+  local revert_out_of_scope="${1:-false}"
+  if status_nvidia_power_cap && [[ "$revert_out_of_scope" == false ]]; then
+    echo -e "\n${C_YELLOW}Skipping NVIDIA Persistent Max GPU Power Limit because NVIDIA Thermal Power Cap ([OPT]) was kept active.${C_RESET}"
+    return 0
+  fi
+  return 1
+}
+check_note_nvidia_power_limit() { echo " (no measured speedup at default PL)"; }
 applicable_nvidia_power_limit() {
   [[ "$HAS_NVIDIA" == true && -n "$(nvidia_tunable_pl_indices)" ]]
 }
@@ -307,8 +316,9 @@ apply_nvidia_power_cap() {
     g_cap="$target_w"
     (( g_cap < g_min )) && g_cap="$g_min"
     (( g_cap > g_max )) && g_cap="$g_max"
-    out="$(run_root "$smi_bin" -i "$idx" -pl "$g_cap" 2>&1 || true)"
-    if grep -qiE "not supported|failed|error|invalid" <<<"$out"; then
+    local smi_rc=0
+    out="$(run_root "$smi_bin" -i "$idx" -pl "$g_cap" 2>&1)" || smi_rc=$?
+    if (( smi_rc != 0 )) || grep -qiE "not supported|failed|error|invalid|insufficient|unable" <<<"$out"; then
       echo -e "${C_YELLOW}Could not set -pl ${g_cap} on GPU ${idx} (${NVIDIA_GPU_NAMES[$i]}): ${out}${C_RESET}"
       continue
     fi
@@ -507,8 +517,6 @@ apply_gpu_unlock() {
 }
 revert_gpu_unlock() { remove_kernel_param "gpu_unlock.targets=all"; }
 
-# 11b. AMD GPU DPM
-
 applicable_nvidia_sm70_table() {
   [[ "$HAS_NVIDIA" == true && "$HAS_NVIDIA_VOLTA_SM70" == true ]] || [[ -f "$NVIDIA_SM70_MARKER" ]]
 }
@@ -535,7 +543,7 @@ EOF
 [Service]
 Environment=STRATA_SM70_TABLE=1
 EOF
-    run_root systemctl daemon-reload
+    service_ctl daemon-reload
     unit_active strata.service && echo -e "${C_YELLOW}Restart strata.service for STRATA_SM70_TABLE=1 to take effect.${C_RESET}" || true
   fi
 }
@@ -544,7 +552,7 @@ revert_nvidia_sm70_table() {
   if [[ -f /etc/systemd/system/strata.service.d/20-sm70-table.conf ]]; then
     run_root rm -f /etc/systemd/system/strata.service.d/20-sm70-table.conf
     run_root rmdir /etc/systemd/system/strata.service.d 2>/dev/null || true
-    [[ "$HAS_SYSTEMD" == true ]] && run_root systemctl daemon-reload 2>/dev/null || true
+    service_ctl daemon-reload 2>/dev/null || true
   fi
 }
 
@@ -807,8 +815,6 @@ PY
   fi
   run_root rm -f /usr/local/libexec/strata-nvidia-pstated.py "$NVIDIA_PSTATE_MARKER"
 }
-
-# 11c. Intel Arc / iGPU
 
 applicable_nvidia_clock_lock() { [[ "$HAS_NVIDIA" == true && -n "$NVIDIA_MAX_GFX_CLK" ]]; }
 title_nvidia_clock_lock() {
@@ -1113,12 +1119,17 @@ apply_nvidia_p2p_open() {
     read -r -a deps <<< "$(gpu_unlock_build_deps)"
     (( ${#deps[@]} > 0 )) && { prompt_install_deps repo "${deps[@]}" || return 1; }
 
-    local build_dir branch_arg="" build_rc=0
+    local build_dir branch_arg="" build_rc=0 drv_esc=""
     build_dir="$(mktemp -d /tmp/nvidia-p2p-open.XXXXXX)"
     [[ $EUID -eq 0 && "$TARGET_USER" != "root" ]] && chown "$TARGET_USER" "$build_dir" 2>/dev/null || true
-    echo -e "${C_CYAN}Cloning ${repo_url}...${C_RESET}"
-    if [[ -n "${NVIDIA_DRIVER_VER:-}" ]] && git ls-remote --tags "$repo_url" 2>/dev/null | grep -qE "refs/tags/${NVIDIA_DRIVER_VER}(\^{})?$"; then
+    echo -e "${C_CYAN}Checking ${repo_url} for driver tag ${NVIDIA_DRIVER_VER:-unknown}...${C_RESET}"
+    drv_esc="${NVIDIA_DRIVER_VER//./\\.}"
+    if [[ -n "${NVIDIA_DRIVER_VER:-}" ]] && git ls-remote --tags "$repo_url" 2>/dev/null | grep -qE "refs/tags/${drv_esc}(\^{})?$"; then
       branch_arg="--branch ${NVIDIA_DRIVER_VER}"
+    else
+      echo -e "${C_RED}No matching tag for installed NVIDIA driver '${NVIDIA_DRIVER_VER:-unknown}' in ${repo_url}; aborting to prevent NVRM API mismatch.${C_RESET}"
+      rm -rf "$build_dir"
+      return 1
     fi
     if ! run_as_user_exec git clone --depth 1 ${branch_arg} "$repo_url" "$build_dir/src"; then
       echo -e "${C_RED}Failed to clone ${repo_url}.${C_RESET}"
@@ -1153,9 +1164,9 @@ revert_nvidia_p2p_open() {
         break
       fi
     done
-    if [[ "$restored" == false ]] && pkg_installed nvidia-open-p2p-dkms 2>/dev/null; then
+    if [[ "$restored" == false ]] && pkg_installed nvidia-open-p2p-dkms 2>/dev/null && pkg_available repo nvidia-open-dkms 2>/dev/null; then
       run_root pacman -Rdd --noconfirm nvidia-open-p2p-dkms 2>/dev/null || true
-      pkg_available repo nvidia-open-dkms 2>/dev/null && pkg_install nvidia-open-dkms && restored=true
+      pkg_install nvidia-open-dkms && restored=true
     fi
   elif command -v dkms >/dev/null 2>&1 && dkms status 2>/dev/null | grep -qiE '^nvidia'; then
     run_root dkms autoinstall && restored=true || true
@@ -1169,13 +1180,4 @@ revert_nvidia_p2p_open() {
   fi
   echo -e "${C_YELLOW}Could not automatically reinstall stock NVIDIA modules; reinstall your distro's nvidia-open / nvidia-dkms package and remove ${NVIDIA_P2P_MARKER}, then reboot.${C_RESET}"
   return 1
-}
-
-# 12j. AMD APU Unified Memory Limit
-amd_apu_gtt_pages() {
-  local kb reserve
-  kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
-  reserve=$((4 * 1048576))
-  (( kb / 8 > reserve )) && reserve=$((kb / 8))
-  echo $(( (kb - reserve) / 4 ))
 }

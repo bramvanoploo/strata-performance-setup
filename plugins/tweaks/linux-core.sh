@@ -88,7 +88,7 @@ revert_cpu_performance() {
   if [[ -f "$PSTATE_MARKER" ]]; then
     local pf pm
     while IFS='=' read -r pf pm; do
-      [[ -n "$pf" && -n "$pm" && -w "$pf" ]] && echo "$pm" | run_root tee "$pf" >/dev/null 2>&1
+      [[ -n "$pf" && -n "$pm" && -e "$pf" ]] && echo "$pm" | run_root tee "$pf" >/dev/null 2>&1 || true
     done < "$PSTATE_MARKER"
     run_root rm -f "$PSTATE_MARKER"
   fi
@@ -274,7 +274,7 @@ apply_lact_overclock() {
     esac
   fi
 
-  run_root systemctl enable --now lactd.service 2>/dev/null || true
+  service_ctl enable-now lactd.service 2>/dev/null || true
   if [[ "$HAS_AMD" == true ]] && compgen -G "/sys/class/drm/card*/device/power_dpm_force_performance_level" >/dev/null 2>&1; then
     add_kernel_param "amdgpu.ppfeaturemask=0xffffffff"
   fi
@@ -298,7 +298,7 @@ apply_lact_overclock() {
   fi
   if [[ ! -f "$cfg" ]]; then
     # lactd creates a default config on its first start
-    run_root systemctl restart lactd.service 2>/dev/null || true
+    service_ctl restart lactd.service 2>/dev/null || true
     for i in 1 2 3 4 5 6 7 8 9 10; do
       [[ -f "$cfg" ]] && break
       sleep 0.5
@@ -401,7 +401,7 @@ PY
 
   if (( rc == 0 )); then
     echo -e "${C_GREEN}LACT: ${out}${C_RESET}"
-    run_root systemctl restart lactd.service 2>/dev/null || true
+    service_ctl restart lactd.service 2>/dev/null || true
     sleep 1
     if ! unit_active lactd.service; then
       echo -e "${C_YELLOW}lactd is not running after the config change:${C_RESET}"
@@ -419,9 +419,9 @@ revert_lact_overclock() {
   cfg="$(lact_config_file)"
   if [[ -f "${cfg}.bak.strata-setup" ]]; then
     run_root mv -f "${cfg}.bak.strata-setup" "$cfg"
-    run_root systemctl restart lactd.service 2>/dev/null || true
+    service_ctl restart lactd.service 2>/dev/null || true
   else
-    run_root systemctl disable --now lactd.service 2>/dev/null || true
+    service_ctl disable-now lactd.service 2>/dev/null || true
   fi
 }
 
@@ -487,7 +487,7 @@ EOF2
   if [[ "$DISTRO_FAMILY" == "arch" ]]; then
     local svc
     for svc in ananicy-cpp.service bpftune.service; do
-      unit_exists "$svc" && run_root systemctl enable --now "$svc" 2>/dev/null || true
+      unit_exists "$svc" && service_ctl enable-now "$svc" 2>/dev/null || true
     done
   fi
 }
@@ -536,13 +536,13 @@ zram-size = ram
 compression-algorithm = zstd
 swap-priority = 100
 EOF
-      run_root systemctl daemon-reload
-      run_root systemctl start systemd-zram-setup@zram0.service
+      service_ctl daemon-reload
+      service_ctl start systemd-zram-setup@zram0.service
       ;;
     fedora)
       prompt_install_deps repo zram-generator-defaults || return 0
-      run_root systemctl daemon-reload
-      run_root systemctl start systemd-zram-setup@zram0.service 2>/dev/null || true
+      service_ctl daemon-reload
+      service_ctl start systemd-zram-setup@zram0.service 2>/dev/null || true
       ;;
     debian)
       if pkg_available repo zram-tools; then
@@ -553,13 +553,15 @@ ALGO=zstd
 PERCENT=50
 PRIORITY=100
 EOF
-        run_root systemctl enable --now zramswap.service
+        service_ctl enable-now zramswap.service
       elif pkg_available repo zram-config; then
         prompt_install_deps repo zram-config || return 0
-        run_root systemctl enable --now zram-config.service 2>/dev/null || true
+        service_ctl enable-now zram-config.service 2>/dev/null || true
       else
-        local zram_kb
-        zram_kb=$(( $(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 4194304) / 2 ))
+        local mem_kb zram_kb
+        mem_kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || true)"
+        [[ "$mem_kb" =~ ^[0-9]+$ ]] || mem_kb=4194304
+        zram_kb=$(( mem_kb / 2 ))
         install_service strata-zram.service <<EOF
 [Unit]
 Description=Strata Compressed zram Swap
@@ -583,9 +585,9 @@ revert_zram_swap() {
   case "$DISTRO_FAMILY" in
     arch|fedora|suse)
       if [[ -f /etc/systemd/zram-generator.conf ]]; then
-        run_root systemctl stop systemd-zram-setup@zram0.service 2>/dev/null || true
+        service_ctl stop systemd-zram-setup@zram0.service 2>/dev/null || true
         run_root rm -f /etc/systemd/zram-generator.conf
-        run_root systemctl daemon-reload
+        service_ctl daemon-reload
       else
         echo -e "${C_YELLOW}zram was configured by your OS by default; leaving OS zram intact.${C_RESET}"
       fi
@@ -594,16 +596,16 @@ revert_zram_swap() {
       if service_installed strata-zram.service; then
         remove_service strata-zram.service
       elif unit_exists zramswap.service; then
-        run_root systemctl disable --now zramswap.service 2>/dev/null || true
+        service_ctl disable-now zramswap.service 2>/dev/null || true
         [[ -f /etc/default/zramswap.bak.strata-setup ]] && run_root mv -f /etc/default/zramswap.bak.strata-setup /etc/default/zramswap
       elif unit_exists zram-config.service; then
-        run_root systemctl disable --now zram-config.service 2>/dev/null || true
+        service_ctl disable-now zram-config.service 2>/dev/null || true
       else
         echo -e "${C_YELLOW}zram was configured by your OS by default; leaving OS zram intact.${C_RESET}"
       fi
       ;;
   esac
-  [[ -f /etc/sysctl.d/99-strata-swappiness.conf ]] && write_swappiness_conf
+  [[ -f "$(strata_sysctl_dir)/99-strata-swappiness.conf" ]] && write_swappiness_conf || true
 }
 
 # 12c. IRQ Balance
@@ -613,9 +615,9 @@ status_irq_balance() { unit_enabled irqbalance.service && unit_active irqbalance
 explain_irq_balance() { echo -e "Impact:\n  Distributes NVMe, NIC, and PCIe/GPU interrupts across CPU cores."; }
 apply_irq_balance() {
   command -v irqbalance >/dev/null 2>&1 || prompt_install_deps repo irqbalance || return 0
-  run_root systemctl enable --now irqbalance.service
+  service_ctl enable-now irqbalance.service
 }
-revert_irq_balance() { run_root systemctl disable --now irqbalance.service 2>/dev/null || true; }
+revert_irq_balance() { service_ctl disable-now irqbalance.service 2>/dev/null || true; }
 
 # 12d. NUMA Balancing
 numa_node_count() { echo "${NUMA_NODES:-1}"; }
@@ -625,6 +627,7 @@ applicable_numa_balancing() {
   (( $(numa_node_count) > 1 || $(cpu_socket_count) > 1 ))
 }
 title_numa_balancing() { echo "Disable Automatic NUMA Balancing ($(cpu_socket_count) socket(s), $(numa_node_count) NUMA nodes, page-migration hygiene)"; }
+check_note_numa_balancing() { echo " (no measured throughput gain on containerised host)"; }
 numa_balancing_managed() { [[ -f "$(strata_sysctl_dir)/99-strata-numa.conf" ]]; }
 status_numa_balancing() {
   [[ -f "$(strata_sysctl_dir)/99-strata-numa.conf" ]] && [[ "$(cat /proc/sys/kernel/numa_balancing 2>/dev/null)" == "0" ]]
@@ -896,7 +899,7 @@ EOF
 }
 apply_tuned_profile() {
   command -v tuned-adm >/dev/null 2>&1 || prompt_install_deps repo tuned || return 0
-  run_root systemctl enable --now tuned.service || return 1
+  service_ctl enable-now tuned.service || return 1
   sleep 1
   if [[ ! -f "$TUNED_MARKER" ]]; then
     tuned-adm active 2>/dev/null | sed -nE 's/^Current active profile: *//p' | run_root tee "$TUNED_MARKER" >/dev/null
@@ -1010,7 +1013,7 @@ apply_numactl_interleave() {
   echo "enabled" | run_root tee "$NUMACTL_MARKER" >/dev/null
   if [[ -f /etc/systemd/system/strata.service ]] && ! grep -q numactl /etc/systemd/system/strata.service; then
     run_root sed -i "s|^ExecStart=|ExecStart=$(command -v numactl) --interleave=all |" /etc/systemd/system/strata.service
-    run_root systemctl daemon-reload
+    service_ctl daemon-reload
     echo -e "${C_YELLOW}Restart strata.service for the interleave policy to take effect.${C_RESET}"
   fi
 }
@@ -1018,7 +1021,7 @@ revert_numactl_interleave() {
   run_root rm -f "$NUMACTL_MARKER"
   if [[ -f /etc/systemd/system/strata.service ]]; then
     run_root sed -i "s|^ExecStart=[^ ]*/numactl --interleave=all |ExecStart=|" /etc/systemd/system/strata.service
-    run_root systemctl daemon-reload
+    service_ctl daemon-reload
   fi
 }
 
@@ -1050,7 +1053,7 @@ revert_hugepages_1g() {
     v="$(kernel_param_value "$n" || true)"
     [[ -n "$v" ]] && rem+=("${n}=${v}")
   done
-  (( ${#rem[@]} > 0 )) && remove_kernel_param "${rem[@]}"
+  (( ${#rem[@]} > 0 )) && remove_kernel_param "${rem[@]}" || true
 }
 
 # 12v. sched_ext scheduler
@@ -1089,13 +1092,13 @@ apply_scx_scheduler() {
 [Service]
 ExecStartPost=-${scxctl_bin} start -s bpfland
 EOF
-    run_root systemctl daemon-reload
-    run_root systemctl enable --now "$u"
+    service_ctl daemon-reload
+    service_ctl enable-now "$u"
     if [[ "$(cat /sys/kernel/sched_ext/state 2>/dev/null)" != "enabled" ]]; then
       run_root "$scxctl_bin" start -s bpfland 2>/dev/null || run_root "$scxctl_bin" switch -s bpfland
     fi
   elif [[ -n "$u" && "$u" != "strata-scx.service" ]]; then
-    run_root systemctl enable --now "$u"
+    service_ctl enable-now "$u"
   elif command -v scx_bpfland >/dev/null 2>&1; then
     local bpfland_bin
     bpfland_bin="$(command -v scx_bpfland)"
@@ -1123,14 +1126,14 @@ revert_scx_scheduler() {
   if [[ -f /etc/systemd/system/scx_loader.service.d/strata.conf ]]; then
     run_root rm -f /etc/systemd/system/scx_loader.service.d/strata.conf
     run_root rmdir /etc/systemd/system/scx_loader.service.d 2>/dev/null || true
-    run_root systemctl daemon-reload
+    service_ctl daemon-reload
   fi
   if service_installed strata-scx.service; then
     remove_service strata-scx.service
   fi
   local u
   u="$(scx_unit 2>/dev/null || true)"
-  [[ -n "$u" ]] && run_root systemctl disable --now "$u" 2>/dev/null || true
+  [[ -n "$u" ]] && service_ctl disable-now "$u" 2>/dev/null || true
 }
 
 # 12w. CPU/Kernel Opt-In Performance Trade-offs

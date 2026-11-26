@@ -53,7 +53,17 @@ revert_amd_gpu_perf() {
   run_root sh -c 'w=0; for f in /sys/class/drm/card*/device/power_dpm_force_performance_level; do [ -w "$f" ] && echo auto > "$f" 2>/dev/null && w=1; done; if [ "$w" -eq 0 ]; then if command -v amd-smi >/dev/null 2>&1; then amd-smi set --perf-level auto >/dev/null 2>&1 || true; elif command -v rocm-smi >/dev/null 2>&1; then rocm-smi --setperflevel auto >/dev/null 2>&1 || true; fi; fi; true' 2>/dev/null || true
 }
 
-# 11d. NVIDIA Volta (V100 / sm_70) Strata Decode Table
+# 12j. AMD APU Unified Memory Limit
+amd_apu_gtt_pages() {
+  local kb reserve pages
+  kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || true)"
+  [[ "$kb" =~ ^[0-9]+$ ]] || kb=0
+  reserve=$((4 * 1048576))
+  (( kb / 8 > reserve )) && reserve=$((kb / 8))
+  pages=$(( (kb - reserve) / 4 ))
+  (( pages < 0 )) && pages=0
+  echo "$pages"
+}
 
 applicable_amd_apu_memory() {
   [[ "$HAS_AMD" == true && "$HAS_AMD_APU" == true ]] || return 1
@@ -76,6 +86,10 @@ EOF
 apply_amd_apu_memory() {
   local pages
   pages="$(amd_apu_gtt_pages)"
+  if ! [[ "$pages" =~ ^[0-9]+$ ]] || (( pages <= 0 )); then
+    echo -e "${C_YELLOW}System RAM is too small to raise ttm.pages_limit safely.${C_RESET}"
+    return 1
+  fi
   add_kernel_param "ttm.pages_limit=${pages}" "ttm.page_pool_size=${pages}"
 }
 revert_amd_apu_memory() {
@@ -85,7 +99,7 @@ revert_amd_apu_memory() {
     v="$(kernel_param_value "$n" || true)"
     [[ -n "$v" ]] && rem+=("${n}=${v}")
   done
-  (( ${#rem[@]} > 0 )) && remove_kernel_param "${rem[@]}"
+  (( ${#rem[@]} > 0 )) && remove_kernel_param "${rem[@]}" || true
 }
 
 # 12j2. AMD Radeon 780M/760M MES Reset Workaround (gfx1103)
@@ -105,8 +119,6 @@ EOF
 }
 apply_amd_cwsr_disable() { add_kernel_param "amdgpu.cwsr_enable=0"; }
 revert_amd_cwsr_disable() { remove_kernel_param "amdgpu.cwsr_enable=0"; }
-
-# 12k. NVMe Tuning
 
 applicable_ryzenadj_tdp() {
   service_installed strata-ryzenadj.service && return 0
@@ -336,7 +348,7 @@ After=multi-user.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c 'for d in /sys/class/drm/card*/device; do [ -r "$d/pp_power_profile_mode" ] || continue; idx=$(awk "/COMPUTE/ {gsub(/[^0-9]/,\"\",\$1); if (\$1 ~ /^[0-9]+$/) {print \$1; exit}}" "$d/pp_power_profile_mode"); [ -n "$idx" ] || continue; [ -w "$d/power_dpm_force_performance_level" ] && echo manual > "$d/power_dpm_force_performance_level" 2>/dev/null || true; [ -w "$d/pp_power_profile_mode" ] && echo "$idx" > "$d/pp_power_profile_mode" 2>/dev/null || true; done; true'
+ExecStart=/bin/sh -c 'for d in /sys/class/drm/card*/device; do [ -r "$d/pp_power_profile_mode" ] || continue; line=$(grep -m1 COMPUTE "$d/pp_power_profile_mode" 2>/dev/null || true); set -- $(printf "%s" "$line" | tr -cs "0-9" " "); idx="${1:-}"; [ -n "$idx" ] || continue; [ -w "$d/power_dpm_force_performance_level" ] && echo manual > "$d/power_dpm_force_performance_level" 2>/dev/null || true; [ -w "$d/pp_power_profile_mode" ] && echo "$idx" > "$d/pp_power_profile_mode" 2>/dev/null || true; done'
 ExecStop=/bin/sh -c 'for d in /sys/class/drm/card*/device; do [ -w "$d/pp_power_profile_mode" ] && echo 0 > "$d/pp_power_profile_mode" 2>/dev/null || true; [ -w "$d/power_dpm_force_performance_level" ] && echo auto > "$d/power_dpm_force_performance_level" 2>/dev/null || true; done; true'
 
 [Install]

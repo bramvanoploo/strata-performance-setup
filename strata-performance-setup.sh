@@ -158,11 +158,18 @@ STRATA_UPDATE_AVAILABLE=false STRATA_UPDATE_SUMMARY="" STRATA_UPDATE_CACHE_FILE=
 UNIT_FILES_CACHE=""
 declare -A PKG_AVAIL_CACHE PKG_INST_CACHE
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT_VERSION="1.9.6"
+SCRIPT_VERSION="1.9.7"
 PLUGIN_BASE_URL="${STRATA_PLUGIN_BASE_URL:-https://raw.githubusercontent.com/bramvanoploo/strata-performance-setup/main}"
-PLUGIN_CACHE_DIR="${STRATA_PLUGIN_CACHE_DIR:-${XDG_CACHE_HOME:-$TARGET_HOME/.cache}/strata-performance-setup/plugins}"
+if [[ -n "${STRATA_PLUGIN_CACHE_DIR:-}" ]]; then
+  PLUGIN_CACHE_DIR="$STRATA_PLUGIN_CACHE_DIR"
+elif [[ $EUID -eq 0 ]]; then
+  PLUGIN_CACHE_DIR="/var/cache/strata-performance-setup/plugins"
+else
+  PLUGIN_CACHE_DIR="${XDG_CACHE_HOME:-$TARGET_HOME/.cache}/strata-performance-setup/plugins"
+fi
 NO_PLUGINS=false
 REGISTRY_FETCHED=false
+REGISTRY_FILE_PATH=""
 declare -a REQUESTED_HOST_PLUGINS=() LOADED_HOST_PLUGINS=() LOADED_TWEAK_PACKS=() AVAILABLE_HOST_PLUGINS=("strata")
 declare -A HOST_PLUGIN_LOADED=() TWEAK_PACK_LOADED=()
 declare -A HOST_PLUGIN_NAMES=([strata]="Strata")
@@ -219,7 +226,7 @@ run_as_user() {
     elif command -v runuser >/dev/null 2>&1; then
       runuser -u "$TARGET_USER" -- bash -c "${env_prefix}$*"
     else
-      su - "$TARGET_USER" -c "${env_prefix}$*"
+      su -s /bin/bash - "$TARGET_USER" -c "${env_prefix}$*"
     fi
   else
     bash -c "${env_prefix}$*"
@@ -229,11 +236,11 @@ run_as_user() {
 # Argument-safe execution as TARGET_USER without extra shell interpolation.
 run_as_user_exec() {
   local -a env_args=() env_cmd=() _rt_env=()
-  [[ -n "${STRATA_API_KEY:-}" ]] && env_args+=("STRATA_API_KEY=${STRATA_API_KEY}")
   _fill_strata_runtime_env_array _rt_env
   (( ${#_rt_env[@]} > 0 )) && env_args+=("${_rt_env[@]}")
-  (( ${#env_args[@]} > 0 )) && env_cmd=(env "${env_args[@]}")
   if [[ $EUID -eq 0 && "$TARGET_USER" != "root" ]]; then
+    [[ -n "${STRATA_API_KEY:-}" ]] && env_args+=("STRATA_API_KEY=${STRATA_API_KEY}")
+    (( ${#env_args[@]} > 0 )) && env_cmd=(env "${env_args[@]}")
     if [[ "$IS_MACOS" == true ]]; then
       sudo -u "$TARGET_USER" -H -- env "PATH=${TARGET_HOME}/.local/bin:${PATH}" ${env_args[@]+"${env_args[@]}"} "$@"
     elif command -v runuser >/dev/null 2>&1; then
@@ -241,9 +248,10 @@ run_as_user_exec() {
     else
       local cmd=""
       printf -v cmd '%q ' ${env_cmd[@]+"${env_cmd[@]}"} "$@"
-      su - "$TARGET_USER" -c "$cmd"
+      su -s /bin/bash - "$TARGET_USER" -c "$cmd"
     fi
   else
+    (( ${#env_args[@]} > 0 )) && env_cmd=(env "${env_args[@]}")
     ${env_cmd[@]+"${env_cmd[@]}"} "$@"
   fi
 }
@@ -262,17 +270,25 @@ unit_exists() {
 }
 
 _launchd_meta() {
-  local unit="$1" name="${1%.service}" scope="system" label="" plist="" runner="" short=""
+  local unit="$1" svc_user="${2:-}" name="${1%.service}" scope="system" label="" plist="" runner="" short=""
+  local user_dir="${STRATA_LAUNCHD_USER_DIR:-$TARGET_HOME/Library/LaunchAgents}"
+  local user_bin="${STRATA_LAUNCHD_USER_BIN_DIR:-$TARGET_HOME/.local/share/strata-performance-setup}"
   if [[ "$unit" == "strata.service" ]]; then
     scope="user"
     label="com.strata.server"
-    plist="${STRATA_LAUNCHD_USER_DIR:-$TARGET_HOME/Library/LaunchAgents}/${label}.plist"
-    runner="${STRATA_LAUNCHD_USER_BIN_DIR:-$TARGET_HOME/.local/share/strata-performance-setup}/strata-server-ctl.sh"
+    plist="${user_dir}/${label}.plist"
+    runner="${user_bin}/strata-server-ctl.sh"
   else
     short="${name#strata-}"
     label="com.strata.${short}"
-    plist="${STRATA_LAUNCHD_SYS_DIR:-/Library/LaunchDaemons}/${label}.plist"
-    runner="${STRATA_LAUNCHD_SYS_BIN_DIR:-$MACOS_SUPPORT_DIR}/${name}.sh"
+    if [[ ( -n "$svc_user" && "$svc_user" != "root" ) || -f "${user_dir}/${label}.plist" ]]; then
+      scope="user"
+      plist="${user_dir}/${label}.plist"
+      runner="${user_bin}/${name}.sh"
+    else
+      plist="${STRATA_LAUNCHD_SYS_DIR:-/Library/LaunchDaemons}/${label}.plist"
+      runner="${STRATA_LAUNCHD_SYS_BIN_DIR:-$MACOS_SUPPORT_DIR}/${name}.sh"
+    fi
   fi
   printf '%s|%s|%s|%s\n' "$scope" "$label" "$plist" "$runner"
 }
@@ -344,11 +360,21 @@ unit_active() {
 }
 
 service_ctl() {
-  local action="$1" unit="$2"
+  local action="$1" unit="${2:-}"
   [[ "${CHECK_ONLY:-false}" == true ]] && return 1
   if [[ "$HAS_SYSTEMD" == true ]]; then
-    run_root systemctl "$action" "$unit"
+    case "$action" in
+      daemon-reload) run_root systemctl daemon-reload ;;
+      enable-now)    run_root systemctl enable --now "$unit" ;;
+      disable-now)   run_root systemctl disable --now "$unit" ;;
+      *)             run_root systemctl "$action" "$unit" ;;
+    esac
   elif [[ "$HAS_LAUNCHD" == true ]]; then
+    [[ "$action" == "daemon-reload" ]] && return 0
+    case "$action" in
+      enable-now)  action="start" ;;
+      disable-now) action="stop" ;;
+    esac
     local _sc _lb _pl _rn
     IFS='|' read -r _sc _lb _pl _rn <<< "$(_launchd_meta "$unit")"
     [[ -f "$_pl" ]] || return 1
@@ -396,10 +422,22 @@ service_ctl() {
       esac
     fi
   else
+    [[ "$action" == "daemon-reload" ]] && return 0
+    local rc_action="$action"
+    case "$action" in
+      enable-now)  rc_action="start" ;;
+      disable-now) rc_action="stop" ;;
+    esac
     local rc_script
     rc_script="$(resolve_rc_script "$unit")" || return 1
-    run_root sh "$rc_script" "$action"
+    run_root sh "$rc_script" "$rc_action"
   fi
+}
+
+_boot_hook_has_tag() {
+  local file="$1" tag="$2"
+  [[ -f "$file" ]] || return 1
+  awk -v t="$tag" 'length($0) >= length(t) && substr($0, length($0)-length(t)+1) == t {f=1; exit} END {exit !f}' "$file"
 }
 
 add_boot_hook() {
@@ -407,10 +445,10 @@ add_boot_hook() {
   if [[ ! -f "$file" ]]; then
     printf '%s\n' "$shebang" | run_root tee "$file" >/dev/null
   fi
-  if [[ -f "$file" ]] && grep -qF "$tag" "$file" 2>/dev/null && ! grep -qxF "$hook" "$file" 2>/dev/null; then
+  if _boot_hook_has_tag "$file" "$tag" && ! grep -qxF "$hook" "$file" 2>/dev/null; then
     remove_boot_hook "$file" "$tag"
   fi
-  if ! grep -qF "$tag" "$file" 2>/dev/null; then
+  if ! _boot_hook_has_tag "$file" "$tag"; then
     [[ -s "$file" && -n "$(tail -c1 "$file" 2>/dev/null)" ]] && printf '\n' | run_root tee -a "$file" >/dev/null
     printf '%s\n' "$hook" | run_root tee -a "$file" >/dev/null
   fi
@@ -418,8 +456,8 @@ add_boot_hook() {
 
 remove_boot_hook() {
   local file="$1" tag="$2" tmp
-  [[ -f "$file" ]] && grep -qF "$tag" "$file" 2>/dev/null || return 0
-  if tmp="$(awk -v t="$tag" 'index($0, t) == 0 {print}' "$file")"; then
+  _boot_hook_has_tag "$file" "$tag" || return 0
+  if tmp="$(awk -v t="$tag" '!(length($0) >= length(t) && substr($0, length($0)-length(t)+1) == t) {print}' "$file")"; then
     if [[ -n "$tmp" ]]; then
       printf '%s\n' "$tmp" | run_root tee "$file" >/dev/null
     else
@@ -440,7 +478,7 @@ install_service() {
   fi
 
   local name="${unit%.service}"
-  local content env_cmds="" start_cmds="" stop_cmds="" work_dir="" svc_user="" limit_memlock="" line cmd ignore_err ev ek evv
+  local content env_cmds="" start_cmds="" stop_cmds="" work_dir="" svc_user="" svc_type="" limit_memlock="" line cmd ignore_err ev ek evv
   content="$(cat)"
   while IFS= read -r line; do
     if [[ "$line" =~ ^Environment=(.*)$ ]]; then
@@ -460,6 +498,8 @@ install_service() {
       work_dir="${BASH_REMATCH[1]}"
     elif [[ "$line" =~ ^User=(.*)$ ]]; then
       svc_user="${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ ^Type=(.*)$ ]]; then
+      svc_type="${BASH_REMATCH[1]}"
     elif [[ "$line" =~ ^LimitMEMLOCK=(.*)$ ]]; then
       limit_memlock="${BASH_REMATCH[1]}"
     elif [[ "$line" =~ ^ExecStart=(.*)$ ]]; then
@@ -476,12 +516,19 @@ install_service() {
   done <<< "$content"
 
   if [[ "$HAS_LAUNCHD" == true ]]; then
-    local scope label plist runner work_dir_line="" dyn_env_line="" runner_content plist_content
-    IFS='|' read -r scope label plist runner <<< "$(_launchd_meta "$unit")"
-    if [[ "$scope" == "user" && -n "${MACOS_METAL_ENV_SH:-}" ]]; then
-      local me_sq
-      me_sq="$(printf "%s" "$MACOS_METAL_ENV_SH" | sed "s/'/'\\\\''/g")"
-      dyn_env_line="[ -r '${me_sq}' ] && . '${me_sq}'"$'\n'
+    local scope label plist runner work_dir_line="" dyn_env_line="" path_line="" runner_content plist_content
+    IFS='|' read -r scope label plist runner <<< "$(_launchd_meta "$unit" "$svc_user")"
+    if [[ "$scope" == "user" ]]; then
+      local th_sq
+      th_sq="$(printf "%s" "$TARGET_HOME" | sed "s/'/'\\\\''/g")"
+      path_line="export PATH='${th_sq}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin':\"\${PATH:-}\""
+      if [[ -n "${MACOS_METAL_ENV_SH:-}" ]]; then
+        local me_sq
+        me_sq="$(printf "%s" "$MACOS_METAL_ENV_SH" | sed "s/'/'\\\\''/g")"
+        dyn_env_line="[ -r '${me_sq}' ] && . '${me_sq}'"$'\n'
+      fi
+    else
+      path_line='export PATH="/usr/sbin:/usr/bin:/sbin:/bin"'
     fi
     if [[ -n "$work_dir" ]]; then
       local wd_sq
@@ -490,7 +537,7 @@ install_service() {
     fi
     runner_content="#!/bin/sh
 # Managed by strata-performance-setup (${unit})
-export PATH=\"${TARGET_HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:\${PATH:-}\"
+${path_line}
 ${env_cmds}${dyn_env_line}${work_dir_line}case \"\$1\" in
   start)
 ${start_cmds:-    :}
@@ -575,6 +622,13 @@ ${extra_plist}</dict>
   local rc_dir="${STRATA_RC_DIR:-/etc/rc.d}"
   local rc_script="${rc_dir}/rc.strata.${name}"
   local rc_work_line="" rc_memlock_line="" rc_start_body="${start_cmds:-    :}" rc_stop_body="${stop_cmds:-    :}"
+  if [[ "$svc_type" == "simple" && -n "$start_cmds" && -z "$stop_cmds" ]]; then
+    local pid_file="/var/run/strata-${name}.pid"
+    local _bg_cmd="${start_cmds#"${start_cmds%%[![:space:]]*}"}"
+    _bg_cmd="${_bg_cmd%$'\n'}"
+    rc_start_body="    nohup sh -c '${_bg_cmd//\'/\'\\\'\'}' >/var/log/strata-${name}.log 2>&1 </dev/null & echo \$! > '${pid_file}'"$'\n'
+    rc_stop_body="    [ -f '${pid_file}' ] && kill \$(cat '${pid_file}') 2>/dev/null || true; rm -f '${pid_file}'"$'\n'
+  fi
   if [[ -n "$work_dir" ]]; then
     local rc_wd_sq
     rc_wd_sq="$(printf "%s" "$work_dir" | sed "s/'/'\\\\''/g")"
@@ -584,7 +638,7 @@ ${extra_plist}</dict>
     rc_memlock_line="ulimit -l unlimited 2>/dev/null || true"$'\n'
   fi
   if [[ -n "$svc_user" && "$svc_user" != "root" ]]; then
-    local rc_u_sq rc_home_sq rc_start_sq rc_stop_sq
+    local rc_u_sq rc_home_sq
     rc_u_sq="$(printf "%s" "$svc_user" | sed "s/'/'\\\\''/g")"
     rc_home_sq="$(printf "%s" "${work_dir:-$TARGET_HOME}" | sed "s/'/'\\\\''/g")"
     _rc_wrap_user() {
@@ -622,17 +676,20 @@ EOF
   run_root chmod +x "$rc_script"
   if [[ "$IS_UNRAID" == true && -d /boot/config ]]; then
     # Unraid's rootfs lives in RAM; persist scripts on the USB flash drive via /boot/config/go
-    local flash_dir="/boot/config/strata" flash_script="/boot/config/strata/rc.strata.${name}"
+    local flash_dir="/boot/config/strata" flash_script="/boot/config/strata/rc.strata.${name}" flash_sq
+    flash_sq="$(printf "%s" "$flash_script" | sed "s/'/'\\\\''/g")"
     run_root mkdir -p "$flash_dir"
     run_root cp "$rc_script" "$flash_script"
     run_root chmod +x "$flash_script" 2>/dev/null || true
-    add_boot_hook "/boot/config/go" "# strata:${name}" "[ -f ${flash_script} ] && sh ${flash_script} start # strata:${name}" "#!/bin/bash"
+    add_boot_hook "/boot/config/go" "# strata:${name}" "[ -f '${flash_sq}' ] && sh '${flash_sq}' start # strata:${name}" "#!/bin/bash"
   elif [[ "$IS_SYNOLOGY" == true && -d /usr/local/etc/rc.d ]]; then
     local syno_script="/usr/local/etc/rc.d/strata-${name}.sh"
     run_root cp "$rc_script" "$syno_script"
     run_root chmod +x "$syno_script"
   else
-    add_boot_hook "${rc_dir}/rc.local" "# strata:${name}" "[ -x ${rc_script} ] && ${rc_script} start # strata:${name}" "#!/bin/sh"
+    local rc_sq
+    rc_sq="$(printf "%s" "$rc_script" | sed "s/'/'\\\\''/g")"
+    add_boot_hook "${rc_dir}/rc.local" "# strata:${name}" "[ -x '${rc_sq}' ] && '${rc_sq}' start # strata:${name}" "#!/bin/sh"
     run_root chmod +x "${rc_dir}/rc.local"
   fi
   run_root "$rc_script" start
@@ -675,7 +732,8 @@ remove_service() {
 }
 
 pkg_installed() {
-  local pkg="$1" rc=1
+  local pkg="${1:-}" rc=1
+  [[ -n "$pkg" ]] || return 1
   [[ -n "${PKG_INST_CACHE[$pkg]+x}" ]] && return "${PKG_INST_CACHE[$pkg]}"
   case "$DISTRO_FAMILY" in
     arch)      pacman -Qi "$pkg" >/dev/null 2>&1 && rc=0 ;;
@@ -886,7 +944,8 @@ for ln in txt.splitlines(True):
     if nl != ln:
         nl = re.sub(r' {2,}', ' ', nl)
         nl = re.sub(r'=(["\']) ', r'=\1', nl)
-        nl = re.sub(r' (["\'])(?=\s|$)', r'\1', nl)
+        nl = re.sub(r'^(?P<head>"[^"]*"[ \t]+)" ', r'\g<head>"', nl)
+        nl = re.sub(r'(?<=\S) (["\'])(?=\s|$)', r'\1', nl)
     out.append(nl)
 new_txt = ''.join(out)
 if new_txt != txt:
@@ -896,7 +955,7 @@ PYEOF
   else
     local esc
     esc="$(printf '%s' "$param" | sed 's/[.[\*^$()+?{|/\\]/\\&/g')"
-    run_root sed -i -E "/^[[:space:]]*#/!{s/(^|[[:space:]\"'])${esc}([[:space:]\"']|\$)/\1\2/g; s/  +/ /g; s/=\" /=\"/g; s/ \"/\"/g}" "$file"
+    run_root sed -i -E "/^[[:space:]]*#/!{s/(^|[[:space:]\"'])${esc}([[:space:]\"']|\$)/\1\2/g; s/  +/ /g; s/=\" /=\"/g; s/ \"$/\"/}" "$file"
   fi
 }
 
@@ -1327,9 +1386,9 @@ _docker_ro() {
     _to=(gtimeout 3)
   fi
   if [[ $EUID -eq 0 || ( -r /var/run/docker.sock && -w /var/run/docker.sock ) ]]; then
-    "${_to[@]}" docker "$@" 2>/dev/null
+    ${_to[@]+"${_to[@]}"} docker "$@" 2>/dev/null
   elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
-    sudo -n "${_to[@]}" docker "$@" 2>/dev/null
+    sudo -n ${_to[@]+"${_to[@]}"} docker "$@" 2>/dev/null
   else
     return 1
   fi
@@ -2161,9 +2220,6 @@ detect_environment() {
         pl_ok=false
         if [[ -n "$g_mx" && "$g_mx" -gt 0 ]] && { [[ -n "$g_def" && "$g_mx" -gt "$g_def" ]] || [[ "$cap_installed" == false && -n "$g_cur" && "$g_cur" -lt "$g_mx" ]]; } && ! grep -qiE "Laptop GPU|Mobile|Max-Q" <<<"$g_name"; then
           pl_ok=true
-          if [[ "${CHECK_ONLY:-false}" == false && $EUID -eq 0 ]] && [[ -n "$g_cur" ]] && grep -qi "not supported" <<<"$(nvidia-smi -i "$g_idx" -pl "$g_cur" 2>&1 || true)"; then
-            pl_ok=false
-          fi
         fi
         NVIDIA_GPU_INDICES+=("$g_idx")
         NVIDIA_GPU_NAMES+=("$g_name")
@@ -2995,8 +3051,16 @@ _sha256_file() {
   fi
 }
 
+_valid_plugin_id() {
+  [[ -n "${1:-}" && "$1" =~ ^[a-z0-9_-]+$ ]]
+}
+
 _fetch_url() {
   local url="$1" dest="$2"
+  case "$url" in
+    https://*|http://*|file://*) ;;
+    *) return 1 ;;
+  esac
   if command -v curl >/dev/null 2>&1; then
     curl -fsSL "$url" -o "$dest" 2>/dev/null
   elif command -v wget >/dev/null 2>&1; then
@@ -3006,24 +3070,41 @@ _fetch_url() {
   fi
 }
 
-_registry_file() {
+_ensure_registry_file() {
   local local_reg="${SCRIPT_DIR}/plugins/registry.tsv"
   if [[ -f "$local_reg" ]]; then
-    echo "$local_reg"
+    REGISTRY_FILE_PATH="$local_reg"
+    REGISTRY_FETCHED=true
     return 0
   fi
   local cached_reg="${PLUGIN_CACHE_DIR}/registry.tsv"
-  if [[ "$REGISTRY_FETCHED" != true ]]; then
+  local now_s reg_mtime
+  now_s="$(date +%s 2>/dev/null || echo 0)"
+  reg_mtime="$(file_mtime "$cached_reg")"
+  if [[ "$REGISTRY_FETCHED" != true ]] && { [[ ! -f "$cached_reg" ]] || (( now_s - reg_mtime > 60 )); }; then
     REGISTRY_FETCHED=true
-    mkdir -p "$PLUGIN_CACHE_DIR" 2>/dev/null || true
-    local tmp_reg="${cached_reg}.tmp.$$"
+    if [[ $EUID -eq 0 ]]; then
+      mkdir -p -m 0700 "$PLUGIN_CACHE_DIR" 2>/dev/null || true
+    else
+      mkdir -p "$PLUGIN_CACHE_DIR" 2>/dev/null || true
+    fi
+    local tmp_reg="${cached_reg}.tmp.${BASHPID:-$$}"
     if _fetch_url "${PLUGIN_BASE_URL}/plugins/registry.tsv" "$tmp_reg"; then
       mv -f "$tmp_reg" "$cached_reg" 2>/dev/null || rm -f "$tmp_reg"
     else
       rm -f "$tmp_reg"
     fi
   fi
-  [[ -f "$cached_reg" ]] && echo "$cached_reg"
+  [[ -f "$cached_reg" ]] && REGISTRY_FILE_PATH="$cached_reg"
+}
+
+_registry_file() {
+  if [[ -n "${REGISTRY_FILE_PATH:-}" && -f "$REGISTRY_FILE_PATH" ]]; then
+    echo "$REGISTRY_FILE_PATH"
+    return 0
+  fi
+  _ensure_registry_file
+  [[ -n "${REGISTRY_FILE_PATH:-}" && -f "$REGISTRY_FILE_PATH" ]] && echo "$REGISTRY_FILE_PATH"
 }
 
 _registry_sha256() {
@@ -3034,6 +3115,7 @@ _registry_sha256() {
 }
 
 _host_plugin_supported() {
+  [[ "${LIST_PLUGINS:-false}" == true ]] && return 0
   local plat="${1:-all}"
   case "$plat" in
     ""|all) return 0 ;;
@@ -3048,37 +3130,40 @@ _host_plugin_supported() {
 
 discover_host_plugins() {
   local f id name desc plat reg=""
+  _ensure_registry_file
   if [[ -d "${SCRIPT_DIR}/plugins/hosts" ]]; then
     for f in "${SCRIPT_DIR}/plugins/hosts/"*.sh; do
       [[ -f "$f" ]] || continue
       id="$(basename "$f" .sh)"
       [[ "$id" == _* ]] && continue
-      plat="$(awk -F': ' '/^# PLUGIN_PLATFORMS:/ {print $2; exit}' "$f" 2>/dev/null || true)"
+      _valid_plugin_id "$id" || continue
+      plat="$(sed -n 's/^# PLUGIN_PLATFORMS:[[:space:]]*//p; /^# PLUGIN_PLATFORMS:/q' "$f" 2>/dev/null || true)"
       _host_plugin_supported "${plat:-all}" || continue
       if ! _array_contains_val "$id" "${AVAILABLE_HOST_PLUGINS[@]}"; then
         AVAILABLE_HOST_PLUGINS+=("$id")
       fi
       if [[ -z "${HOST_PLUGIN_NAMES[$id]:-}" ]]; then
-        name="$(awk -F': ' '/^# PLUGIN_NAME:/ {print $2; exit}' "$f" 2>/dev/null || true)"
+        name="$(sed -n 's/^# PLUGIN_NAME:[[:space:]]*//p; /^# PLUGIN_NAME:/q' "$f" 2>/dev/null || true)"
         HOST_PLUGIN_NAMES[$id]="${name:-$id}"
       fi
       if [[ -z "${HOST_PLUGIN_DESCS[$id]:-}" ]]; then
-        desc="$(awk -F': ' '/^# PLUGIN_DESC:/ {print $2; exit}' "$f" 2>/dev/null || true)"
+        desc="$(sed -n 's/^# PLUGIN_DESC:[[:space:]]*//p; /^# PLUGIN_DESC:/q' "$f" 2>/dev/null || true)"
         HOST_PLUGIN_DESCS[$id]="${desc:-LLM host plugin}"
       fi
     done
   fi
   reg="$(_registry_file || true)"
   if [[ -n "$reg" && -f "$reg" ]]; then
-    while IFS=$'\t' read -r cat pid pname pdesc _pfile _psha pplat; do
-      [[ "$cat" == "hosts" && -n "$pid" && "$pid" != _* ]] || continue
+    local pid pname pdesc pplat
+    while IFS=$'\037' read -r pid pname pdesc pplat; do
+      _valid_plugin_id "$pid" || continue
       _host_plugin_supported "${pplat:-all}" || continue
       if ! _array_contains_val "$pid" "${AVAILABLE_HOST_PLUGINS[@]}"; then
         AVAILABLE_HOST_PLUGINS+=("$pid")
       fi
       [[ -n "$pname" ]] && HOST_PLUGIN_NAMES[$pid]="$pname"
       [[ -n "$pdesc" ]] && HOST_PLUGIN_DESCS[$pid]="$pdesc"
-    done < "$reg"
+    done < <(awk -F'\t' '$1=="hosts" && $2!="" && $2!~/^_/ {print $2 "\037" $3 "\037" $4 "\037" $7}' "$reg")
   fi
 }
 
@@ -3139,6 +3224,11 @@ _FETCHED_PLUGIN_FILE=""
 
 _fetch_verified_plugin() {
   local category="$1" id="$2"
+  if [[ "$category" != "hosts" && "$category" != "tweaks" ]] || ! _valid_plugin_id "$id"; then
+    echo -e "${C_RED}Invalid plugin identifier '${category}/${id}' — refusing to load.${C_RESET}" >&2
+    return 1
+  fi
+  _ensure_registry_file
   local local_file="${SCRIPT_DIR}/plugins/${category}/${id}.sh"
   local cache_file="${PLUGIN_CACHE_DIR}/${category}/${id}.sh"
   local target_file="" expected_sha="" actual_sha=""
@@ -3154,8 +3244,12 @@ _fetch_verified_plugin() {
     [[ "$actual_sha" == "$expected_sha" ]] && target_file="$cache_file"
   fi
   if [[ -z "$target_file" ]]; then
-    mkdir -p "${PLUGIN_CACHE_DIR}/${category}" 2>/dev/null || return 1
-    local tmp_file="${cache_file}.tmp.$$"
+    if [[ $EUID -eq 0 ]]; then
+      mkdir -p -m 0700 "${PLUGIN_CACHE_DIR}/${category}" 2>/dev/null || return 1
+    else
+      mkdir -p "${PLUGIN_CACHE_DIR}/${category}" 2>/dev/null || return 1
+    fi
+    local tmp_file="${cache_file}.tmp.${BASHPID:-$$}"
     if ! _fetch_url "${PLUGIN_BASE_URL}/plugins/${category}/${id}.sh" "$tmp_file"; then
       rm -f "$tmp_file"
       return 1
@@ -3259,7 +3353,7 @@ load_all_local_plugins() {
 run_host_hook() {
   local hook="$1"; shift
   local pid
-  for pid in "${LOADED_HOST_PLUGINS[@]}"; do
+  for pid in ${LOADED_HOST_PLUGINS[@]+"${LOADED_HOST_PLUGINS[@]}"}; do
     if declare -F "${pid}_${hook}" >/dev/null 2>&1; then
       "${pid}_${hook}" "$@"
     fi
@@ -3275,7 +3369,7 @@ declare -A STEP_GAIN_PTS=()
 
 build_active_steps() {
   local step candidates=() pts os_scope
-  for step in "${ALL_STEPS[@]}"; do
+  for step in ${ALL_STEPS[@]+"${ALL_STEPS[@]}"}; do
     os_scope="${STEP_OS[$step]:-linux}"
     if [[ "$IS_MACOS" == true ]]; then
       [[ "$os_scope" == "macos" || "$os_scope" == "both" ]] || continue
@@ -3291,7 +3385,7 @@ build_active_steps() {
   done
   ACTIVE_STEPS=()
   for (( pts = 5; pts >= 1; pts-- )); do
-    for step in "${candidates[@]}"; do
+    for step in ${candidates[@]+"${candidates[@]}"}; do
       (( ${STEP_GAIN_PTS[$step]:-1} == pts )) && ACTIVE_STEPS+=("$step") || true
     done
   done
@@ -3367,7 +3461,7 @@ run_recommended_batch() {
     [[ "$has_exp_ex" == true ]] && batch_excl+=("experimental options ([EXP])")
     batch_excl+=("prevent sleep" "GPU high-idle-clock/persistence" "platform & vendor performance profiles" "Strata setup")
   else
-    [[ "$has_warn_ex" == true ]] && batch_excl+=("high-idle-power options ([!]: CPU Performance, PCIe ASPM, CPU C-State Limit, NVIDIA Clock Lock, tuned profile)")
+    [[ "$has_warn_ex" == true ]] && batch_excl+=("high-idle-power options ([!])")
     [[ "$has_opt_ex" == true ]] && batch_excl+=("opt-in trade-offs ([OPT])")
     [[ "$has_exp_ex" == true ]] && batch_excl+=("experimental options ([EXP])")
     batch_excl+=("Strata setup")
@@ -3435,8 +3529,7 @@ run_recommended_batch() {
   fi
 
   for step in "${targets[@]}"; do
-    if [[ "$mode" == "apply" && "$step" == "nvidia_power_limit" ]] && status_nvidia_power_cap && [[ "$revert_out_of_scope" == false ]]; then
-      echo -e "\n${C_YELLOW}Skipping NVIDIA Persistent Max GPU Power Limit because NVIDIA Thermal Power Cap ([OPT]) was kept active.${C_RESET}"
+    if [[ "$mode" == "apply" ]] && declare -F "batch_skip_${step}" >/dev/null 2>&1 && "batch_skip_${step}" "$revert_out_of_scope"; then
       continue
     fi
     echo -e "\n${C_BOLD}${C_CYAN}>>> ${prompt_verb}ing: $("title_${step}")${C_RESET}"
@@ -3639,7 +3732,7 @@ start_bench_power_sampler() {
           gpu_sum="$(awk -v a="$gpu_sum" -v b="$gw" 'BEGIN{printf "%.2f", a + b}')"
           ((gpu_n++))
         fi
-        if [[ "$IS_JETSON" == true ]]; then
+        if [[ "$IS_JETSON" == true ]] && declare -F read_jetson_ina3221_watts >/dev/null 2>&1; then
           local j_sw="" j_gw="" j_cw=""
           IFS='|' read -r j_sw j_gw j_cw <<< "$(read_jetson_ina3221_watts)"
           if [[ "$has_g" == false && -n "$j_gw" ]]; then
@@ -3684,7 +3777,7 @@ start_bench_power_sampler() {
         fi
 
         ((n++))
-        (sleep 0.25 2>/dev/null || sleep 1) &
+        sleep 1 &
         wait $! 2>/dev/null || true
       done
     fi
@@ -3889,7 +3982,12 @@ if libc.host_statistics(libc.mach_host_self(), 3, ctypes.byref(i), ctypes.byref(
         local wl_mb cap_gib
         wl_mb="${STRATA_MACOS_WIRED_LIMIT_MB:-${MACOS_WIRED_LIMIT_MB:-}}"
         if ! [[ "$wl_mb" =~ ^[0-9]+$ ]]; then
-          wl_mb="$(_macos_wired_limit_cur_mb)"
+          if declare -F _macos_wired_limit_cur_mb >/dev/null 2>&1; then
+            wl_mb="$(_macos_wired_limit_cur_mb)"
+          else
+            wl_mb="$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)"
+            [[ "$wl_mb" =~ ^[0-9]+$ ]] || wl_mb=0
+          fi
         fi
         if (( wl_mb > 0 )); then
           cap_gib="$(awk -v m="$wl_mb" 'BEGIN{printf "%.1f", m/1024.0}')"
@@ -4272,7 +4370,7 @@ if libc.host_statistics(libc.mach_host_self(), 3, ctypes.byref(i), ctypes.byref(
       sys_pwr_w="$(_read_sysfs_bat_watts "%.0f" || true)"
     fi
 
-    if [[ "$IS_JETSON" == true ]]; then
+    if [[ "$IS_JETSON" == true ]] && declare -F read_jetson_ina3221_watts >/dev/null 2>&1; then
       local j_sw="" j_gw="" j_cw=""
       IFS='|' read -r j_sw j_gw j_cw <<< "$(read_jetson_ina3221_watts)"
       [[ -n "$j_sw" && -z "$sys_pwr_w" ]] && sys_pwr_w="$(awk -v w="$j_sw" 'BEGIN{printf "%.0f", w}')"
@@ -4408,7 +4506,12 @@ build_sys_info_lines() {
   SYS_INFO_LINES+=("$(printf "GPU(s): %b%s%b" "${C_DIM}" "$GPU_SUMMARY" "${C_RESET}")")
   if [[ "$IS_MACOS" == true && "$IS_APPLE_SILICON" == true ]]; then
     local _mwl _mwl_txt
-    _mwl="$(_macos_wired_limit_cur_mb)"
+    if declare -F _macos_wired_limit_cur_mb >/dev/null 2>&1; then
+      _mwl="$(_macos_wired_limit_cur_mb)"
+    else
+      _mwl="${STRATA_MACOS_WIRED_LIMIT_MB:-$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)}"
+      [[ "$_mwl" =~ ^[0-9]+$ ]] || _mwl=0
+    fi
     if (( _mwl > 0 )); then
       _mwl_txt="$(awk -v m="$_mwl" 'BEGIN{printf "%.1f GiB wired limit (%d MiB)", m/1024.0, m}')"
     else
@@ -4436,7 +4539,7 @@ build_sys_info_lines() {
   if [[ "$HAS_AMD" == true && -n "$AMD_GFX_SUMMARY" ]] && { [[ "$HAS_AMD_PREBUILT_GFX" == true ]] || (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )) || [[ "$HAS_NVIDIA" == false && "$HAS_INTEL_ARC" == false ]]; }; then
     local hip_st="display / non-target iGPU" hip_col="${C_DIM}"
     if (( ${#AMD_MISSING_GFX_ARCHS[@]} > 0 )); then
-      if status_strata_build_hip; then
+      if declare -F status_strata_build_hip >/dev/null 2>&1 && status_strata_build_hip; then
         hip_st="local Strata HIP engine built"
         hip_col="${C_GREEN}"
       elif [[ "$HAS_NVIDIA" == true || "$HAS_AMD_PREBUILT_GFX" == true || "$HAS_INTEL_ARC" == true ]]; then
@@ -4457,7 +4560,7 @@ build_sys_info_lines() {
   append_gpu_pcie_lines
   [[ -n "$IS_VIRT" ]] && SYS_INFO_LINES+=("$(printf "Virt:   %b%s (hardware-specific steps hidden)%b" "${C_DIM}" "$IS_VIRT" "${C_RESET}")")
   local rl pdl
-  for rl in "${RAM_HEALTH_LINES[@]}" "${GPU_TOPO_LINES[@]}"; do [[ -n "$rl" ]] && SYS_INFO_LINES+=("$rl"); done
+  for rl in ${RAM_HEALTH_LINES[@]+"${RAM_HEALTH_LINES[@]}"} ${GPU_TOPO_LINES[@]+"${GPU_TOPO_LINES[@]}"}; do [[ -n "$rl" ]] && SYS_INFO_LINES+=("$rl"); done
   pdl="$(power_daemon_conflict_line)"
   [[ -n "$pdl" ]] && SYS_INFO_LINES+=("$pdl")
   if grep -qiE "PowerEdge|ProLiant|ThinkSystem|Supermicro|PRIMERGY|SYS-[0-9]" <<<"${SYS_VENDOR} ${PRODUCT_NAME}"; then
@@ -4541,9 +4644,9 @@ print_stats_and_info_grid() {
     done
   }
   run_host_hook live_stats
-  _append_grid_section "${SYS_INFO_LINES[@]}"
-  _append_grid_section "${LIVE_STAT_LINES[@]}"
-  _append_grid_section "${STRATA_STAT_LINES[@]}"
+  _append_grid_section ${SYS_INFO_LINES[@]+"${SYS_INFO_LINES[@]}"}
+  _append_grid_section ${LIVE_STAT_LINES[@]+"${LIVE_STAT_LINES[@]}"}
+  _append_grid_section ${STRATA_STAT_LINES[@]+"${STRATA_STAT_LINES[@]}"}
   unset -f _append_grid_section
   LIVE_STATS_COUNT="$total_lines"
   printf "%s\n" "$out"
@@ -4852,14 +4955,21 @@ _tui_start_live_stats_sampler() {
   local -n _tmp_ref="$1" _pid_ref="$2"
   _tmp_ref="" _pid_ref=""
   (( LIVE_STATS_COUNT > 0 )) || return 0
-  _tmp_ref="$(mktemp /tmp/strata-stats.XXXXXX 2>/dev/null || echo "")"
-  [[ -n "$_tmp_ref" ]] || return 0
+  local _tmp_dir=""
+  _tmp_dir="$(mktemp -d /tmp/strata-stats.XXXXXX 2>/dev/null || echo "")"
+  [[ -n "$_tmp_dir" ]] || return 0
+  chmod 700 "$_tmp_dir" 2>/dev/null || true
+  _tmp_ref="${_tmp_dir}/grid"
   (
     trap 'exit 0' TERM INT
     while true; do
       sleep 1 &
       wait $! 2>/dev/null || exit 0
-      declare -F refresh_strata_running >/dev/null 2>&1 && refresh_strata_running
+      _LIVE_TICK_STRATA_REFRESHED=false
+      if declare -F refresh_strata_running >/dev/null 2>&1; then
+        refresh_strata_running
+        _LIVE_TICK_STRATA_REFRESHED=true
+      fi
       if print_stats_and_info_grid true > "${_tmp_ref}.tmp" 2>/dev/null; then
         format_compact_live_bar > "${_tmp_ref}.bar.tmp" 2>/dev/null || true
         mv -f "${_tmp_ref}.bar.tmp" "${_tmp_ref}.bar" 2>/dev/null || true
@@ -4877,7 +4987,15 @@ _tui_start_live_stats_sampler() {
 _tui_stop_live_stats_sampler() {
   local pid="${1:-}" tmp="${2:-}"
   [[ -n "$pid" ]] && { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; }
-  [[ -n "$tmp" ]] && rm -f "$tmp" "${tmp}.tmp" "${tmp}.bar" "${tmp}.bar.tmp" "${tmp}.meta" "${tmp}.meta.tmp" 2>/dev/null || true
+  if [[ -n "$tmp" ]]; then
+    local _tdir
+    _tdir="$(dirname "$tmp")"
+    if [[ "$_tdir" == /tmp/strata-stats.* ]]; then
+      rm -rf "$_tdir" 2>/dev/null || true
+    else
+      rm -f "$tmp" "${tmp}.tmp" "${tmp}.bar" "${tmp}.bar.tmp" "${tmp}.meta" "${tmp}.meta.tmp" 2>/dev/null || true
+    fi
+  fi
   ACTIVE_SAMPLER_PID="" ACTIVE_SAMPLER_TMP=""
 }
 
@@ -5022,7 +5140,7 @@ read_line_with_live_stats() {
           _accept=true
         elif [[ "$ch" =~ ^[0-9]$ ]] && [[ -z "$buf" || "$buf" =~ ^[0-9]+$ ]]; then
           local _cand="${buf}${ch}"
-          (( total_rows == 0 || (10#_cand >= 1 && 10#_cand <= total_rows) )) && _accept=true
+          (( total_rows == 0 || (10#$_cand >= 1 && 10#$_cand <= total_rows) )) && _accept=true
         fi
         if [[ "$_accept" == true ]]; then
           buf+="$ch"; printf "%s" "$ch"
@@ -5397,12 +5515,9 @@ show_stats_page() {
 }
 
 _pad_ansi_col() {
-  local expanded="" plain="" pad_len=0 pad=""
+  local expanded=""
   printf -v expanded "%b" "$1"
-  plain="$(sed -E $'s/\033\\[[0-9;]*m//g' <<< "$expanded")"
-  pad_len=$(( $2 - ${#plain} ))
-  (( pad_len > 0 )) && printf -v pad "%*s" "$pad_len" ""
-  printf "%b%s" "$expanded" "$pad"
+  pad_ansi_col "$expanded" "$2"
 }
 
 _server_cap_cell() {
@@ -5597,8 +5712,14 @@ show_inference_servers_page() {
           break
           ;;
         [1-9])
-          if (( action <= total )); then
-            sel=$(( action - 1 ))
+          if (( action * 10 <= total )); then
+            local next_digit=""
+            if IFS= read -rsn1 -t 0.5 next_digit && [[ "$next_digit" =~ ^[0-9]$ ]] && (( 10#"${action}${next_digit}" <= total )); then
+              action="${action}${next_digit}"
+            fi
+          fi
+          if (( 10#$action >= 1 && 10#$action <= total )); then
+            sel=$(( 10#$action - 1 ))
             open_pid="${AVAILABLE_HOST_PLUGINS[$sel]}"
             break
           fi
@@ -5784,10 +5905,13 @@ show_index() {
       c|C) show_check_page ;;
       u|U) _run_all_server_updates ;;
       h|H)
+        if ! declare -F show_benchmark_history >/dev/null 2>&1 && [[ "$NO_PLUGINS" != true ]]; then
+          load_plugin hosts strata >/dev/null 2>&1 || true
+        fi
         if declare -F show_benchmark_history >/dev/null 2>&1; then
           show_benchmark_history
         else
-          echo -e "${C_YELLOW}Load the Strata plugin first to view benchmark history.${C_RESET}"; sleep 1
+          echo -e "${C_YELLOW}Strata plugin is unavailable (benchmark history requires Strata).${C_RESET}"; sleep 1
         fi
         ;;
       w|W) run_step_view 0 "wizard" ;;
@@ -5990,7 +6114,7 @@ print_check_summary() {
     done
   fi
   local _hl
-  for _hl in "${RAM_HEALTH_LINES[@]}" "${GPU_TOPO_LINES[@]}"; do
+  for _hl in ${RAM_HEALTH_LINES[@]+"${RAM_HEALTH_LINES[@]}"} ${GPU_TOPO_LINES[@]+"${GPU_TOPO_LINES[@]}"}; do
     [[ -n "$_hl" ]] && printf "  %s\n" "$_hl"
   done
   if (( ${#LOADED_HOST_PLUGINS[@]} > 0 )); then
@@ -6025,8 +6149,9 @@ print_check_summary() {
     elif [[ "$IS_LAPTOP" == true ]] && is_laptop_recommended_step "$step"; then
       note_lbl=" [L]"
     fi
-    [[ "$step" == "nvidia_power_limit" ]] && note_lbl+=" (no measured speedup at default PL)"
-    [[ "$step" == "numa_balancing" ]] && note_lbl+=" (no measured throughput gain on containerised host)"
+    if declare -F "check_note_${step}" >/dev/null 2>&1; then
+      note_lbl+="$(check_note_${step})"
+    fi
 
     if "status_${step}"; then
       status_lbl="${C_GREEN}[APPLIED]${C_RESET}    "
@@ -6096,8 +6221,13 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
           exit 2
         fi
         IFS=',' read -ra _p_list <<< "$2"
-        for _p_item in "${_p_list[@]}"; do
-          [[ -n "$_p_item" ]] && REQUESTED_HOST_PLUGINS+=("$_p_item")
+        for _p_item in ${_p_list[@]+"${_p_list[@]}"}; do
+          [[ -z "$_p_item" ]] && continue
+          if ! _valid_plugin_id "$_p_item"; then
+            echo "Error: invalid plugin name '${_p_item}'." >&2
+            exit 2
+          fi
+          REQUESTED_HOST_PLUGINS+=("$_p_item")
         done
         shift
         ;;
@@ -6109,8 +6239,13 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
           exit 2
         fi
         IFS=',' read -ra _p_list <<< "$_p_val"
-        for _p_item in "${_p_list[@]}"; do
-          [[ -n "$_p_item" ]] && REQUESTED_HOST_PLUGINS+=("$_p_item")
+        for _p_item in ${_p_list[@]+"${_p_list[@]}"}; do
+          [[ -z "$_p_item" ]] && continue
+          if ! _valid_plugin_id "$_p_item"; then
+            echo "Error: invalid plugin name '${_p_item}'." >&2
+            exit 2
+          fi
+          REQUESTED_HOST_PLUGINS+=("$_p_item")
         done
         ;;
       --strata-api-key)
@@ -6133,11 +6268,21 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         shift
         ;;
       --strata-api-key=*)
-        STRATA_API_KEY="${1#*=}"
-        if [[ -z "$STRATA_API_KEY" ]]; then
+        _k_val="${1#*=}"
+        if [[ -z "$_k_val" ]]; then
           echo "Error: --strata-api-key requires a non-empty value." >&2
           usage >&2
           exit 2
+        fi
+        if [[ "$_k_val" == "-" ]]; then
+          IFS= read -rs STRATA_API_KEY </dev/tty || true
+          echo "" >&2
+          if [[ -z "$STRATA_API_KEY" ]]; then
+            echo "Error: --strata-api-key: no key entered." >&2
+            exit 2
+          fi
+        else
+          STRATA_API_KEY="$_k_val"
         fi
         export STRATA_API_KEY
         ;;
@@ -6167,16 +6312,17 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   fi
 
   if [[ "$DOWNLOAD_PLUGINS" == true ]]; then
+    _ensure_registry_file
     _reg="$(_registry_file || true)"
     if [[ -z "$_reg" || ! -f "$_reg" ]]; then
       echo "Error: could not locate or download plugins/registry.tsv." >&2
       exit 1
     fi
-    while IFS=$'\t' read -r _rcat _rid _rname _rdesc _rfile _rsha _rplat; do
+    while IFS=$'\037' read -r _rcat _rid; do
       [[ -n "$_rcat" && -n "$_rid" ]] || continue
       echo "Caching ${_rcat}/${_rid}.sh..."
       _fetch_verified_plugin "$_rcat" "$_rid" || exit 1
-    done < "$_reg"
+    done < <(awk -F'\t' '$1!="" && $2!="" {print $1 "\037" $2}' "$_reg")
     echo "All plugins cached in ${PLUGIN_CACHE_DIR}."
     exit 0
   fi
@@ -6185,7 +6331,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   if [[ "$CHECK_ONLY" == true ]]; then
     detect_environment
     load_applicable_tweak_packs
-    for _req_p in "${REQUESTED_HOST_PLUGINS[@]}"; do
+    for _req_p in ${REQUESTED_HOST_PLUGINS[@]+"${REQUESTED_HOST_PLUGINS[@]}"}; do
       load_plugin hosts "$_req_p" || exit 1
     done
     run_check_mode
@@ -6204,7 +6350,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   ensure_script_tools
   detect_environment
   load_applicable_tweak_packs
-  for _req_p in "${REQUESTED_HOST_PLUGINS[@]}"; do
+  for _req_p in ${REQUESTED_HOST_PLUGINS[@]+"${REQUESTED_HOST_PLUGINS[@]}"}; do
     load_plugin hosts "$_req_p" || true
   done
   start_server_update_poller

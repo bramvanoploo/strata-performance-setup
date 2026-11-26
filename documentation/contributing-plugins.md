@@ -102,13 +102,17 @@ plugins/
    - `explain_<id>()` — Print impact/details.
    - `apply_<id>()` — Apply the optimization.
    - `revert_<id>()` — Cleanly revert the optimization.
+4. Optional tweak hooks:
+   - `<id>_managed()` — Return `0` if the setting is managed by the wizard.
+   - `batch_skip_<id>(revert_out_of_scope)` — Return `0` to skip during `[a]`/`[l]` batch apply.
+   - `check_note_<id>()` — Echo an extra note shown in `--check` / `[c]`.
 
 ---
 
 ## Shared Core Helpers (Reuse Instead of Reimplementing)
 
-- **Privileges & prompts**: `run_root`, `run_as_user`, `confirm_yn`, `pause_prompt`
-- **Services (systemd / launchd / SysVinit / Unraid / Synology)**: `install_service`, `remove_service`, `service_ctl`, `service_installed`, `unit_enabled`, `unit_active`
+- **Privileges & prompts**: `run_root`, `run_as_user_exec`, `confirm_yn`, `pause_prompt`
+- **Services (systemd / launchd / SysVinit / Unraid / Synology)**: `install_service`, `remove_service`, `service_ctl` (`start`, `stop`, `restart`, `enable-now`, `disable-now`, `daemon-reload`), `service_installed`, `unit_enabled`, `unit_active`
 - **Packages**: `pkg_installed`, `pkg_available`, `pkg_install`, `aur_install`, `prompt_install_deps`
 - **Kernel & sysctl**: `add_kernel_param`, `remove_kernel_param`, `has_kernel_param`, `kernel_param_value`, `write_sysctl_with_prev`, `restore_sysctl_prev`
 - **TUI**: `print_header`, `read_step_action`, color variables (`C_BOLD`, `C_GREEN`, `C_YELLOW`, `C_CYAN`, `C_DIM`, `C_RESET`)

@@ -10,6 +10,23 @@ register_tweak --id "macos_timemachine_exclude" --stars 2 --tier "recommended" -
 register_tweak --id "macos_metal_tuning" --stars 4 --tier "opt_in" --os "macos" --laptop-recommended true --vm-supported true --experimental-non-arch false
 register_tweak --id "macos_rdma_tb5" --stars 4 --tier "opt_in" --os "macos" --laptop-recommended false --vm-supported false --experimental-non-arch false
 
+# 12y. macOS Metal GPU Wired Memory Limit (iogpu.wired_limit_mb)
+_macos_wired_limit_cur_mb() {
+  local v="${STRATA_MACOS_WIRED_LIMIT_MB:-$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)}"
+  [[ "$v" =~ ^[0-9]+$ ]] || v=0
+  echo "$v"
+}
+_macos_wired_limit_rec_gb() {
+  local r="${1:-${RAM_GB:-0}}"
+  if (( r >= 128 )); then echo $(( r - 16 ))
+  elif (( r >= 96 )); then echo $(( r - 12 ))
+  elif (( r >= 64 )); then echo $(( r - 10 ))
+  elif (( r >= 48 )); then echo $(( r - 8 ))
+  elif (( r >= 32 )); then echo $(( r - 6 ))
+  else echo $(( r - 5 ))
+  fi
+}
+
 applicable_macos_wired_limit() {
   [[ "$IS_MACOS" == true && "$IS_APPLE_SILICON" == true ]] && (( RAM_GB >= 24 ))
 }
@@ -406,7 +423,10 @@ applicable_macos_rdma_tb5() {
 title_macos_rdma_tb5() { echo "macOS RDMA over Thunderbolt 5 (exo / MLX Distributed Clusters)"; }
 note_macos_rdma_tb5() { echo -e "${C_BLUE}[OPT]${C_RESET}"; }
 status_macos_rdma_tb5() {
-  command -v rdma_ctl >/dev/null 2>&1 && rdma_ctl status 2>/dev/null | grep -qiE 'enabled|active'
+  command -v rdma_ctl >/dev/null 2>&1 || return 1
+  local st
+  st="$(rdma_ctl status 2>/dev/null || true)"
+  grep -qiE '(^|[^a-z])(enabled|active)([^a-z]|$)' <<<"$st" && ! grep -qiE '(^|[^a-z])(disabled|inactive|not enabled)([^a-z]|$)' <<<"$st"
 }
 explain_macos_rdma_tb5() {
   cat <<'EOF'

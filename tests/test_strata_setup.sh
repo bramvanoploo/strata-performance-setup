@@ -17,7 +17,7 @@ assert_eq() {
   if [[ "$got" == "$want" ]]; then
     pass "$msg"
   else
-    fail "$msg (got=${got@Q}, want=${want@Q})"
+    fail "$msg (got='${got}', want='${want}')"
   fi
 }
 
@@ -26,7 +26,7 @@ assert_contains() {
   if grep -qF -- "$needle" <<<"$haystack"; then
     pass "$msg"
   else
-    fail "$msg (missing ${needle@Q})"
+    fail "$msg (missing '${needle}')"
   fi
 }
 
@@ -35,11 +35,9 @@ assert_not_contains() {
   if ! grep -qF -- "$needle" <<<"$haystack"; then
     pass "$msg"
   else
-    fail "$msg (unexpected ${needle@Q})"
+    fail "$msg (unexpected '${needle}')"
   fi
 }
-
-TMP_DIR_UNUSED=""
 
 # 1. Syntax & CLI flags
 bash -n "$SCRIPT" && pass "bash -n syntax check (core)" || fail "bash -n syntax check (core)"
@@ -228,10 +226,10 @@ EOF
   MACOS_METAL_ENV_FILE="${TMP_DIR}/metal.conf"
   pwn_marker="${TMP_DIR}/pwned"
   printf 'STRATA_METAL_TEST=$(touch_%s)\n' "$pwn_marker" > "$MACOS_METAL_ENV_FILE"
-  printf 'STRATA_METAL_TEST=$(touch\t%s)\n' "$pwn_marker" > "$MACOS_METAL_ENV_FILE"
-  printf 'STRATA_METAL_TEST=$(touch/%s)\n' "$pwn_marker" > "$MACOS_METAL_ENV_FILE"
+  printf 'STRATA_METAL_TEST=$(touch\t%s)\n' "$pwn_marker" >> "$MACOS_METAL_ENV_FILE"
+  printf 'STRATA_METAL_TEST=$(touch/%s)\n' "$pwn_marker" >> "$MACOS_METAL_ENV_FILE"
   # Even with $(...) without spaces:
-  printf 'STRATA_METAL_TEST=$(touch${IFS}%s)\n' "$pwn_marker" > "$MACOS_METAL_ENV_FILE"
+  printf 'STRATA_METAL_TEST=$(touch${IFS}%s)\n' "$pwn_marker" >> "$MACOS_METAL_ENV_FILE"
   run_as_user "true"
   [[ ! -e "$pwn_marker" ]] && pass "run_as_user safely quotes MACOS_METAL_ENV_FILE values" || fail "run_as_user executed injected subshell"
 )
@@ -838,6 +836,74 @@ EOF
   status_nvidia_clock_lock && pass "status_nvidia_clock_lock true after apply" || fail "status_nvidia_clock_lock after apply"
   revert_nvidia_clock_lock >/dev/null
   [[ ! -f "${STRATA_RC_DIR}/rc.strata.nvidia-clock-lock" ]] && pass "revert_nvidia_clock_lock removes service" || fail "revert_nvidia_clock_lock removes service"
+)
+
+# 20. Security & regression tests from audit
+(
+  # 20a. --plugin rejects path traversal
+  rc_trav=0
+  bash "$SCRIPT" --plugin ../../../../tmp/evil --check >/dev/null 2>&1 || rc_trav=$?
+  assert_eq "$rc_trav" "2" "--plugin rejects path traversal with exit 2"
+
+  # 20b. _fetch_verified_plugin rejects tampered checksum
+  bad_dir="${TMP_DIR}/bad_sha"
+  mkdir -p "${bad_dir}/plugins/hosts" "${bad_dir}/cache"
+  printf 'echo evil\n' > "${bad_dir}/plugins/hosts/fake.sh"
+  printf 'hosts\tfake\tFake\tFake\tplugins/hosts/fake.sh\t0000000000000000000000000000000000000000000000000000000000000000\tall\n' > "${bad_dir}/plugins/registry.tsv"
+  SCRIPT_DIR="${TMP_DIR}/nonexistent_repo"
+  PLUGIN_CACHE_DIR="${bad_dir}/cache"
+  PLUGIN_BASE_URL="file://${bad_dir}"
+  REGISTRY_FETCHED=false REGISTRY_FILE_PATH=""
+  rc_sha=0
+  _fetch_verified_plugin hosts fake >/dev/null 2>&1 || rc_sha=$?
+  [[ "$rc_sha" -ne 0 ]] && pass "_fetch_verified_plugin rejects SHA-256 mismatch" || fail "_fetch_verified_plugin accepted bad SHA-256"
+
+  # 20c. _host_standard_uninstall refuses to remove shared system python3
+  source "${REPO_ROOT}/plugins/hosts/_common.sh"
+  confirm_yn() { return 0; }
+  _host_owning_pkg() { echo "python"; }
+  _host_pkg_uninstall() { touch "${TMP_DIR}/python_removed"; return 0; }
+  _host_standard_uninstall "sglang" "SGLang" "sglang.service" "/usr/bin/python3" "manual" "sglang" >/dev/null 2>&1
+  [[ ! -e "${TMP_DIR}/python_removed" ]] && pass "_host_standard_uninstall protects shared python3" || fail "_host_standard_uninstall tried to uninstall python3"
+
+  # 20d. Boot hook exact suffix match: removing # strata:strata keeps # strata:strata-cpu-perf
+  bh_file="${TMP_DIR}/rc.local.test"
+  add_boot_hook "$bh_file" "# strata:strata" "[ -x /etc/rc.d/rc.strata.strata ] && /etc/rc.d/rc.strata.strata start # strata:strata"
+  add_boot_hook "$bh_file" "# strata:strata-cpu-perf" "[ -x /etc/rc.d/rc.strata.strata-cpu-perf ] && /etc/rc.d/rc.strata.strata-cpu-perf start # strata:strata-cpu-perf"
+  remove_boot_hook "$bh_file" "# strata:strata"
+  assert_not_contains "$(cat "$bh_file")" "rc.strata.strata " "remove_boot_hook removes exact tag"
+  assert_contains "$(cat "$bh_file")" "rc.strata.strata-cpu-perf" "remove_boot_hook preserves longer prefix-sharing tags"
+
+  # 20e. _remove_kparam_from_file preserves rEFInd entry spacing (first token + untouched lines)
+  rf_file="${TMP_DIR}/refind_test.conf"
+  printf '"Boot standard"  "pcie_aspm=off root=UUID=abc"\n"Boot recovery"  "root=UUID=abc single"\n' > "$rf_file"
+  _remove_kparam_from_file "pcie_aspm=off" "$rf_file"
+  assert_contains "$(cat "$rf_file")" '"Boot standard" "root=UUID=abc"' "rEFInd python removal preserves quote delimiter"
+  assert_contains "$(cat "$rf_file")" '"Boot recovery"  "root=UUID=abc single"' "rEFInd removal leaves untouched lines intact"
+
+  # 20f. macOS launchd: root LaunchDaemon uses safe PATH, User= service installs as user LaunchAgent
+  HAS_SYSTEMD=false HAS_LAUNCHD=true IS_MACOS=true
+  TARGET_HOME="${TMP_DIR}/mac_home" TARGET_USER="testuser"
+  STRATA_LAUNCHD_SYS_DIR="${TMP_DIR}/mac_sys_plists"
+  STRATA_LAUNCHD_SYS_BIN_DIR="${TMP_DIR}/mac_sys_bin"
+  STRATA_LAUNCHD_USER_DIR="${TMP_DIR}/mac_usr_plists"
+  STRATA_LAUNCHD_USER_BIN_DIR="${TMP_DIR}/mac_usr_bin"
+  mkdir -p "$TARGET_HOME" "$STRATA_LAUNCHD_SYS_DIR" "$STRATA_LAUNCHD_SYS_BIN_DIR" "$STRATA_LAUNCHD_USER_DIR" "$STRATA_LAUNCHD_USER_BIN_DIR"
+  run_as_user_exec() { "$@"; }
+  launchctl() { return 0; }
+  install_service strata-macos-wired-limit.service >/dev/null 2>&1 <<'EOF'
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/sysctl -w iogpu.wired_limit_mb=8192
+EOF
+  assert_not_contains "$(cat "${STRATA_LAUNCHD_SYS_BIN_DIR}/strata-macos-wired-limit.sh")" "$TARGET_HOME" "macOS root LaunchDaemon omits TARGET_HOME from PATH"
+  install_service ollama.service >/dev/null 2>&1 <<'EOF'
+[Service]
+Type=simple
+User=testuser
+ExecStart=/opt/homebrew/bin/ollama serve
+EOF
+  [[ -f "${STRATA_LAUNCHD_USER_DIR}/com.strata.ollama.plist" ]] && pass "macOS User= service installs as user LaunchAgent" || fail "macOS User= service installed as root LaunchDaemon"
 )
 
 PASS="$(grep -c '^P$' "$RESULTS_FILE" || true)"
