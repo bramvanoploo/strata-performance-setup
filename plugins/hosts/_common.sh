@@ -342,6 +342,7 @@ _host_ver_older() {
 
 _host_check_update_cached() {
   local id="$1" inst_ver="$2" target="$3" ttl="${4:-7200}" kind="${5:-github}"
+  [[ "${_FORCE_FRESH_UPDATE_CHECK:-false}" == true ]] && ttl=0
   HOST_UPDATE_AVAIL[$id]="false"
   HOST_UPDATE_LATEST[$id]=""
   [[ -n "$inst_ver" && "$inst_ver" != "installed" && "$inst_ver" != "n/a" ]] || return 0
@@ -385,6 +386,10 @@ _host_clear_update_cache() {
   cdir="$(_host_update_cache_dir)"
   HOST_UPDATE_AVAIL[$id]="false"
   HOST_UPDATE_LATEST[$id]=""
+  if [[ "$id" == "strata" ]]; then
+    STRATA_UPDATE_AVAILABLE=false
+    STRATA_UPDATE_SUMMARY=""
+  fi
   rm -f "${cdir}/${id}.cache" 2>/dev/null || true
   sfile="${cdir}/summary.state"
   if [[ -f "$sfile" ]]; then
@@ -462,6 +467,7 @@ _host_pkg_mgr_update_ver() {
 
 _host_check_update_by_source() {
   local id="$1" src="$2" inst_ver="$3" pkg="$4" repo="$5" pypi_pkg="${6:-}" ttl="${7:-7200}"
+  [[ "${_FORCE_FRESH_UPDATE_CHECK:-false}" == true ]] && ttl=0
   case "$src" in
     none|manual|docker)
       _host_clear_update_cache "$id"
@@ -780,7 +786,12 @@ _host_option_row() {
       title="Install ${name}"
       ;;
     update)
-      badge="${C_GREEN}[INSTALLED]    ${C_RESET}"
+      local _hid="${unit%.service}"
+      if declare -F _server_has_update >/dev/null 2>&1 && _server_has_update "$_hid"; then
+        badge="${C_UPDATE_BANNER}[UPDATE READY]${C_RESET} "
+      else
+        badge="${C_GREEN}[INSTALLED]    ${C_RESET}"
+      fi
       title="Update ${name}${ver:+ (${ver})}"
       ;;
     service)
@@ -912,22 +923,45 @@ _host_run_options_page() {
       printf "%s\n" "$(_host_option_row "$i" "${opts[$i]}" "$name" "$unit" "$ver_val" "$running" "$is_sel")"
     done
     echo ""
-    local num_hint="1"
+    local num_hint="1" footer_extra=0 _host_upd_names=""
     (( total > 1 )) && num_hint="1-${total}"
     echo -e "  ${C_BOLD}[${num_hint} / ↑↓+Enter]${C_RESET} Select an option"
+    declare -F _outdated_server_names >/dev/null 2>&1 && _host_upd_names="$(_outdated_server_names)"
+    if [[ -n "$_host_upd_names" ]]; then
+      echo -e "  ${C_BGREEN}[u]${C_RESET} Install update(s) for: ${_host_upd_names}"
+      footer_extra=1
+    fi
     echo -e "  ${C_DIM}[i / b / Esc]${C_RESET} Back to Inference Servers"
     echo -e "  ${C_BOLD}[q]${C_RESET} Quit"
     echo ""
 
-    local saved_tty="" chosen_opt=""
+    local saved_tty="" chosen_opt="" do_refresh=false do_upd_all=false init_upd_cnt=0
+    declare -F _count_server_updates >/dev/null 2>&1 && init_upd_cnt="$(_count_server_updates)"
     saved_tty="$(stty -g 2>/dev/null || true)"
     stty -echo 2>/dev/null || true
     trap '_tui_restore_tty "$saved_tty"; exit 0' INT TERM
 
     printf "Select action: "
     while true; do
-      local action=""
-      IFS= read -rsn1 action || { _tui_restore_tty "$saved_tty"; trap - INT TERM; printf "\n"; return 0; }
+      local action="" rc=0
+      if [[ -t 0 && -t 1 ]]; then
+        IFS= read -rsn1 -t 1 action || rc=$?
+      else
+        IFS= read -rsn1 action || rc=$?
+      fi
+      if (( rc > 128 )); then
+        if declare -F load_server_update_states >/dev/null 2>&1; then
+          load_server_update_states
+          declare -F load_strata_update_state >/dev/null 2>&1 && load_strata_update_state
+          if (( $(_count_server_updates) != init_upd_cnt )); then
+            do_refresh=true
+            break
+          fi
+        fi
+        continue
+      elif (( rc != 0 )); then
+        _tui_restore_tty "$saved_tty"; trap - INT TERM; printf "\n"; return 0
+      fi
       if [[ "$action" == $'\e' ]]; then
         local seq=""
         _tui_read_esc_seq seq
@@ -942,8 +976,8 @@ _host_run_options_page() {
         fi
         if (( new_sel != old_sel )); then
           sel="$new_sel"
-          local old_up=$(( 5 + (total - old_sel) ))
-          local new_up=$(( 5 + (total - new_sel) ))
+          local old_up=$(( 5 + footer_extra + (total - old_sel) ))
+          local new_up=$(( 5 + footer_extra + (total - new_sel) ))
           local old_row new_row
           old_row="$(_host_option_row "$old_sel" "${opts[$old_sel]}" "$name" "$unit" "$ver_val" "$running" false)"
           new_row="$(_host_option_row "$new_sel" "${opts[$new_sel]}" "$name" "$unit" "$ver_val" "$running" true)"
@@ -965,6 +999,12 @@ _host_run_options_page() {
             break
           fi
           ;;
+        u|U)
+          if [[ -n "$_host_upd_names" ]] && declare -F _run_all_server_updates >/dev/null 2>&1; then
+            do_upd_all=true
+            break
+          fi
+          ;;
         0|b|B|i|I)
           _tui_restore_tty "$saved_tty"; trap - INT TERM; printf "\n"; return 0
           ;;
@@ -977,6 +1017,12 @@ _host_run_options_page() {
     _tui_restore_tty "$saved_tty"
     trap - INT TERM
     printf "\n"
+    [[ "$do_refresh" == true ]] && continue
+    if [[ "$do_upd_all" == true ]]; then
+      _run_all_server_updates
+      last_probe=-99
+      continue
+    fi
     "$dispatch_fn" "$chosen_opt"
     pause_prompt
     last_probe=-99
