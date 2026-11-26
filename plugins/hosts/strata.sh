@@ -17,7 +17,10 @@ register_host_plugin \
 strata_init() {
   refresh_strata_bin
   refresh_strata_running
-  [[ "${_IN_SERVER_UPDATE_POLLER:-false}" != true ]] && start_strata_update_poller
+  if [[ "${_IN_SERVER_UPDATE_POLLER:-false}" != true ]]; then
+    declare -F load_server_update_states >/dev/null 2>&1 && load_server_update_states
+    [[ -z "${SERVER_UPDATE_POLLER_PID:-}" ]] && start_strata_update_poller
+  fi
 }
 
 strata_menu_row() {
@@ -80,6 +83,7 @@ strata_cleanup() {
 }
 
 strata_check_update() {
+  declare -F load_server_update_states >/dev/null 2>&1 && load_server_update_states
   load_strata_update_state
 }
 
@@ -90,6 +94,7 @@ strata_update() {
 refresh_strata_bin() {
   if command -v strata >/dev/null 2>&1; then STRATA_BIN="$(command -v strata)"
   elif [[ -x "$TARGET_HOME/.local/bin/strata" ]]; then STRATA_BIN="$TARGET_HOME/.local/bin/strata"
+  elif [[ -x "$TARGET_HOME/bin/strata" ]]; then STRATA_BIN="$TARGET_HOME/bin/strata"
   elif [[ -x "/opt/homebrew/bin/strata" ]]; then STRATA_BIN="/opt/homebrew/bin/strata"
   elif [[ -x "/opt/homebrew/sbin/strata" ]]; then STRATA_BIN="/opt/homebrew/sbin/strata"
   elif [[ -x "/usr/local/bin/strata" ]]; then STRATA_BIN="/usr/local/bin/strata"
@@ -295,27 +300,65 @@ status_strata_build_hip() {
 
 check_strata_update_sync() {
   [[ -n "$STRATA_BIN" ]] || return 1
-  local json_out parsed=""
-  json_out="$(run_as_user_exec "$STRATA_BIN" update --check --json 2>/dev/null || true)"
+  local json_out="" parsed="" rc=0 attempt=0
+  for (( attempt = 1; attempt <= 2; attempt++ )); do
+    rc=0
+    json_out="$(run_as_user_exec "$STRATA_BIN" update --check --json 2>/dev/null)" || rc=$?
+    if [[ -z "$json_out" && $rc -ne 7 ]]; then
+      rc=0
+      json_out="$(run_as_user_exec "$STRATA_BIN" update --check --output json 2>/dev/null)" || rc=$?
+    fi
+    (( rc == 7 && attempt < 2 )) && sleep 1 || break
+  done
   if [[ -n "$json_out" ]] && has_working_python3; then
     parsed="$(python3 -c '
 import json, sys
+raw = sys.stdin.read()
+d = None
 try:
-    d = json.loads(sys.stdin.read())
+    d = json.loads(raw)
 except Exception:
+    s, e = raw.find("{"), raw.rfind("}")
+    if s != -1 and e > s:
+        try:
+            d = json.loads(raw[s : e + 1])
+        except Exception:
+            d = None
+if not isinstance(d, dict):
     sys.exit(1)
+
+def ver_of(v):
+    if isinstance(v, dict):
+        return str(v.get("version") or v.get("tag") or "").strip()
+    return str(v or "").strip() if v is not None else ""
+
+comps = d.get("components") if isinstance(d.get("components"), dict) else d
+keys = []
+for k in ("engine", "control", "cli", "launcher", "runtime"):
+    if isinstance(comps.get(k), dict):
+        keys.append(k)
+for k, v in comps.items():
+    if k not in keys and isinstance(v, dict) and any(f in v for f in ("installed", "offered", "current", "latest", "update_available", "updateAvailable")):
+        keys.append(k)
+
 updates = []
-for key in ("engine", "control"):
-    comp = d.get(key)
-    if not isinstance(comp, dict):
-        continue
-    inst = comp.get("installed")
-    off = comp.get("offered")
-    inst_v = inst.get("version") if isinstance(inst, dict) else inst
-    off_v = off.get("version") if isinstance(off, dict) else off
-    st = comp.get("status", "")
-    if inst_v and off_v and (st not in ("", "current", "unknown-installed") or inst_v != off_v):
-        updates.append(f"{key} {inst_v} -> {off_v}")
+upd_statuses = {"update-available", "update_available", "outdated", "behind", "upgrade-available", "newer-available"}
+ok_statuses = {"", "current", "up-to-date", "up_to_date", "unknown-installed", "none", "not-installed", "not_installed"}
+for key in keys:
+    comp = comps[key]
+    inst_v = ver_of(comp.get("installed") if "installed" in comp else comp.get("current", comp.get("installed_version", comp.get("current_version"))))
+    off_v = ver_of(comp.get("offered") if "offered" in comp else comp.get("latest", comp.get("available", comp.get("offered_version", comp.get("latest_version")))))
+    st = str(comp.get("status") or "").strip().lower()
+    flag = comp.get("update_available") is True or comp.get("updateAvailable") is True
+    if inst_v and off_v and (flag or st in upd_statuses or (st not in ok_statuses) or inst_v != off_v):
+        updates.append(f"{key} {inst_v} -> {off_v}".replace("|", "/"))
+    elif off_v and (flag or st in upd_statuses):
+        updates.append(f"{key} -> {off_v}".replace("|", "/"))
+
+if not updates and (d.get("update_available") is True or d.get("updateAvailable") is True or str(d.get("status") or "").strip().lower() in upd_statuses):
+    lat = ver_of(d.get("offered") or d.get("latest") or d.get("latest_version"))
+    updates.append(f"new version {lat}".strip().replace("|", "/") if lat else "new version available")
+
 if updates:
     print("1|" + ", ".join(updates))
 else:
@@ -324,9 +367,13 @@ else:
   fi
 
   if [[ -z "$parsed" ]]; then
-    local txt_out
-    txt_out="$(run_as_user_exec "$STRATA_BIN" update --check 2>/dev/null || true)"
-    if grep -qiE "update available|newer|out of date" <<< "$txt_out"; then
+    local txt_out="" txt_rc=0
+    txt_out="$(run_as_user_exec "$STRATA_BIN" update --check 2>&1)" || txt_rc=$?
+    if (( txt_rc == 7 )) && [[ -z "$json_out" ]]; then
+      [[ "${STRATA_UPDATE_AVAILABLE:-false}" == true ]]
+      return $?
+    fi
+    if grep -qiE "update[ -]?available|updates available|newer|out[- ]of[- ]date|outdated|upgrade available|run ['\"]?strata update" <<< "$txt_out"; then
       parsed="1|new version available"
     else
       parsed="0|"
@@ -340,10 +387,12 @@ else:
   if [[ "$parsed" == 1\|* ]]; then
     STRATA_UPDATE_AVAILABLE=true
     STRATA_UPDATE_SUMMARY="${parsed#1|}"
+    [[ "${_IN_SERVER_UPDATE_POLLER:-false}" != true ]] && declare -F save_server_update_state >/dev/null 2>&1 && save_server_update_state "strata" "true" "$STRATA_UPDATE_SUMMARY"
     return 0
   else
     STRATA_UPDATE_AVAILABLE=false
     STRATA_UPDATE_SUMMARY=""
+    [[ "${_IN_SERVER_UPDATE_POLLER:-false}" != true ]] && declare -F save_server_update_state >/dev/null 2>&1 && save_server_update_state "strata" "false" ""
     return 1
   fi
 }
@@ -482,6 +531,7 @@ perform_strata_update() {
   # Pause background update polling and wait for any in-flight 'strata update --check'
   # to release the component-folder lock before running 'strata update --yes'.
   stop_strata_update_poller
+  declare -F stop_server_update_poller >/dev/null 2>&1 && stop_server_update_poller
 
   local svc_lbl
   svc_lbl="$(strata_service_label)"
@@ -489,7 +539,7 @@ perform_strata_update() {
     echo -e "\n${C_CYAN}Stopping ${svc_lbl} before updating...${C_RESET}"
     service_ctl stop strata.service || true
     if ! wait_for_strata_stopped 60; then
-      start_strata_update_poller
+      if declare -F start_server_update_poller >/dev/null 2>&1; then start_server_update_poller; else start_strata_update_poller; fi
       return 1
     fi
   else
@@ -498,7 +548,7 @@ perform_strata_update() {
       echo -e "\n${C_CYAN}Stopping Strata ('strata launch --stop') before updating...${C_RESET}"
       run_as_user_exec "$STRATA_BIN" launch --stop || true
       if ! wait_for_strata_stopped 60; then
-        start_strata_update_poller
+        if declare -F start_server_update_poller >/dev/null 2>&1; then start_server_update_poller; else start_strata_update_poller; fi
         return 1
       fi
     fi
@@ -547,7 +597,11 @@ perform_strata_update() {
     fi
   fi
 
-  start_strata_update_poller
+  if declare -F start_server_update_poller >/dev/null 2>&1; then
+    start_server_update_poller
+  else
+    start_strata_update_poller
+  fi
 }
 format_strata_hw_warnings() {
   if [[ "$IS_MACOS" == true ]]; then
@@ -1389,6 +1443,7 @@ show_benchmark_history() {
         continue
         ;;
       __esc__|b|B|q|Q) return 0 ;;
+      u|U) _run_all_server_updates; continue ;;
       *)
         [[ -z "$h_choice" ]] && h_choice=$(( HIST_SELECTED + 1 ))
         if ! [[ "$h_choice" =~ ^[0-9]+$ ]] || (( h_choice < 1 || h_choice > ${#rows[@]} )); then
@@ -1617,7 +1672,10 @@ _strata_run_installer() {
   command -v curl >/dev/null 2>&1 || prompt_install_deps repo curl || return 1
   run_as_user_exec sh -c 'curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh | sh'
   refresh_strata_bin
-  [[ -n "$STRATA_BIN" && -z "$STRATA_POLLER_PID" ]] && start_strata_update_poller
+  if [[ -n "$STRATA_BIN" ]]; then
+    check_strata_update_sync >/dev/null 2>&1 || true
+    [[ -z "${SERVER_UPDATE_POLLER_PID:-}" && -z "$STRATA_POLLER_PID" ]] && start_strata_update_poller
+  fi
   return 0
 }
 
@@ -2768,6 +2826,9 @@ run_strata_option() {
     else
       body+="$(echo -e "  ${C_GREEN}[a]${C_RESET} ${action_label}")"$'\n'
     fi
+    local _sopt_upd_names=""
+    declare -F _outdated_server_names >/dev/null 2>&1 && _sopt_upd_names="$(_outdated_server_names)"
+    [[ -n "$_sopt_upd_names" ]] && body+="$(echo -e "  ${C_BGREEN}[u]${C_RESET} Install update(s) for: ${_sopt_upd_names}")"$'\n'
     if [[ "$opt" == "benchmark" ]] || (( $(count_bench_history) > 0 )); then
       body+="$(echo -e "  ${C_CYAN}[h]${C_RESET} Benchmark history & restore coupled options")"$'\n'
     fi
@@ -2792,6 +2853,15 @@ run_strata_option() {
     case "$action" in
       __refresh__) ;;
       __esc__|i|I) return 0 ;;
+      u|U)
+        if [[ "$opt" == "update" && "$STRATA_UPDATE_AVAILABLE" == true ]]; then
+          echo ""
+          perform_strata_update || true
+          pause_prompt
+        else
+          _run_all_server_updates
+        fi
+        ;;
       a|A)
         echo ""
         "strata_action_${opt}" || true
@@ -3054,7 +3124,8 @@ read_strata_page_choice() {
   local term_lines=40
   term_lines="$(tput lines 2>/dev/null || echo 40)"
 
-  local init_upd="$STRATA_UPDATE_AVAILABLE"
+  local init_upd_cnt=0
+  declare -F _count_server_updates >/dev/null 2>&1 && init_upd_cnt="$(_count_server_updates)"
   local cur_running_url="$STRATA_RUNNING_URL" cur_running_preset="$STRATA_RUNNING_PRESET" cur_svc_active="0"
   unit_active strata.service && cur_svc_active="1"
 
@@ -3173,8 +3244,11 @@ read_strata_page_choice() {
         fi
       fi
     elif (( rc > 128 )); then
+      declare -F load_server_update_states >/dev/null 2>&1 && load_server_update_states
       load_strata_update_state
-      if [[ "$init_upd" == false && "$STRATA_UPDATE_AVAILABLE" == true ]] && [[ -z "$buf" ]]; then
+      local cur_upd_cnt=0
+      declare -F _count_server_updates >/dev/null 2>&1 && cur_upd_cnt="$(_count_server_updates)"
+      if (( cur_upd_cnt != init_upd_cnt && cur_upd_cnt > 0 )) && [[ -z "$buf" ]]; then
         _cleanup_strata_tty
         trap - INT TERM
         printf "\n"
@@ -3275,6 +3349,8 @@ show_strata_options_page() {
       u|U)
         if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
           run_strata_option "update" true
+        elif declare -F _count_server_updates >/dev/null 2>&1 && (( $(_count_server_updates) > 0 )); then
+          _run_all_server_updates
         else
           echo -e "${C_YELLOW}No Strata update available.${C_RESET}"; sleep 1
         fi

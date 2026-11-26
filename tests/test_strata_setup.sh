@@ -579,6 +579,55 @@ EOF
   assert_not_contains "$(cat "${STRATA_UPDATE_CACHE_DIR}/summary.state")" "llamacpp|" "_host_clear_update_cache removes server entry from summary.state"
   assert_contains "$(cat "${STRATA_UPDATE_CACHE_DIR}/summary.state")" "ollama|true|v0.9.0" "_host_clear_update_cache preserves other entries in summary.state"
 
+  # Startup direct update check & banner visibility across all header modes
+  (
+    STRATA_UPDATE_CACHE_DIR="${TMP_DIR}/startup_ucache"
+    mkdir -p "$STRATA_UPDATE_CACHE_DIR" "${TMP_DIR}/fake_strata_bin"
+    # Pre-seed stale summary.state claiming no update so startup check must refresh it directly
+    printf "strata|false|\nollama|false|\n" > "${STRATA_UPDATE_CACHE_DIR}/summary.state"
+    printf "%s|v0.1.0\n" "$(date +%s)" > "${STRATA_UPDATE_CACHE_DIR}/ollama.cache"
+    cat > "${TMP_DIR}/fake_strata_bin/strata" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "--version" ]]; then
+  echo "strata 0.4.0"
+elif [[ "${1:-}" == "update" && "${2:-}" == "--check" ]]; then
+  echo '[info] checking update feed'
+  echo '{"engine":{"installed":{"version":"0.4.0"},"offered":{"version":"0.5.0"},"status":"update-available"},"control":{"installed":"0.4.0","offered":"0.4.0","status":"current"}}'
+fi
+EOF
+    chmod +x "${TMP_DIR}/fake_strata_bin/strata"
+    PATH="${TMP_DIR}/fake_strata_bin:${PATH}"
+    unset "HOST_PLUGIN_LOADED[strata]"
+    LOADED_HOST_PLUGINS=()
+    AVAILABLE_HOST_PLUGINS=("strata")
+    HOST_UPDATE_AVAIL=()
+    HOST_UPDATE_LATEST=()
+    STRATA_UPDATE_AVAILABLE=false
+    STRATA_UPDATE_SUMMARY=""
+    NO_PLUGINS=false
+    CHECK_ONLY=false
+    discover_host_plugins() { AVAILABLE_HOST_PLUGINS=("strata"); }
+    check_server_updates_now
+    assert_eq "$STRATA_UPDATE_AVAILABLE" "true" "check_server_updates_now sets STRATA_UPDATE_AVAILABLE directly on startup"
+    assert_eq "$STRATA_UPDATE_SUMMARY" "engine 0.4.0 -> 0.5.0" "check_server_updates_now parses Strata update summary with leading log output"
+    # Simulate fresh render on every header mode before any timeout tick
+    HOST_UPDATE_AVAIL=()
+    STRATA_UPDATE_AVAILABLE=false
+    STRATA_UPDATE_SUMMARY=""
+    for _hmode in "toggle" "stats" "none"; do
+      HOST_UPDATE_AVAIL=()
+      STRATA_UPDATE_AVAILABLE=false
+      hdr_out="$(print_header "$_hmode")"
+      assert_contains "$hdr_out" "[UPDATE AVAILABLE] Strata update ready (engine 0.4.0 -> 0.5.0)" "print_header (${_hmode}) renders Strata update banner immediately"
+    done
+    hdr_skip="$(print_header none true)"
+    assert_contains "$hdr_skip" "[UPDATE AVAILABLE] Strata update ready (engine 0.4.0 -> 0.5.0)" "print_header (skip_rule) renders Strata update banner on history page"
+    _host_clear_update_cache "strata"
+    assert_eq "$STRATA_UPDATE_AVAILABLE" "false" "_host_clear_update_cache resets STRATA_UPDATE_AVAILABLE"
+    hdr_cleared="$(print_header none)"
+    assert_not_contains "$hdr_cleared" "[UPDATE AVAILABLE]" "print_header hides banner once Strata update cache is cleared"
+  )
+
   DISTRO_FAMILY="arch" IS_MACOS=false AUR_HELPER="" LLAMACPP_BIN="/usr/local/bin/llama-server"
   pacman() { return 1; }
   PKG_INST_CACHE=()

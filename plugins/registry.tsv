@@ -1,6 +1,6 @@
 hosts	adamant	Adamant	Install, update, manage service, and benchmark Adamant (NVIDIA Ada/Ampere Basalt/Strata fork)	plugins/hosts/adamant.sh	5721a68c84ab86fc85c7c5c5463f5483dff847973a06541234ea8b23490cbc9e	linux-nvidia
 hosts	basalt	Basalt	Install, update, manage service, and benchmark Basalt (NVIDIA Blackwell Strata fork)	plugins/hosts/basalt.sh	71b54c1ae8213c896c22c720eb4275e6fa329fee150d81d9c957e36a4872c900	linux-nvidia
-hosts	_common	_common		plugins/hosts/_common.sh	85a09fe792a13f1d47b6006d6edaa228a651efba1d281af5cdd7d509391c3d90	all
+hosts	_common	_common		plugins/hosts/_common.sh	674e3eb2d1bae5bd99ddcc6e383b04e0154c12faa730bdadc9bc135405d00636	all
 hosts	exo	exo	Install, update, manage service, and benchmark exo distributed cluster server	plugins/hosts/exo.sh	6f9ebc8f3c06190b2adebe78b4ecb8e28f0acfaa30692c381e4a1389af9fb542	all
 hosts	ik-llamacpp	ik_llama.cpp	Install, update, manage service, and benchmark ik_llama.cpp (CPU/hybrid MoE)	plugins/hosts/ik-llamacpp.sh	7832d09eec701376b5d676a39497469afdf466532af47a85a9096003bad20932	all
 hosts	ktransformers	KTransformers	Install, update, manage service, and benchmark KTransformers hybrid MoE server	plugins/hosts/ktransformers.sh	ed4a165f6437f451ae648d687cade24dc1497a2e7f717d78f12749e90b0d538e	linux
@@ -12,7 +12,7 @@ hosts	ollama	Ollama	Install, update, manage service, and benchmark Ollama LLM se
 hosts	openvino	OpenVINO	Install, update, manage service, and benchmark OpenVINO Model Server (Intel NPU/GPU/CPU)	plugins/hosts/openvino.sh	22a00d788fac34c358b0c46f2204f5ce2ee1a3e635d69c57d17902bf5626292f	linux
 hosts	polystrata	PolyStrata	Install, update, manage service, and benchmark PolyStrata (Strata fork, multi-engine)	plugins/hosts/polystrata.sh	d62f40cacd5d1e48a7b9c1a2dbdd69b4f37835dc5dbea51f908f3026948234b3	all
 hosts	sglang	SGLang	Install, update, manage service, and benchmark SGLang inference server	plugins/hosts/sglang.sh	b27520700fccef87b4c38ac2a03aec2190d1bb84f61ee8cee50e1ed7a4eab86c	linux
-hosts	strata	Strata	Install, update, launch, and benchmark Strata LLM server	plugins/hosts/strata.sh	f70549d8a3feaf5f1d8caf1a86f8cd95de1659cb4d4cffd3691c7f5f8a456b66	all
+hosts	strata	Strata	Install, update, launch, and benchmark Strata LLM server	plugins/hosts/strata.sh	16225e11d6c50bf58b8d6d0b9734b163e3fd3a7a607486527c66aa35a9e795d5	all
 hosts	tabbyapi	TabbyAPI	Install, update, manage service, and benchmark TabbyAPI (ExLlamaV2/V3)	plugins/hosts/tabbyapi.sh	8979d648c9185948a7e4e014563a2efd7aee7ff276b0ea2997cba34c9d2d8660	linux-gpu
 hosts	tensorrt-llm	TensorRT-LLM	Install, update, manage service, and benchmark NVIDIA TensorRT-LLM (trtllm-serve)	plugins/hosts/tensorrt-llm.sh	92f1d13120001eb1a63b797553b0273cdae78f738ed23108058a0a1ddf31e59d	linux-nvidia
 hosts	vllm	vLLM	Install, update, manage service, and benchmark vLLM inference server	plugins/hosts/vllm.sh	d1d15b3580e3e30364ed7cea875d06c5796ac9929af57821bd0b5fd31c61515d	linux

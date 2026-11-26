@@ -158,7 +158,7 @@ STRATA_UPDATE_AVAILABLE=false STRATA_UPDATE_SUMMARY="" STRATA_UPDATE_CACHE_FILE=
 UNIT_FILES_CACHE=""
 declare -A PKG_AVAIL_CACHE PKG_INST_CACHE
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT_VERSION="1.9.7"
+SCRIPT_VERSION="1.9.8"
 PLUGIN_BASE_URL="${STRATA_PLUGIN_BASE_URL:-https://raw.githubusercontent.com/bramvanoploo/strata-performance-setup/main}"
 if [[ -n "${STRATA_PLUGIN_CACHE_DIR:-}" ]]; then
   PLUGIN_CACHE_DIR="$STRATA_PLUGIN_CACHE_DIR"
@@ -4675,36 +4675,124 @@ load_server_update_states() {
     [[ -n "$pid" ]] || continue
     HOST_UPDATE_AVAIL[$pid]="${avail:-false}"
     HOST_UPDATE_LATEST[$pid]="${latest:-}"
+    if [[ "$pid" == "strata" ]]; then
+      if [[ "$avail" == "true" ]]; then
+        STRATA_UPDATE_AVAILABLE=true
+        STRATA_UPDATE_SUMMARY="${latest:-}"
+      else
+        STRATA_UPDATE_AVAILABLE=false
+        STRATA_UPDATE_SUMMARY=""
+      fi
+    fi
   done < "$sfile"
 }
 
-start_server_update_poller() {
-  [[ "$NO_PLUGINS" != true && "$CHECK_ONLY" != true ]] || return 0
-  discover_host_plugins
-  (( ${#AVAILABLE_HOST_PLUGINS[@]} > 0 )) || return 0
+save_server_update_state() {
+  local id="$1" avail="${2:-false}" latest="${3:-}"
+  HOST_UPDATE_AVAIL[$id]="$avail"
+  HOST_UPDATE_LATEST[$id]="$latest"
+  if [[ "$id" == "strata" ]]; then
+    if [[ "$avail" == "true" ]]; then
+      STRATA_UPDATE_AVAILABLE=true
+      STRATA_UPDATE_SUMMARY="$latest"
+    else
+      STRATA_UPDATE_AVAILABLE=false
+      STRATA_UPDATE_SUMMARY=""
+    fi
+  fi
+  [[ "${CHECK_ONLY:-false}" != true ]] || return 0
+  local sfile sdir tmp_sfile
+  sfile="$(_server_update_summary_file)"
+  sdir="$(dirname "$sfile")"
+  mkdir -p "$sdir" 2>/dev/null || return 0
+  tmp_sfile="${sfile}.tmp.$$"
+  if [[ -f "$sfile" ]]; then
+    awk -F'|' -v id="$id" '$1 != id' "$sfile" > "$tmp_sfile" 2>/dev/null || : > "$tmp_sfile"
+  else
+    : > "$tmp_sfile" 2>/dev/null || return 0
+  fi
+  printf "%s|%s|%s\n" "$id" "$avail" "$latest" >> "$tmp_sfile" 2>/dev/null || { rm -f "$tmp_sfile" 2>/dev/null || true; return 0; }
+  mv -f "$tmp_sfile" "$sfile" 2>/dev/null || rm -f "$tmp_sfile" 2>/dev/null || true
+  [[ $EUID -eq 0 && "${TARGET_USER:-root}" != "root" ]] && chown "$TARGET_USER" "$sdir" "$sfile" 2>/dev/null || true
+}
+
+_poll_all_server_updates() {
+  local force_fresh="${1:-false}"
   local sfile sdir
   sfile="$(_server_update_summary_file)"
   sdir="$(dirname "$sfile")"
   (
-    local _IN_SERVER_UPDATE_POLLER=true
-    local pid tmp_sfile="${sfile}.tmp.$$"
+    _IN_SERVER_UPDATE_POLLER=true
+    _FORCE_FRESH_UPDATE_CHECK="$force_fresh"
     mkdir -p "$sdir" 2>/dev/null || exit 0
-    : > "$tmp_sfile" 2>/dev/null || exit 0
+    local tmp_dir="${sdir}/.poll.${BASHPID:-$$}"
+    rm -rf "$tmp_dir" 2>/dev/null || true
+    mkdir -p "$tmp_dir" 2>/dev/null || exit 0
+    local pid
     for pid in "${AVAILABLE_HOST_PLUGINS[@]}"; do
-      if [[ -z "${HOST_PLUGIN_LOADED[$pid]:-}" ]]; then
-        load_plugin hosts "$pid" >/dev/null 2>&1 || continue
-      fi
-      if [[ "$pid" == "strata" ]] && declare -F check_strata_update_sync >/dev/null 2>&1; then
-        check_strata_update_sync >/dev/null 2>&1 || true
-        declare -F load_strata_update_state >/dev/null 2>&1 && load_strata_update_state
-        printf "strata|%s|%s\n" "${STRATA_UPDATE_AVAILABLE:-false}" "${STRATA_UPDATE_SUMMARY:-}" >> "$tmp_sfile" 2>/dev/null || true
-      elif declare -F "${pid}_check_update" >/dev/null 2>&1; then
-        "${pid}_check_update" >/dev/null 2>&1 || true
-        printf "%s|%s|%s\n" "$pid" "${HOST_UPDATE_AVAIL[$pid]:-false}" "${HOST_UPDATE_LATEST[$pid]:-}" >> "$tmp_sfile" 2>/dev/null || true
-      fi
+      (
+        if [[ -z "${HOST_PLUGIN_LOADED[$pid]:-}" ]]; then
+          load_plugin hosts "$pid" >/dev/null 2>&1 || exit 0
+        fi
+        if [[ "$pid" == "strata" ]] && declare -F check_strata_update_sync >/dev/null 2>&1; then
+          if [[ -z "${STRATA_BIN:-}" ]] && declare -F refresh_strata_bin >/dev/null 2>&1; then
+            refresh_strata_bin
+          fi
+          if [[ -n "${STRATA_BIN:-}" ]]; then
+            STRATA_UPDATE_CACHE_FILE="" check_strata_update_sync >/dev/null 2>&1 || true
+          else
+            STRATA_UPDATE_AVAILABLE=false
+            STRATA_UPDATE_SUMMARY=""
+          fi
+          printf "strata|%s|%s\n" "${STRATA_UPDATE_AVAILABLE:-false}" "${STRATA_UPDATE_SUMMARY:-}" > "${tmp_dir}/${pid}" 2>/dev/null || true
+        elif declare -F "${pid}_check_update" >/dev/null 2>&1; then
+          "${pid}_check_update" >/dev/null 2>&1 || true
+          printf "%s|%s|%s\n" "$pid" "${HOST_UPDATE_AVAIL[$pid]:-false}" "${HOST_UPDATE_LATEST[$pid]:-}" > "${tmp_dir}/${pid}" 2>/dev/null || true
+        fi
+      ) &
     done
+    wait 2>/dev/null || true
+    local tmp_sfile="${sfile}.tmp.${BASHPID:-$$}"
+    : > "$tmp_sfile" 2>/dev/null || { rm -rf "$tmp_dir" 2>/dev/null || true; exit 0; }
+    for pid in "${AVAILABLE_HOST_PLUGINS[@]}"; do
+      [[ -r "${tmp_dir}/${pid}" ]] && cat "${tmp_dir}/${pid}" >> "$tmp_sfile" 2>/dev/null || true
+    done
+    rm -rf "$tmp_dir" 2>/dev/null || true
     mv -f "$tmp_sfile" "$sfile" 2>/dev/null || rm -f "$tmp_sfile" 2>/dev/null || true
-    [[ $EUID -eq 0 && "${TARGET_USER:-root}" != "root" ]] && chown "$TARGET_USER" "$sdir" "$sfile" 2>/dev/null || true
+    [[ $EUID -eq 0 && "${TARGET_USER:-root}" != "root" ]] && chown -R "$TARGET_USER" "$sdir" 2>/dev/null || true
+  ) >/dev/null 2>&1
+}
+
+check_server_updates_now() {
+  [[ "$NO_PLUGINS" != true && "$CHECK_ONLY" != true ]] || return 0
+  discover_host_plugins
+  (( ${#AVAILABLE_HOST_PLUGINS[@]} > 0 )) || return 0
+  [[ -t 1 ]] && echo -e "${C_DIM}Checking for inference server updates...${C_RESET}"
+  _poll_all_server_updates true
+  load_server_update_states
+}
+
+stop_server_update_poller() {
+  if [[ -n "${SERVER_UPDATE_POLLER_PID:-}" ]]; then
+    kill "$SERVER_UPDATE_POLLER_PID" 2>/dev/null || true
+    wait "$SERVER_UPDATE_POLLER_PID" 2>/dev/null || true
+    SERVER_UPDATE_POLLER_PID=""
+  fi
+}
+
+start_server_update_poller() {
+  [[ "$NO_PLUGINS" != true && "$CHECK_ONLY" != true ]] || return 0
+  [[ -z "${SERVER_UPDATE_POLLER_PID:-}" ]] || return 0
+  discover_host_plugins
+  (( ${#AVAILABLE_HOST_PLUGINS[@]} > 0 )) || return 0
+  (
+    trap 'kill $(jobs -p) 2>/dev/null || true; exit 0' TERM INT
+    while true; do
+      # shortcut: 2h matches the update-cache TTL in _host_check_update_cached; startup always runs a fresh check first
+      sleep "${STRATA_UPDATE_POLL_INTERVAL:-7200}" &
+      wait $! 2>/dev/null || exit 0
+      _poll_all_server_updates false
+    done
   ) >/dev/null 2>&1 &
   SERVER_UPDATE_POLLER_PID=$!
 }
@@ -4858,6 +4946,7 @@ print_header() {
   echo -e "${C_BOLD}${C_CYAN}${_hdr_eq}${C_RESET}"
   printf "${C_BOLD}${C_CYAN}%*s%s${C_RESET}\n" "$_title_pad" "" "$_title"
   echo -e "${C_BOLD}${C_CYAN}${_hdr_eq}${C_RESET}"
+  load_server_update_states
   declare -F load_strata_update_state >/dev/null 2>&1 && load_strata_update_state
   if [[ "$hdr_mode" == "toggle" ]]; then
     LIVE_STATS_COUNT=0
@@ -4896,7 +4985,7 @@ print_header() {
     POST_HEADER_LINES=$((POST_HEADER_LINES - 1))
     UPDATE_BANNER_OFFSET=$((UPDATE_BANNER_OFFSET - 1))
   fi
-  if (( $(_count_server_updates) > 0 )); then
+  if [[ "$NO_PLUGINS" != true ]] && (( $(_count_server_updates) > 0 )); then
     printf "%s\n" "$(format_server_update_banner "$_rule_w")"
   else
     echo ""
@@ -5041,10 +5130,10 @@ _tui_poll_live_stats_tick() {
   local lines_up="$1" term_lines="$2" compact_bar="$3" tmp_file="$4" buf="$5"
   local prev_upd_cnt new_upd_cnt new_lines stats_block
   prev_upd_cnt="$(_count_server_updates)"
-  declare -F load_strata_update_state >/dev/null 2>&1 && load_strata_update_state
   load_server_update_states
+  declare -F load_strata_update_state >/dev/null 2>&1 && load_strata_update_state
   new_upd_cnt="$(_count_server_updates)"
-  if (( prev_upd_cnt == 0 && new_upd_cnt > 0 )); then
+  if (( prev_upd_cnt != new_upd_cnt && new_upd_cnt > 0 )); then
     local _b_up=$(( lines_up - LIVE_STATS_COUNT - UPDATE_BANNER_OFFSET ))
     if ! _render_server_update_banner_inplace "$_b_up" "$term_lines" && [[ -z "$buf" ]]; then
       return 1
@@ -5136,7 +5225,7 @@ read_line_with_live_stats() {
           _line_out="__toggle__"; return 0
         fi
         local _accept=false
-        if [[ -z "$buf" && "$ch" =~ ^[bB]$ ]]; then
+        if [[ -z "$buf" && "$ch" =~ ^[bBuU]$ ]]; then
           _accept=true
         elif [[ "$ch" =~ ^[0-9]$ ]] && [[ -z "$buf" || "$buf" =~ ^[0-9]+$ ]]; then
           local _cand="${buf}${ch}"
@@ -5625,6 +5714,8 @@ show_inference_servers_page() {
     (( sel >= total )) && sel=$(( total - 1 ))
     (( sel < 0 )) && sel=0
 
+    load_server_update_states
+    declare -F load_strata_update_state >/dev/null 2>&1 && load_strata_update_state
     local -a outdated_pids=()
     local _opid outdated_names=""
     while IFS= read -r _opid; do
@@ -5662,15 +5753,30 @@ show_inference_servers_page() {
     (( ${#help_plain} > max_footer_w )) && max_footer_w=${#help_plain}
     echo ""
 
-    local saved_tty="" open_pid="" do_update_all=false do_refresh=false
+    local saved_tty="" open_pid="" do_update_all=false do_refresh=false init_srv_upd="${#outdated_pids[@]}"
     saved_tty="$(stty -g 2>/dev/null || true)"
     stty -echo 2>/dev/null || true
     trap '_tui_restore_tty "$saved_tty"; exit 0' INT TERM
 
     printf "Select server: "
     while true; do
-      local action=""
-      IFS= read -rsn1 action || { _tui_restore_tty "$saved_tty"; trap - INT TERM; printf "\n"; return 0; }
+      local action="" rc=0
+      if [[ -t 0 && -t 1 ]]; then
+        IFS= read -rsn1 -t 1 action || rc=$?
+      else
+        IFS= read -rsn1 action || rc=$?
+      fi
+      if (( rc > 128 )); then
+        load_server_update_states
+        declare -F load_strata_update_state >/dev/null 2>&1 && load_strata_update_state
+        if (( $(_count_server_updates) != init_srv_upd )); then
+          do_refresh=true
+          break
+        fi
+        continue
+      elif (( rc != 0 )); then
+        _tui_restore_tty "$saved_tty"; trap - INT TERM; printf "\n"; return 0
+      fi
       if [[ "$action" == $'\e' ]]; then
         local seq=""
         _tui_read_esc_seq seq
@@ -5942,11 +6048,7 @@ show_index() {
 
 cleanup_all_on_exit() {
   run_host_hook cleanup
-  if [[ -n "${SERVER_UPDATE_POLLER_PID:-}" ]]; then
-    kill "$SERVER_UPDATE_POLLER_PID" 2>/dev/null || true
-    wait "$SERVER_UPDATE_POLLER_PID" 2>/dev/null || true
-    SERVER_UPDATE_POLLER_PID=""
-  fi
+  stop_server_update_poller
   stop_bench_power_sampler
   [[ -n "$BENCH_POWER_TMP_FILE" ]] && rm -f "$BENCH_POWER_TMP_FILE" 2>/dev/null || true
   if [[ -n "$ACTIVE_SAMPLER_PID" ]]; then
@@ -6353,6 +6455,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   for _req_p in ${REQUESTED_HOST_PLUGINS[@]+"${REQUESTED_HOST_PLUGINS[@]}"}; do
     load_plugin hosts "$_req_p" || true
   done
+  check_server_updates_now
   start_server_update_poller
   show_index
 fi
