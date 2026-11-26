@@ -15,6 +15,7 @@ _hash_file() {
 }
 
 tmp="${OUT_FILE}.tmp.$$"
+trap 'rm -f "$tmp"' EXIT
 : > "$tmp"
 
 for cat in hosts tweaks; do
@@ -25,9 +26,9 @@ for cat in hosts tweaks; do
     base="$(basename "$f")"
     [[ "$base" == _* && "$base" != "_common.sh" ]] && continue
     id="${base%.sh}"
-    name="$(awk -F': ' '/^# PLUGIN_NAME:/ {print $2; exit}' "$f" || true)"
-    desc="$(awk -F': ' '/^# PLUGIN_DESC:/ {print $2; exit}' "$f" || true)"
-    plat="$(awk -F': ' '/^# PLUGIN_PLATFORMS:/ {print $2; exit}' "$f" || true)"
+    name="$(sed -n 's/^# PLUGIN_NAME:[[:space:]]*//p; /^# PLUGIN_NAME:/q' "$f" || true)"
+    desc="$(sed -n 's/^# PLUGIN_DESC:[[:space:]]*//p; /^# PLUGIN_DESC:/q' "$f" || true)"
+    plat="$(sed -n 's/^# PLUGIN_PLATFORMS:[[:space:]]*//p; /^# PLUGIN_PLATFORMS:/q' "$f" || true)"
     sha="$(_hash_file "$f")"
     printf '%s\t%s\t%s\t%s\tplugins/%s/%s\t%s\t%s\n' \
       "$cat" "$id" "${name:-$id}" "${desc:-}" "$cat" "$base" "$sha" "${plat:-all}" >> "$tmp"

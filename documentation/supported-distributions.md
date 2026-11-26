@@ -13,6 +13,9 @@ The wizard supports Linux distributions across systemd, Slackware SysVinit, and 
 | **TrueNAS SCALE** | TrueNAS SCALE (Debian-based appliance with `systemd`; host-tuning mode for containerized Strata, skips restricted `apt-get` installs) | host-only (appliance) |
 | **Synology DSM** | Synology DSM 7 (`systemd`) & DSM 6 (`/usr/local/etc/rc.d/strata-*.sh`); host-tuning mode for containerized Strata | host-only (appliance) |
 | **WSL2 (Windows)** | Ubuntu, Debian, Fedora, Arch, openSUSE under Windows Subsystem for Linux 2 (`wsl2_windows_config` for `.wslconfig` RAM cap & idle timeout, `wsl2_linux_tuning` for `/etc/wsl.conf` `systemd`/metadata & native `ext4` model storage; bare-metal-only steps are automatically hidden) | Distro native (`apt-get` / `dnf` / `pacman` / `zypper`) |
+| **Immutable / Atomic (`ostree`)** | Fedora Silverblue / Kinoite, Bazzite, Universal Blue (`rpm-ostree kargs` for kernel parameters) | `rpm-ostree` |
+| **NixOS** | NixOS (declarative system detection; warns that `boot.kernelParams` and `systemPackages` should be managed in NixOS config) | Declarative (`nix`) |
+| **Raspberry Pi** | Raspberry Pi OS / Debian ARM64 (`/boot/firmware/cmdline.txt` or `/boot/cmdline.txt` kernel parameters) | `apt-get` |
 | **macOS** | macOS 15+ on **Apple Silicon** (`arm64` / M1–M5+, `launchd` user LaunchAgents & system LaunchDaemons; requires Bash 4.3+ via `brew install bash`, automatically re-execed when invoked with `/bin/bash`) | `brew` (Homebrew) |
 
 > **Apple Hardware Notes:**

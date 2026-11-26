@@ -179,6 +179,7 @@ if os.path.exists(p):
     with open(p) as src:
         comments = [l for l in src if l.lstrip().startswith("#")]
 cp = configparser.ConfigParser()
+cp.optionxform = str
 if os.path.exists(p):
     cp.read(p)
 if not cp.has_section("boot"):
@@ -187,7 +188,11 @@ cp.set("boot", "systemd", "true")
 if not cp.has_section("automount"):
     cp.add_section("automount")
 cp.set("automount", "enabled", "true")
-cp.set("automount", "options", '"metadata"')
+cur_opts = cp.get("automount", "options", fallback="").strip().strip('"')
+opt_list = [o.strip() for o in cur_opts.split(",") if o.strip()]
+if "metadata" not in opt_list:
+    opt_list.insert(0, "metadata")
+cp.set("automount", "options", '"' + ",".join(opt_list) + '"')
 with open(p, "w") as f:
     f.writelines(l if l.endswith("\n") else l + "\n" for l in comments)
     cp.write(f, space_around_delimiters=False)
@@ -215,7 +220,7 @@ EOF
 revert_wsl2_linux_tuning() {
   if [[ -f /etc/wsl.conf.strata.bak ]]; then
     run_root mv -f /etc/wsl.conf.strata.bak /etc/wsl.conf
-  else
+  elif [[ -f "$WSL2_CONF_MARKER" ]]; then
     run_root rm -f /etc/wsl.conf
   fi
   run_root rm -f "$WSL2_CONF_MARKER"

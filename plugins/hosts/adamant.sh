@@ -155,7 +155,7 @@ _adamant_dispatch() {
       _host_openai_bench "Adamant" "$ADAMANT_URL"
       ;;
     uninstall)
-      _host_standard_uninstall "adamant" "Adamant" "adamant.service" "$ADAMANT_BIN" "$ADAMANT_SOURCE" "adamant"
+      _host_standard_uninstall "adamant" "Adamant" "adamant.service" "$ADAMANT_BIN" "$ADAMANT_SOURCE" "adamant" "${TARGET_HOME:-$HOME}/.local/bin/adamant"
       _adamant_refresh
       _host_clear_update_cache "adamant"
       ;;

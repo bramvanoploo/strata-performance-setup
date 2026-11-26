@@ -3,6 +3,11 @@
 # PLUGIN_NAME: Strata
 # PLUGIN_DESC: Install, update, launch, and benchmark Strata LLM server
 
+if [[ -z "${_HOST_COMMON_LOADED:-}" ]]; then
+  # shellcheck source=/dev/null
+  source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_common.sh"
+fi
+
 register_host_plugin \
   --id "strata" \
   --name "Strata" \
@@ -25,7 +30,7 @@ strata_open() {
 }
 
 strata_live_stats() {
-  refresh_strata_running
+  [[ "${_LIVE_TICK_STRATA_REFRESHED:-false}" != true ]] && refresh_strata_running
   collect_strata_stats_lines
 }
 
@@ -50,10 +55,6 @@ strata_table_status() {
     fi
   fi
   printf "%s|%s" "$inst" "$svc"
-}
-
-strata_bench_stats() {
-  collect_strata_bench_lines
 }
 
 strata_check_summary() {
@@ -154,14 +155,6 @@ strata_service_label() {
     echo "com.strata.server"
   else
     echo "strata.service"
-  fi
-}
-applicable_strata_manager() { return 0; }
-title_strata_manager() {
-  if [[ "$HAS_LAUNCHD" == true ]]; then
-    echo "Strata: Install, Update, Launch & launchd Service"
-  else
-    echo "Strata: Install, Update, Launch & Systemd Service"
   fi
 }
 strata_service_installed() { service_installed strata.service; }
@@ -527,6 +520,7 @@ perform_strata_update() {
   if (( rc == 0 )); then
     echo -e "\n${C_GREEN}Strata update completed successfully!${C_RESET}"
     echo -e "${C_DIM}Installed version: $(run_as_user_exec "$STRATA_BIN" --version 2>/dev/null || echo unknown)${C_RESET}"
+    _host_clear_update_cache "strata" 2>/dev/null || true
     check_strata_update_sync >/dev/null 2>&1 || true
   else
     echo -e "\n${C_RED}Strata update failed (exit code ${rc}).${C_RESET}"
@@ -601,23 +595,6 @@ format_strata_hw_warnings() {
   fi
 }
 
-status_strata_manager() { [[ -n "$STRATA_BIN" ]] && strata_service_installed; }
-explain_strata_manager() {
-  local svc_lbl
-  svc_lbl="$(strata_service_label)"
-  cat <<EOF
-Impact:
-  Installs Strata (Niko1221/Strata), checks for updates ('strata update'),
-  runs 'strata launch', benchmarks running instances ('strata bench run'),
-  and installs/uninstalls ${svc_lbl} using a saved preset.
-EOF
-  local hw_warns=""
-  hw_warns="$(format_strata_hw_warnings)"
-  if [[ -n "$hw_warns" ]]; then
-    echo ""
-    printf "%s\n" "$hw_warns"
-  fi
-}
 list_strata_presets() {
   local preset_dir="$TARGET_HOME/.config/strata/launch-presets" cli_out f
   if [[ -n "$STRATA_BIN" ]]; then
@@ -1711,6 +1688,7 @@ strata_action_remove() {
   fi
   STRATA_BIN="" STRATA_VERSION="" STRATA_RUNNING_PRESET="" STRATA_RUNNING_URL=""
   STRATA_UPDATE_AVAILABLE=false STRATA_UPDATE_SUMMARY=""
+  _host_clear_update_cache "strata" 2>/dev/null || true
 }
 
 strata_action_service() {
@@ -1854,22 +1832,6 @@ EOF
   else
     echo -e "\n${C_YELLOW}Strata is not currently serving. Start ${svc_lbl} or 'strata launch' first.${C_RESET}"
   fi
-}
-
-strata_action_history() {
-  show_benchmark_history
-}
-
-explain_strata_history() {
-  local cnt
-  cnt="$(count_bench_history)"
-  cat <<'EOF'
-Impact:
-  Lists all recorded benchmark runs with decode/prefill throughput and average
-  GPU/CPU/system power consumption. Selecting any result lets you revert/apply
-  the host optimizations to match what was active during that benchmark run.
-EOF
-  echo -e "\nRecorded benchmark results: ${cnt}"
 }
 
 _user_cache_dir() {
@@ -2762,7 +2724,9 @@ PY
 }
 
 run_strata_option() {
-  local target_opt="$1" auto_run="${2:-false}" s_idx=0 total="${#ACTIVE_STRATA_OPTIONS[@]}" i opt action action_label
+  local target_opt="$1" auto_run="${2:-false}" s_idx=0 total i opt action action_label
+  (( ${#ACTIVE_STRATA_OPTIONS[@]} == 0 )) && build_strata_options
+  total="${#ACTIVE_STRATA_OPTIONS[@]}"
   (( total > 0 )) || return 0
   for (( i = 0; i < total; i++ )); do
     [[ "${ACTIVE_STRATA_OPTIONS[$i]}" == "$target_opt" ]] && { s_idx=$i; break; }
@@ -3059,32 +3023,6 @@ format_strata_toggle_row() {
     printf "%b %b%s%b %b%s%b  %b%s%b" "$ptr" "${C_YELLOW}${C_BOLD}" "$tag" "${C_RESET}" "${C_BOLD}" "$title" "${C_RESET}" "${C_DIM}" "$sub" "${C_RESET}"
   fi
 }
-
-format_strata_update_banner() {
-  local rule_w="${1:-117}"
-  [[ "$STRATA_UPDATE_AVAILABLE" == true ]] || return 0
-  local msg=" [UPDATE AVAILABLE] Strata update ready — Press [u] to install & restart service "
-  if (( rule_w > 10 && ${#msg} > rule_w )); then
-    msg="${msg:0:$((rule_w - 3))}..."
-  fi
-  local pad=$(( rule_w - ${#msg} ))
-  local spaces=""
-  (( pad > 0 )) && printf -v spaces "%*s" "$pad" ""
-  printf "%b%s%s%b" "${C_UPDATE_BANNER}" "$msg" "$spaces" "${C_RESET}"
-}
-
-_render_update_banner_inplace() {
-  local banner_up="$1" term_lines="${2:-40}"
-  (( banner_up > 0 && banner_up < term_lines )) || return 1
-  local rule_w=120
-  [[ -t 1 ]] && rule_w="$(tput cols 2>/dev/null || echo 117)"
-  (( rule_w > 117 )) && rule_w=117
-  local banner_line
-  banner_line="$(format_strata_update_banner "$rule_w")"
-  printf "\033[?2026h\033[?25l\033[s\033[%dA\r\033[2K%s\033[u\033[?25h\033[?2026l" "$banner_up" "$banner_line"
-  return 0
-}
-
 
 format_strata_row() {
   local s_idx="$1" selected="${2:-false}"

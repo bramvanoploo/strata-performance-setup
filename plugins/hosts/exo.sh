@@ -76,7 +76,7 @@ exo_table_status() {
 }
 
 exo_check_update() {
-  [[ -n "$EXO_BIN" ]] && _host_check_update_by_source "exo" "$EXO_SOURCE" "$EXO_VERSION" "exo" "exo-explore/exo"
+  [[ -n "$EXO_BIN" ]] && _host_check_update_by_source "exo" "$EXO_SOURCE" "$EXO_VERSION" "" "exo-explore/exo"
 }
 
 exo_update() {

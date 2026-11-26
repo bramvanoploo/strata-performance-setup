@@ -29,7 +29,9 @@ applicable_tenstorrent_setup() {
 }
 title_tenstorrent_setup() { echo "Tenstorrent NPU Hugepages, KMD & Device Permissions (tt-metal / vLLM)"; }
 status_tenstorrent_setup() {
-  [[ -f "$TT_UDEV" && -f "$TT_SYSCTL" ]] && (( $(sysctl -n vm.nr_hugepages 2>/dev/null || echo 0) >= 64 ))
+  local hp
+  hp="$(sysctl -n vm.nr_hugepages 2>/dev/null || echo 0)"
+  [[ -f "$TT_UDEV" && -f "$TT_SYSCTL" && "$hp" =~ ^[0-9]+$ ]] && (( hp >= 64 ))
 }
 explain_tenstorrent_setup() {
   cat <<'EOF'

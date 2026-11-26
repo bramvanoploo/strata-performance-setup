@@ -129,10 +129,10 @@ _basalt_install_or_update() {
         if run_as_user_exec tar -xzf "$tmp_tgz" -C "${pfx}/bin" --strip-components=1 2>/dev/null || run_as_user_exec tar -xzf "$tmp_tgz" -C "${pfx}/bin"; then
           rm -f "$tmp_tgz"
           if [[ -x "${pfx}/bin/bin/basalt" ]]; then
-            mv "${pfx}/bin/bin/"* "${pfx}/bin/" 2>/dev/null || true
+            run_as_user_exec mv "${pfx}/bin/bin/"* "${pfx}/bin/" 2>/dev/null || true
           fi
           if [[ -x "${pfx}/bin/basalt" ]]; then
-            printf '%s\n' "$latest" > "${pfx}/.version"
+            printf '%s\n' "$latest" | run_as_user_exec tee "${pfx}/.version" >/dev/null
             run_as_user_exec ln -sf "${pfx}/bin/basalt" "${TARGET_HOME:-$HOME}/.local/bin/basalt"
             _basalt_refresh
             return 0
@@ -185,7 +185,7 @@ _basalt_dispatch() {
       _host_openai_bench "Basalt" "$BASALT_URL"
       ;;
     uninstall)
-      _host_standard_uninstall "basalt" "Basalt" "basalt.service" "$BASALT_BIN" "$BASALT_SOURCE" "basalt"
+      _host_standard_uninstall "basalt" "Basalt" "basalt.service" "$BASALT_BIN" "$BASALT_SOURCE" "basalt" "${TARGET_HOME:-$HOME}/.local/bin/basalt"
       _basalt_refresh
       _host_clear_update_cache "basalt"
       ;;

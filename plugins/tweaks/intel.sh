@@ -120,9 +120,9 @@ status_intel_thermald() { unit_enabled thermald.service && unit_active thermald.
 explain_intel_thermald() { echo -e "Impact:\n  Installs/enables thermald, which uses RAPL/P-state/powerclamp cooling to hold\n  Intel CPUs just below thermal limits instead of hitting abrupt hardware throttling."; }
 apply_intel_thermald() {
   command -v thermald >/dev/null 2>&1 || prompt_install_deps repo thermald || return 0
-  run_root systemctl enable --now thermald.service
+  service_ctl enable-now thermald.service
 }
-revert_intel_thermald() { run_root systemctl disable --now thermald.service 2>/dev/null || true; }
+revert_intel_thermald() { service_ctl disable-now thermald.service 2>/dev/null || true; }
 
 # 12r. Intel compute stack
 intel_compute_pkgs() {
@@ -187,13 +187,13 @@ apply_intel_pcore_pinning() {
 [Service]
 CPUAffinity=${pcpus}
 EOF
-  run_root systemctl daemon-reload
+  service_ctl daemon-reload
   unit_active strata.service && echo -e "${C_YELLOW}Restart strata.service for P-core affinity to take effect.${C_RESET}" || true
 }
 revert_intel_pcore_pinning() {
   run_root rm -f /etc/systemd/system/strata.service.d/10-pcore-affinity.conf
   run_root rmdir /etc/systemd/system/strata.service.d 2>/dev/null || true
-  run_root systemctl daemon-reload
+  service_ctl daemon-reload
 }
 
 # 12r2. Intel Core Ultra NPU (intel_vpu) Stack & Device Access
@@ -243,21 +243,4 @@ EOF
 revert_intel_npu_stack() {
   run_root rm -f "$INTEL_NPU_UDEV"
   run_root udevadm control --reload >/dev/null 2>&1 || true
-}
-
-# 12y. macOS Metal GPU Wired Memory Limit (iogpu.wired_limit_mb)
-_macos_wired_limit_cur_mb() {
-  local v="${STRATA_MACOS_WIRED_LIMIT_MB:-$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)}"
-  [[ "$v" =~ ^[0-9]+$ ]] || v=0
-  echo "$v"
-}
-_macos_wired_limit_rec_gb() {
-  local r="${1:-${RAM_GB:-0}}"
-  if (( r >= 128 )); then echo $(( r - 16 ))
-  elif (( r >= 96 )); then echo $(( r - 12 ))
-  elif (( r >= 64 )); then echo $(( r - 10 ))
-  elif (( r >= 48 )); then echo $(( r - 8 ))
-  elif (( r >= 32 )); then echo $(( r - 6 ))
-  else echo $(( r - 5 ))
-  fi
 }

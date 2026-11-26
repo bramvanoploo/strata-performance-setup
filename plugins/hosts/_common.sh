@@ -42,12 +42,22 @@ _host_find_docker() {
 
 _host_http_get() {
   local url="$1" timeout="${2:-2}" h
-  shift 2
-  local -a hdr=()
-  for h in "$@"; do hdr+=(--header="$h"); done
+  if (( $# >= 2 )); then shift 2; else shift $#; fi
   if command -v curl >/dev/null 2>&1; then
-    curl -fsS --max-time "$timeout" ${hdr[@]+"${hdr[@]}"} "$url" 2>/dev/null || return 1
+    if (( $# > 0 )); then
+      local cfg="" esc_h=""
+      for h in "$@"; do
+        esc_h="${h//\\/\\\\}"
+        esc_h="${esc_h//\"/\\\"}"
+        cfg+="header = \"${esc_h}\""$'\n'
+      done
+      printf '%s' "$cfg" | curl -fsS --max-time "$timeout" -K - "$url" 2>/dev/null || return 1
+    else
+      curl -fsS --max-time "$timeout" "$url" 2>/dev/null || return 1
+    fi
   elif command -v wget >/dev/null 2>&1; then
+    local -a hdr=()
+    for h in "$@"; do hdr+=(--header="$h"); done
     wget -qO- --timeout="$timeout" ${hdr[@]+"${hdr[@]}"} "$url" 2>/dev/null || return 1
   else
     return 1
@@ -139,7 +149,7 @@ _host_openai_models() {
   local base_url="${1%/}" body="" out=""
   # shortcut: model list cached 5s (positives only) so live-stats redraws don't re-GET the same endpoint
   local cts="${_HOST_MODELS_TS[$base_url]:-}"
-  if [[ -n "$cts" ]]; then
+  if [[ -n "$cts" ]] && (( SECONDS - cts < 5 )); then
     printf '%s\n' "${_HOST_MODELS_CACHE[$base_url]}"
     return 0
   fi
@@ -215,13 +225,23 @@ _host_pkg_uninstall() {
 _host_standard_uninstall() {
   local id="$1" name="$2" unit="$3" bin_path="$4" src="$5" pkg_name="$6"
   shift 6
+  if ! [[ "$id" =~ ^[a-z0-9_-]+$ ]]; then
+    echo -e "${C_RED}Refusing to uninstall invalid host id '${id}'.${C_RESET}" >&2
+    return 1
+  fi
   local -a extra_paths=("$@")
-  local vdir host_dir owner_pkg="" has_svc=false
+  local vdir host_dir owner_pkg="" has_svc=false shared_interp=false
   vdir="$(_host_venv_dir "$id")"
   host_dir="${TARGET_HOME:-$HOME}/.local/share/strata-hosts/${id}"
   service_installed "$unit" 2>/dev/null && has_svc=true
 
-  if [[ "$src" == "manual" && -n "$bin_path" ]]; then
+  if [[ -n "$bin_path" ]]; then
+    case "$(basename "$bin_path")" in
+      python|python3|python3.*|node|sh|bash|zsh|env) shared_interp=true ;;
+    esac
+  fi
+
+  if [[ "$src" == "manual" && -n "$bin_path" && "$shared_interp" == false ]]; then
     owner_pkg="$(_host_owning_pkg "$bin_path" || true)"
   fi
 
@@ -236,7 +256,9 @@ _host_standard_uninstall() {
       echo "  - Package (${src}): ${pkg_name}"
       ;;
     installer|manual)
-      if [[ -n "$owner_pkg" ]]; then
+      if [[ "$shared_interp" == true ]]; then
+        echo "  - Shared system interpreter (${bin_path}) will NOT be removed; run 'pip uninstall ${pkg_name}' if installed in system Python."
+      elif [[ -n "$owner_pkg" ]]; then
         echo "  - Owning system package: ${owner_pkg}"
       elif [[ -n "$bin_path" ]]; then
         echo "  - Binary: ${bin_path}"
@@ -245,7 +267,7 @@ _host_standard_uninstall() {
       ;;
   esac
   local ep
-  for ep in "${extra_paths[@]}"; do
+  for ep in ${extra_paths[@]+"${extra_paths[@]}"}; do
     [[ -e "$ep" || -L "$ep" ]] && echo "  - Extra path: ${ep}"
   done
   echo ""
@@ -264,7 +286,9 @@ _host_standard_uninstall() {
       _host_pkg_uninstall "$pkg_name" || return 1
       ;;
     installer|manual)
-      if [[ -n "$owner_pkg" ]]; then
+      if [[ "$shared_interp" == true ]]; then
+        echo -e "${C_YELLOW}Skipped removing shared interpreter ${bin_path}; uninstall the Python package via pip.${C_RESET}"
+      elif [[ -n "$owner_pkg" ]]; then
         _host_pkg_uninstall "$owner_pkg" || return 1
       elif [[ -n "$bin_path" && ( -e "$bin_path" || -L "$bin_path" ) ]]; then
         if [[ -w "$(dirname "$bin_path")" ]]; then
@@ -276,7 +300,7 @@ _host_standard_uninstall() {
       [[ -d "$host_dir" ]] && { rm -rf "$host_dir" 2>/dev/null || run_root rm -rf "$host_dir"; }
       ;;
   esac
-  for ep in "${extra_paths[@]}"; do
+  for ep in ${extra_paths[@]+"${extra_paths[@]}"}; do
     [[ -e "$ep" || -L "$ep" ]] || continue
     if [[ -w "$(dirname "$ep")" ]]; then
       rm -rf "$ep"

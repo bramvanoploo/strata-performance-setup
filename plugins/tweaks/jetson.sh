@@ -91,5 +91,3 @@ WantedBy=multi-user.target
 EOF
 }
 revert_jetson_fan() { remove_service strata-jetson-fan.service; }
-
-# 12t. numactl interleave
