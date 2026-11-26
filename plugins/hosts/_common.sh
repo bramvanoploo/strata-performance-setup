@@ -51,9 +51,9 @@ _host_http_get() {
         esc_h="${esc_h//\"/\\\"}"
         cfg+="header = \"${esc_h}\""$'\n'
       done
-      printf '%s' "$cfg" | curl -fsS --max-time "$timeout" -K - "$url" 2>/dev/null || return 1
+      printf '%s' "$cfg" | curl -fsS --connect-timeout 2 --max-time "$timeout" -K - "$url" 2>/dev/null || return 1
     else
-      curl -fsS --max-time "$timeout" "$url" 2>/dev/null || return 1
+      curl -fsS --connect-timeout 2 --max-time "$timeout" "$url" 2>/dev/null || return 1
     fi
   elif command -v wget >/dev/null 2>&1; then
     local -a hdr=()
@@ -1095,17 +1095,19 @@ _host_vp_refresh() {
       [[ -z "$ver" ]] && ver="installed"
     fi
   fi
-  if [[ -z "$bin" && -n "$docker_pat" ]]; then
-    docker="$(_host_find_docker "$docker_pat" || true)"
+  if [[ "${_IN_SERVER_UPDATE_POLLER:-false}" != true ]]; then
+    if [[ -z "$bin" && -n "$docker_pat" ]]; then
+      docker="$(_host_find_docker "$docker_pat" || true)"
+    fi
+    local pat="$id"
+    [[ -n "$bin_name" && "$bin_name" != "python3" ]] && pat="(^|/)${bin_name}([[:space:]]|$)"
+    _HOST_VP_URL[$id]="$(_host_detect_url "http://127.0.0.1:${_HOST_VP_PORT[$id]}" "$pat" "$docker" "${id}.service")"
   fi
   src="$(_host_detect_install_source "$id" "$bin" "$pip_pkg" false)"
   _HOST_VP_BIN[$id]="$bin"
   _HOST_VP_VER[$id]="$ver"
   _HOST_VP_DOCKER[$id]="$docker"
   _HOST_VP_SRC[$id]="$src"
-  local pat="$id"
-  [[ -n "$bin_name" && "$bin_name" != "python3" ]] && pat="(^|/)${bin_name}([[:space:]]|$)"
-  _HOST_VP_URL[$id]="$(_host_detect_url "http://127.0.0.1:${_HOST_VP_PORT[$id]}" "$pat" "$docker" "${id}.service")"
 }
 
 _host_vp_running() {

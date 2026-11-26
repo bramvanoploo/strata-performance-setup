@@ -626,7 +626,48 @@ EOF
     assert_eq "$STRATA_UPDATE_AVAILABLE" "false" "_host_clear_update_cache resets STRATA_UPDATE_AVAILABLE"
     hdr_cleared="$(print_header none)"
     assert_not_contains "$hdr_cleared" "[UPDATE AVAILABLE]" "print_header hides banner once Strata update cache is cleared"
+    # _run_all_server_updates delegates to show_inference_servers_page true
+    _srv_called=""
+    show_inference_servers_page() { _srv_called="${1:-false}"; }
+    _run_all_server_updates
+    assert_eq "$_srv_called" "true" "_run_all_server_updates executes updates inside Server page"
+    # Exit code 7 (lock busy) preserves prior strata update state in summary.state
+    printf "strata|true|engine 0.4.0 -> 0.5.0\n" > "${STRATA_UPDATE_CACHE_DIR}/summary.state"
+    cat > "${TMP_DIR}/fake_strata_bin/strata" <<'EOF'
+#!/usr/bin/env bash
+exit 7
+EOF
+    chmod +x "${TMP_DIR}/fake_strata_bin/strata"
+    _poll_all_server_updates true
+    load_server_update_states
+    assert_eq "$STRATA_UPDATE_AVAILABLE" "true" "_poll_all_server_updates preserves prior update state on lock exit 7"
   )
+  if command -v python3 >/dev/null 2>&1; then
+    splash_out="$(python3 - "$SCRIPT" <<'PY' 2>/dev/null || true
+import os, pty, select, subprocess, sys
+m, s = pty.openpty()
+p = subprocess.Popen(["bash", "-c", f"source {sys.argv[1]!r}; sleep 0.08 & _render_startup_update_splash $!; wait"], stdin=s, stdout=s, stderr=s)
+os.close(s)
+out = b""
+while True:
+    r, _, _ = select.select([m], [], [], 2.0)
+    if not r:
+        break
+    try:
+        chunk = os.read(m, 4096)
+    except OSError:
+        break
+    if not chunk:
+        break
+    out += chunk
+os.close(m)
+p.wait(timeout=2)
+if p.returncode == 0:
+    print(out.decode("utf-8", "ignore"))
+PY
+)"
+    assert_contains "$splash_out" "Checking inference servers for updates" "_render_startup_update_splash renders cleanly under pty"
+  fi
 
   DISTRO_FAMILY="arch" IS_MACOS=false AUR_HELPER="" LLAMACPP_BIN="/usr/local/bin/llama-server"
   pacman() { return 1; }
