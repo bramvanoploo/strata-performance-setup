@@ -158,7 +158,7 @@ STRATA_UPDATE_AVAILABLE=false STRATA_UPDATE_SUMMARY="" STRATA_UPDATE_CACHE_FILE=
 UNIT_FILES_CACHE=""
 declare -A PKG_AVAIL_CACHE PKG_INST_CACHE
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT_VERSION="1.9.8"
+SCRIPT_VERSION="1.9.9"
 PLUGIN_BASE_URL="${STRATA_PLUGIN_BASE_URL:-https://raw.githubusercontent.com/bramvanoploo/strata-performance-setup/main}"
 if [[ -n "${STRATA_PLUGIN_CACHE_DIR:-}" ]]; then
   PLUGIN_CACHE_DIR="$STRATA_PLUGIN_CACHE_DIR"
@@ -4738,13 +4738,18 @@ _poll_all_server_updates() {
           if [[ -z "${STRATA_BIN:-}" ]] && declare -F refresh_strata_bin >/dev/null 2>&1; then
             refresh_strata_bin
           fi
+          local _strata_rc=0
           if [[ -n "${STRATA_BIN:-}" ]]; then
-            STRATA_UPDATE_CACHE_FILE="" check_strata_update_sync >/dev/null 2>&1 || true
+            STRATA_UPDATE_CACHE_FILE="" check_strata_update_sync >/dev/null 2>&1 || _strata_rc=$?
           else
             STRATA_UPDATE_AVAILABLE=false
             STRATA_UPDATE_SUMMARY=""
           fi
-          printf "strata|%s|%s\n" "${STRATA_UPDATE_AVAILABLE:-false}" "${STRATA_UPDATE_SUMMARY:-}" > "${tmp_dir}/${pid}" 2>/dev/null || true
+          if (( _strata_rc == 7 )) && [[ -r "$sfile" ]]; then
+            awk -F'|' '$1=="strata" {print; exit}' "$sfile" > "${tmp_dir}/${pid}" 2>/dev/null || true
+          else
+            printf "strata|%s|%s\n" "${STRATA_UPDATE_AVAILABLE:-false}" "${STRATA_UPDATE_SUMMARY:-}" > "${tmp_dir}/${pid}" 2>/dev/null || true
+          fi
         elif declare -F "${pid}_check_update" >/dev/null 2>&1; then
           "${pid}_check_update" >/dev/null 2>&1 || true
           printf "%s|%s|%s\n" "$pid" "${HOST_UPDATE_AVAIL[$pid]:-false}" "${HOST_UPDATE_LATEST[$pid]:-}" > "${tmp_dir}/${pid}" 2>/dev/null || true
@@ -4763,12 +4768,95 @@ _poll_all_server_updates() {
   ) >/dev/null 2>&1
 }
 
+_render_startup_update_splash() {
+  local pid="$1"
+  local rule_w=120 term_lines=40
+  rule_w="$(tput cols 2>/dev/null || echo 117)"
+  term_lines="$(tput lines 2>/dev/null || echo 40)"
+  (( rule_w > 117 )) && rule_w=117
+  local -a frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+  local -a grad=("\033[1;96m" "\033[0;96m" "\033[0;36m" "\033[1;34m" "\033[0;35m" "\033[1;35m" "\033[1;32m" "\033[1;96m")
+  local bar_w=$(( rule_w - 20 ))
+  (( bar_w > 64 )) && bar_w=64
+  (( bar_w < 24 )) && bar_w=24
+  local tick=0
+
+  local bar_indent="" msg_indent="" border_line=""
+  local bar_pad=$(( (rule_w - bar_w - 2) / 2 ))
+  (( bar_pad < 0 )) && bar_pad=0
+  printf -v bar_indent "%*s" "$bar_pad" ""
+  local msg_pad=$(( (rule_w - 42) / 2 ))
+  (( msg_pad < 0 )) && msg_pad=0
+  printf -v msg_indent "%*s" "$msg_pad" ""
+  printf -v border_line "%*s" "$bar_w" ""
+  border_line="${border_line// /═}"
+
+  clear 2>/dev/null || true
+  if (( term_lines >= 16 )); then
+    print_logo "$rule_w"
+    printf "\033[?25l\033[s"
+  else
+    printf "\033[?25l"
+  fi
+
+  while kill -0 "$pid" 2>/dev/null; do
+    local sp="${frames[$(( tick % ${#frames[@]} ))]}"
+    local col="${grad[$(( (tick / 2) % ${#grad[@]} ))]}"
+    if (( term_lines < 16 )); then
+      printf "\r\033[2K%b%s%b  Checking inference servers for updates..." "$col" "$sp" "${C_RESET}"
+      tick=$(( tick + 1 ))
+      sleep 0.06 2>/dev/null || break
+      continue
+    fi
+    local seg_w=$(( bar_w / 3 ))
+    (( seg_w < 8 )) && seg_w=8
+    local span=$(( bar_w - seg_w ))
+    (( span < 1 )) && span=1
+    local phase=$(( tick % (span * 2) ))
+    local pos=$(( phase <= span ? phase : (span * 2 - phase) ))
+    local bar="" i dist
+    for (( i = 0; i < bar_w; i++ )); do
+      if (( i >= pos && i < pos + seg_w )); then
+        local c_idx=$(( ( (i - pos) * ${#grad[@]} ) / seg_w ))
+        (( c_idx >= ${#grad[@]} )) && c_idx=$(( ${#grad[@]} - 1 ))
+        bar+="${grad[$c_idx]}█"
+      else
+        dist=$(( i < pos ? pos - i : i - (pos + seg_w - 1) ))
+        if (( dist == 1 )); then
+          bar+="${col}▓"
+        elif (( dist == 2 )); then
+          bar+="${col}▒"
+        else
+          bar+="\033[2;36m░"
+        fi
+      fi
+    done
+
+    printf "\033[?2026h\033[u\r%s%b╔%s╗%b\033[K\n%s%b║%b%b%b║%b\033[K\n%s%b╚%s╝%b\033[K\n\033[K\n%s%b%s%b  Checking inference servers for updates...\033[K\n\033[?2026l" \
+      "$bar_indent" "$col" "$border_line" "${C_RESET}" \
+      "$bar_indent" "$col" "${C_RESET}" "$bar" "$col" "${C_RESET}" \
+      "$bar_indent" "$col" "$border_line" "${C_RESET}" \
+      "$msg_indent" "$col" "$sp" "${C_RESET}"
+    tick=$(( tick + 1 ))
+    sleep 0.06 2>/dev/null || break
+  done
+  printf "\033[?25h"
+}
+
 check_server_updates_now() {
   [[ "$NO_PLUGINS" != true && "$CHECK_ONLY" != true ]] || return 0
   discover_host_plugins
   (( ${#AVAILABLE_HOST_PLUGINS[@]} > 0 )) || return 0
-  [[ -t 1 ]] && echo -e "${C_DIM}Checking for inference server updates...${C_RESET}"
-  _poll_all_server_updates true
+  if [[ -t 0 && -t 1 ]]; then
+    _poll_all_server_updates true &
+    local poll_pid=$!
+    SERVER_UPDATE_POLLER_PID="$poll_pid"
+    _render_startup_update_splash "$poll_pid"
+    wait "$poll_pid" 2>/dev/null || true
+    SERVER_UPDATE_POLLER_PID=""
+  else
+    _poll_all_server_updates true
+  fi
   load_server_update_states
 }
 
@@ -4872,38 +4960,7 @@ _render_server_update_banner_inplace() {
 }
 
 _run_all_server_updates() {
-  local -a outdated=()
-  local pid non_strata=false
-  while IFS= read -r pid; do
-    [[ -n "$pid" ]] && outdated+=("$pid")
-  done < <(_list_outdated_servers)
-  if (( ${#outdated[@]} == 0 )); then
-    echo -e "${C_YELLOW}No server updates available.${C_RESET}"
-    sleep 1
-    return 0
-  fi
-  local -a outdated_names=()
-  for pid in "${outdated[@]}"; do
-    outdated_names+=("${HOST_PLUGIN_NAMES[$pid]:-$pid}")
-  done
-  echo -e "\n${C_YELLOW}Outdated servers:${C_RESET} ${outdated_names[*]}"
-  if ! confirm_yn "Update all listed servers? [y/N]: " "N"; then
-    echo -e "${C_DIM}Skipped server updates.${C_RESET}"
-    return 0
-  fi
-  for pid in "${outdated[@]}"; do
-    if [[ -z "${HOST_PLUGIN_LOADED[$pid]:-}" ]]; then
-      load_plugin hosts "$pid" >/dev/null 2>&1 || continue
-    fi
-    if [[ "$pid" == "strata" ]] && declare -F run_strata_option >/dev/null 2>&1; then
-      run_strata_option "update" true
-    elif declare -F "${pid}_update" >/dev/null 2>&1; then
-      echo -e "\n${C_CYAN}Updating ${HOST_PLUGIN_NAMES[$pid]:-$pid}...${C_RESET}"
-      "${pid}_update" || true
-      non_strata=true
-    fi
-  done
-  [[ "$non_strata" == true ]] && pause_prompt
+  show_inference_servers_page true
 }
 
 format_servers_toggle_row() {
@@ -5216,7 +5273,7 @@ read_line_with_live_stats() {
           fi
         fi
       else
-        if [[ -z "$buf" && ( "$ch" == "q" || "$ch" == "Q" ) ]]; then
+        if [[ -z "$buf" && ( "$ch" == "q" || "$ch" == "Q" || "$ch" == "u" || "$ch" == "U" ) ]]; then
           _cleanup_line_live; trap - INT TERM; printf "\n"
           _line_out="$ch"; return 0
         fi
@@ -5225,7 +5282,7 @@ read_line_with_live_stats() {
           _line_out="__toggle__"; return 0
         fi
         local _accept=false
-        if [[ -z "$buf" && "$ch" =~ ^[bBuU]$ ]]; then
+        if [[ -z "$buf" && "$ch" =~ ^[bB]$ ]]; then
           _accept=true
         elif [[ "$ch" =~ ^[0-9]$ ]] && [[ -z "$buf" || "$buf" =~ ^[0-9]+$ ]]; then
           local _cand="${buf}${ch}"
@@ -5288,10 +5345,10 @@ read_step_action() {
           _restore_step_tty; trap - INT TERM; printf "\n"
           _act_out="__esc__"; return 0
         fi
-      elif [[ -z "$buf" && ( "$ch" == "q" || "$ch" == "Q" ) ]]; then
+      elif [[ -z "$buf" && ( "$ch" == "q" || "$ch" == "Q" || "$ch" == "u" || "$ch" == "U" ) ]]; then
         _restore_step_tty; trap - INT TERM; printf "\n"
         _act_out="$ch"; return 0
-      elif [[ -z "$buf" && "$ch" =~ ^[aArRuUhHnNbBiI]$ ]]; then
+      elif [[ -z "$buf" && "$ch" =~ ^[aArRhHnNbBiI]$ ]]; then
         buf="$ch"; printf "%s" "$ch"
       fi
     elif (( rc > 128 )); then
@@ -5492,7 +5549,7 @@ read_choice_with_live_stats() {
           fi
         fi
       else
-        if [[ -z "$buf" && ( "$ch" == "q" || "$ch" == "Q" ) ]]; then
+        if [[ -z "$buf" && ( "$ch" == "q" || "$ch" == "Q" || "$ch" == "u" || "$ch" == "U" ) ]]; then
           _restore_index_tty
           trap - INT TERM
           printf "\n"
@@ -5501,7 +5558,7 @@ read_choice_with_live_stats() {
         fi
         local accept=false
         if [[ -z "$buf" ]]; then
-          if [[ "$ch" =~ ^[wWcCuUhHaAlLxXrR]$ ]] || [[ "$ch" =~ ^[1-9]$ ]]; then
+          if [[ "$ch" =~ ^[wWcChHaAlLxXrR]$ ]] || [[ "$ch" =~ ^[1-9]$ ]]; then
             accept=true
           fi
         elif [[ "$buf" =~ ^[0-9]{1,2}$ ]] && [[ "$ch" =~ ^[0-9]$ ]]; then
@@ -5693,13 +5750,16 @@ format_server_row() {
 }
 
 show_inference_servers_page() {
+  local auto_update="${1:-false}"
   discover_host_plugins
   local sel=0 _p
   for _p in "${AVAILABLE_HOST_PLUGINS[@]}"; do
     if [[ -z "${HOST_PLUGIN_LOADED[$_p]:-}" ]]; then
       load_plugin hosts "$_p" >/dev/null 2>&1 || true
     fi
-    declare -F "${_p}_check_update" >/dev/null 2>&1 && "${_p}_check_update"
+    if [[ "$auto_update" != true ]]; then
+      declare -F "${_p}_check_update" >/dev/null 2>&1 && "${_p}_check_update"
+    fi
   done
   while true; do
     local total=${#AVAILABLE_HOST_PLUGINS[@]}
@@ -5754,100 +5814,111 @@ show_inference_servers_page() {
     echo ""
 
     local saved_tty="" open_pid="" do_update_all=false do_refresh=false init_srv_upd="${#outdated_pids[@]}"
-    saved_tty="$(stty -g 2>/dev/null || true)"
-    stty -echo 2>/dev/null || true
-    trap '_tui_restore_tty "$saved_tty"; exit 0' INT TERM
-
-    printf "Select server: "
-    while true; do
-      local action="" rc=0
-      if [[ -t 0 && -t 1 ]]; then
-        IFS= read -rsn1 -t 1 action || rc=$?
+    if [[ "$auto_update" == true ]]; then
+      auto_update=false
+      if (( ${#outdated_pids[@]} > 0 )); then
+        do_update_all=true
       else
-        IFS= read -rsn1 action || rc=$?
-      fi
-      if (( rc > 128 )); then
-        load_server_update_states
-        declare -F load_strata_update_state >/dev/null 2>&1 && load_strata_update_state
-        if (( $(_count_server_updates) != init_srv_upd )); then
-          do_refresh=true
-          break
-        fi
+        echo -e "${C_YELLOW}No server updates available.${C_RESET}"
+        sleep 1
         continue
-      elif (( rc != 0 )); then
-        _tui_restore_tty "$saved_tty"; trap - INT TERM; printf "\n"; return 0
       fi
-      if [[ "$action" == $'\e' ]]; then
-        local seq=""
-        _tui_read_esc_seq seq
-        if [[ -z "$seq" ]]; then
-          _tui_restore_tty "$saved_tty"; trap - INT TERM; printf "\n"; return 0
+    else
+      saved_tty="$(stty -g 2>/dev/null || true)"
+      stty -echo 2>/dev/null || true
+      trap '_tui_restore_tty "$saved_tty"; exit 0' INT TERM
+
+      printf "Select server: "
+      while true; do
+        local action="" rc=0
+        if [[ -t 0 && -t 1 ]]; then
+          IFS= read -rsn1 -t 1 action || rc=$?
+        else
+          IFS= read -rsn1 action || rc=$?
         fi
-        local old_sel="$sel" new_sel="$sel"
-        if [[ "$seq" == "[A" || "$seq" == "OA" ]]; then
-          new_sel=$(( (old_sel - 1 + total) % total ))
-        elif [[ "$seq" == "[B" || "$seq" == "OB" ]]; then
-          new_sel=$(( (old_sel + 1) % total ))
-        fi
-        if (( new_sel != old_sel )); then
-          sel="$new_sel"
-          local old_up=$(( 3 + footer_extra + (total - old_sel) ))
-          local new_up=$(( 3 + footer_extra + (total - new_sel) ))
-          local _tc=120 _tl=40
-          if [[ -t 1 ]]; then
-            _tc="$(tput cols 2>/dev/null || echo 120)"
-            _tl="$(tput lines 2>/dev/null || echo 40)"
-          fi
-          if (( _tc > 115 && _tc > max_footer_w && old_up < _tl && new_up < _tl )); then
-            local old_row new_row
-            old_row="$(format_server_row "$old_sel" false)"
-            new_row="$(format_server_row "$new_sel" true)"
-            printf "\033[?2026h\033[?25l\033[s\033[%dA\r\033[2K%s\033[u\033[s\033[%dA\r\033[2K%s\033[u\033[?25h\033[?2026l" \
-              "$old_up" "$old_row" "$new_up" "$new_row"
-          else
+        if (( rc > 128 )); then
+          load_server_update_states
+          declare -F load_strata_update_state >/dev/null 2>&1 && load_strata_update_state
+          if (( $(_count_server_updates) != init_srv_upd )); then
             do_refresh=true
             break
           fi
+          continue
+        elif (( rc != 0 )); then
+          _tui_restore_tty "$saved_tty"; trap - INT TERM; printf "\n"; return 0
         fi
-        continue
-      fi
-
-      case "$action" in
-        "")
-          open_pid="${AVAILABLE_HOST_PLUGINS[$sel]}"
-          break
-          ;;
-        [1-9])
-          if (( action * 10 <= total )); then
-            local next_digit=""
-            if IFS= read -rsn1 -t 0.5 next_digit && [[ "$next_digit" =~ ^[0-9]$ ]] && (( 10#"${action}${next_digit}" <= total )); then
-              action="${action}${next_digit}"
+        if [[ "$action" == $'\e' ]]; then
+          local seq=""
+          _tui_read_esc_seq seq
+          if [[ -z "$seq" ]]; then
+            _tui_restore_tty "$saved_tty"; trap - INT TERM; printf "\n"; return 0
+          fi
+          local old_sel="$sel" new_sel="$sel"
+          if [[ "$seq" == "[A" || "$seq" == "OA" ]]; then
+            new_sel=$(( (old_sel - 1 + total) % total ))
+          elif [[ "$seq" == "[B" || "$seq" == "OB" ]]; then
+            new_sel=$(( (old_sel + 1) % total ))
+          fi
+          if (( new_sel != old_sel )); then
+            sel="$new_sel"
+            local old_up=$(( 3 + footer_extra + (total - old_sel) ))
+            local new_up=$(( 3 + footer_extra + (total - new_sel) ))
+            local _tc=120 _tl=40
+            if [[ -t 1 ]]; then
+              _tc="$(tput cols 2>/dev/null || echo 120)"
+              _tl="$(tput lines 2>/dev/null || echo 40)"
+            fi
+            if (( _tc > 115 && _tc > max_footer_w && old_up < _tl && new_up < _tl )); then
+              local old_row new_row
+              old_row="$(format_server_row "$old_sel" false)"
+              new_row="$(format_server_row "$new_sel" true)"
+              printf "\033[?2026h\033[?25l\033[s\033[%dA\r\033[2K%s\033[u\033[s\033[%dA\r\033[2K%s\033[u\033[?25h\033[?2026l" \
+                "$old_up" "$old_row" "$new_up" "$new_row"
+            else
+              do_refresh=true
+              break
             fi
           fi
-          if (( 10#$action >= 1 && 10#$action <= total )); then
-            sel=$(( 10#$action - 1 ))
+          continue
+        fi
+
+        case "$action" in
+          "")
             open_pid="${AVAILABLE_HOST_PLUGINS[$sel]}"
             break
-          fi
-          ;;
-        u|U)
-          if (( ${#outdated_pids[@]} > 0 )); then
-            do_update_all=true
-            break
-          fi
-          ;;
-        0|b|B|i|I)
-          _tui_restore_tty "$saved_tty"; trap - INT TERM; printf "\n"; return 0
-          ;;
-        q|Q)
-          _tui_restore_tty "$saved_tty"; trap - INT TERM; printf "\n"; exit 0
-          ;;
-      esac
-    done
+            ;;
+          [1-9])
+            if (( action * 10 <= total )); then
+              local next_digit=""
+              if IFS= read -rsn1 -t 0.5 next_digit && [[ "$next_digit" =~ ^[0-9]$ ]] && (( 10#"${action}${next_digit}" <= total )); then
+                action="${action}${next_digit}"
+              fi
+            fi
+            if (( 10#$action >= 1 && 10#$action <= total )); then
+              sel=$(( 10#$action - 1 ))
+              open_pid="${AVAILABLE_HOST_PLUGINS[$sel]}"
+              break
+            fi
+            ;;
+          u|U)
+            if (( ${#outdated_pids[@]} > 0 )); then
+              do_update_all=true
+              break
+            fi
+            ;;
+          0|b|B|i|I)
+            _tui_restore_tty "$saved_tty"; trap - INT TERM; printf "\n"; return 0
+            ;;
+          q|Q)
+            _tui_restore_tty "$saved_tty"; trap - INT TERM; printf "\n"; exit 0
+            ;;
+        esac
+      done
 
-    _tui_restore_tty "$saved_tty"
-    trap - INT TERM
-    printf "\n"
+      _tui_restore_tty "$saved_tty"
+      trap - INT TERM
+      printf "\n"
+    fi
     [[ "$do_refresh" == true ]] && continue
 
     if [[ "$do_update_all" == true ]]; then

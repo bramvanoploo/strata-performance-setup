@@ -16,8 +16,8 @@ register_host_plugin \
 
 strata_init() {
   refresh_strata_bin
-  refresh_strata_running
   if [[ "${_IN_SERVER_UPDATE_POLLER:-false}" != true ]]; then
+    refresh_strata_running
     declare -F load_server_update_states >/dev/null 2>&1 && load_server_update_states
     [[ -z "${SERVER_UPDATE_POLLER_PID:-}" ]] && start_strata_update_poller
   fi
@@ -100,7 +100,7 @@ refresh_strata_bin() {
   elif [[ -x "/usr/local/bin/strata" ]]; then STRATA_BIN="/usr/local/bin/strata"
   else STRATA_BIN=""; fi
 
-  if [[ -n "$STRATA_BIN" ]]; then
+  if [[ -n "$STRATA_BIN" && "${_IN_SERVER_UPDATE_POLLER:-false}" != true ]]; then
     local raw_ver
     raw_ver="$(run_as_user_exec "$STRATA_BIN" --version 2>/dev/null | head -n1 || true)"
     if [[ -n "$raw_ver" ]]; then
@@ -108,12 +108,12 @@ refresh_strata_bin() {
     else
       STRATA_VERSION="installed (${STRATA_BIN})"
     fi
-  else
+  elif [[ -z "$STRATA_BIN" ]]; then
     STRATA_VERSION=""
   fi
   STRATA_DOCKER_CONTAINER=""
   STRATA_DOCKER_IMAGE=""
-  if [[ -z "$STRATA_BIN" ]]; then
+  if [[ -z "$STRATA_BIN" && "${_IN_SERVER_UPDATE_POLLER:-false}" != true ]]; then
     local _dc_line=""
     _dc_line="$(_docker_ro ps --format '{{.Names}}|{{.Image}}' | awk -F'|' 'tolower($2) ~ /(^|[\/_-])strata(:|@|$)/ {print $1 "|" $2; exit}' || true)"
     if [[ -n "$_dc_line" ]]; then
@@ -370,6 +370,7 @@ else:
     local txt_out="" txt_rc=0
     txt_out="$(run_as_user_exec "$STRATA_BIN" update --check 2>&1)" || txt_rc=$?
     if (( txt_rc == 7 )) && [[ -z "$json_out" ]]; then
+      [[ "${_IN_SERVER_UPDATE_POLLER:-false}" == true ]] && return 7
       [[ "${STRATA_UPDATE_AVAILABLE:-false}" == true ]]
       return $?
     fi
@@ -2854,12 +2855,12 @@ run_strata_option() {
       __refresh__) ;;
       __esc__|i|I) return 0 ;;
       u|U)
-        if [[ "$opt" == "update" && "$STRATA_UPDATE_AVAILABLE" == true ]]; then
+        if declare -F _run_all_server_updates >/dev/null 2>&1; then
+          _run_all_server_updates
+        elif [[ "$opt" == "update" && "$STRATA_UPDATE_AVAILABLE" == true ]]; then
           echo ""
           perform_strata_update || true
           pause_prompt
-        else
-          _run_all_server_updates
         fi
         ;;
       a|A)
@@ -3221,7 +3222,7 @@ read_strata_page_choice() {
           fi
         fi
       else
-        if [[ -z "$buf" && ( "$ch" == "q" || "$ch" == "Q" ) ]]; then
+        if [[ -z "$buf" && ( "$ch" == "q" || "$ch" == "Q" || "$ch" == "u" || "$ch" == "U" ) ]]; then
           _cleanup_strata_tty
           trap - INT TERM
           printf "\n"
@@ -3230,7 +3231,7 @@ read_strata_page_choice() {
         fi
         local accept=false
         if [[ -z "$buf" ]]; then
-          if [[ "$ch" =~ ^[uUhHiIbBsS]$ ]] || { [[ "$ch" =~ ^[1-9]$ ]] && (( 10#$ch <= n_str )); }; then
+          if [[ "$ch" =~ ^[hHiIbBsS]$ ]] || { [[ "$ch" =~ ^[1-9]$ ]] && (( 10#$ch <= n_str )); }; then
             accept=true
           fi
         elif [[ "$buf" =~ ^[sS]$ ]]; then
@@ -3347,10 +3348,10 @@ show_strata_options_page() {
         (( STRATA_PAGE_SELECTED >= 0 && STRATA_PAGE_SELECTED < n_str )) && run_strata_option "${ACTIVE_STRATA_OPTIONS[$STRATA_PAGE_SELECTED]}"
         ;;
       u|U)
-        if [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
-          run_strata_option "update" true
-        elif declare -F _count_server_updates >/dev/null 2>&1 && (( $(_count_server_updates) > 0 )); then
+        if declare -F _run_all_server_updates >/dev/null 2>&1; then
           _run_all_server_updates
+        elif [[ "$STRATA_UPDATE_AVAILABLE" == true ]]; then
+          run_strata_option "update" true
         else
           echo -e "${C_YELLOW}No Strata update available.${C_RESET}"; sleep 1
         fi
