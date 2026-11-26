@@ -26,6 +26,7 @@ register_tweak --id "kernel_mitigations_off" --stars 3 --tier "opt_in" --os "lin
 register_tweak --id "kernel_init_on_alloc_off" --stars 2 --tier "opt_in" --os "linux" --laptop-recommended true --vm-supported true --experimental-non-arch false
 register_tweak --id "kernel_split_lock_off" --stars 1 --tier "opt_in" --os "linux" --laptop-recommended true --vm-supported true --experimental-non-arch false
 register_tweak --id "vm_overcommit" --stars 2 --tier "opt_in" --os "linux" --laptop-recommended true --vm-supported true --wsl-supported true --experimental-non-arch false
+register_tweak --id "low_swappiness" --stars 2 --tier "opt_in" --os "linux" --laptop-recommended true --vm-supported true --wsl-supported true --experimental-non-arch false
 
 # 4. CPU Performance
 applicable_cpu_performance() { [[ -d /sys/devices/system/cpu/cpu0/cpufreq ]] || command -v powerprofilesctl >/dev/null 2>&1; }
@@ -429,7 +430,9 @@ revert_lact_overclock() {
 # 12. Sysctl & Scheduler
 applicable_sysctl_tuning() { [[ "$IS_MACOS" == false ]]; }
 title_sysctl_tuning() { echo "Kernel VM, Sysctl, THP & Auto-Nice Tuning (ananicy-cpp / bpftune / sysctl)"; }
-strata_swappiness_value() { if status_zram_swap; then echo 100; else echo 10; fi; }
+strata_swappiness_value() {
+  if status_low_swappiness || ! status_zram_swap; then echo 10; else echo 100; fi
+}
 strata_sysctl_dir() { echo "${STRATA_SYSCTL_DIR:-/etc/sysctl.d}"; }
 strata_tmpfiles_dir() { echo "${STRATA_TMPFILES_DIR:-/etc/tmpfiles.d}"; }
 write_swappiness_conf() {
@@ -1226,4 +1229,54 @@ apply_vm_overcommit() {
 }
 revert_vm_overcommit() {
   restore_sysctl_prev /etc/sysctl.d/99-strata-overcommit.conf
+}
+
+low_swappiness_conf() { echo "$(strata_sysctl_dir)/99-strata-z-swappiness.conf"; }
+low_swappiness_managed() { status_low_swappiness; }
+status_low_swappiness() { [[ -f "$(low_swappiness_conf)" ]]; }
+applicable_low_swappiness() {
+  [[ "$IS_MACOS" == false ]] || return 1
+  status_low_swappiness && return 0
+  unit_active bpftune.service && return 1
+  sysctl -n vm.swappiness >/dev/null 2>&1
+}
+title_low_swappiness() { echo "Low Swappiness for Inference Latency (vm.swappiness=10)"; }
+note_low_swappiness() {
+  if status_low_swappiness && unit_active bpftune.service; then
+    echo -e "${C_YELLOW}[OPT!]${C_RESET}"
+  else
+    echo -e "${C_BLUE}[OPT]${C_RESET}"
+  fi
+}
+check_note_low_swappiness() {
+  if status_low_swappiness && unit_active bpftune.service; then
+    echo " (bpftune active — revert recommended)"
+  fi
+}
+explain_low_swappiness() {
+  cat <<'EOF'
+Impact:
+  Sets vm.swappiness=10 in /etc/sysctl.d/99-strata-z-swappiness.conf (overriding
+  the zram default of 100 or CachyOS's 150) so the kernel stops proactively
+  pushing cold anonymous model/KV-cache pages into zram swap. Reduces tail
+  latency and cold-expert decompression jitter when RAM is nearly full.
+EOF
+  echo -e "\n${C_YELLOW}[NOTE] Trade-off: On zram systems, lowering swappiness forces the kernel to${C_RESET}"
+  echo -e "${C_YELLOW}       evict file-backed page cache (including mmap'd weights) before using zram.${C_RESET}"
+  if status_low_swappiness && unit_active bpftune.service; then
+    echo -e "\n${C_YELLOW}[WARNING] bpftune.service is currently active and dynamically overrides${C_RESET}"
+    echo -e "${C_YELLOW}          vm.swappiness at runtime, so vm.swappiness=10 cannot be guaranteed.${C_RESET}"
+    echo -e "${C_YELLOW}          Reverting this option is recommended.${C_RESET}"
+  fi
+}
+apply_low_swappiness() {
+  if unit_active bpftune.service; then
+    echo -e "${C_YELLOW}Warning: bpftune.service is active and may override vm.swappiness dynamically.${C_RESET}"
+  fi
+  write_sysctl_with_prev "$(low_swappiness_conf)" "vm.swappiness=10"
+  [[ -f "$(strata_sysctl_dir)/99-strata-swappiness.conf" ]] && write_swappiness_conf || true
+}
+revert_low_swappiness() {
+  restore_sysctl_prev "$(low_swappiness_conf)"
+  [[ -f "$(strata_sysctl_dir)/99-strata-swappiness.conf" ]] && write_swappiness_conf || true
 }

@@ -21,7 +21,7 @@ tweaks	amd	amd	AMD GPU/APU, Instinct, Ryzen TDP, and X3D tweaks	plugins/tweaks/a
 tweaks	common	common	Cross-platform host tweaks (Linux & macOS)	plugins/tweaks/common.sh	e43d914b60768f564a5d7be0b36f118f713220dd251c62061490b9e504e4cf47	all
 tweaks	intel	intel	Intel GPU, RAPL, thermald, and P-core pinning tweaks	plugins/tweaks/intel.sh	64d458bfb2fc57d2b11278bb07e85b537d0c19570eb716cf7ccf1a76ad51c7e2	all
 tweaks	jetson	jetson	NVIDIA Jetson nvpmodel and fan tweaks	plugins/tweaks/jetson.sh	a0930c4789a901274e647c3a11efdcb02a0632d19cbf00740029cd2787e20181	all
-tweaks	linux-core	linux-core	Core Linux kernel, memory, CPU, PCIe, and storage tweaks	plugins/tweaks/linux-core.sh	3b6ad5d7befa85ff6c28a2944210dcba584c4a9763ece81fdd0f5a732ee39f6d	all
+tweaks	linux-core	linux-core	Core Linux kernel, memory, CPU, PCIe, and storage tweaks	plugins/tweaks/linux-core.sh	aaa4a39ad2968f4c61ce8516804e12330c86b507712152318f20440b9161fbb4	all
 tweaks	linux-laptop	linux-laptop	Linux laptop OEM thermal & fan profile tweaks	plugins/tweaks/linux-laptop.sh	b181d85ffae91eb1814ba02bb1a69cc375a5e5704f494495f9b4dc3738d7ff31	all
 tweaks	macos	macos	macOS Apple Silicon wired memory, power mode, Spotlight, and Metal tweaks	plugins/tweaks/macos.sh	e0e486f2a3b2b0b272f0e20b1d5f3565919249f084ace4df41864f53379c006b	all
 tweaks	nvidia	nvidia	NVIDIA GPU driver, power, clock, ECC, and datacenter tweaks	plugins/tweaks/nvidia.sh	9f66f2b003c089d11a41ad48367bfde1098627c0b4506692e25f01e074f4536c	all

@@ -996,6 +996,39 @@ EOF
   [[ -f "${STRATA_LAUNCHD_USER_DIR}/com.strata.ollama.plist" ]] && pass "macOS User= service installs as user LaunchAgent" || fail "macOS User= service installed as root LaunchDaemon"
 )
 
+# 21. low_swappiness opt-in visibility, bpftune interaction, and apply/revert round-trip
+(
+  IS_MACOS=false
+  STRATA_SYSCTL_DIR="${TMP_DIR}/sysctl_low_swap"
+  mkdir -p "$STRATA_SYSCTL_DIR"
+  sysctl() { case "$1" in -n) echo 150 ;; *) : ;; esac; return 0; }
+  status_zram_swap() { return 0; }
+  bpftune_active=true
+  unit_active() { [[ "$1" == "bpftune.service" && "$bpftune_active" == true ]]; }
+
+  is_opt_in_step low_swappiness && pass "low_swappiness is opt_in" || fail "low_swappiness should be opt_in"
+  applicable_low_swappiness && fail "low_swappiness should be hidden when not applied and bpftune is active" || pass "low_swappiness hidden when not applied and bpftune is active"
+
+  bpftune_active=false
+  applicable_low_swappiness && pass "low_swappiness applicable when bpftune is inactive" || fail "low_swappiness should be applicable when bpftune is inactive"
+
+  printf 'vm.swappiness = 100\n' > "${STRATA_SYSCTL_DIR}/99-strata-swappiness.conf"
+  apply_low_swappiness >/dev/null
+  status_low_swappiness && pass "status_low_swappiness true after apply" || fail "status_low_swappiness after apply"
+  assert_contains "$(cat "${STRATA_SYSCTL_DIR}/99-strata-z-swappiness.conf")" "vm.swappiness = 10" "apply_low_swappiness writes vm.swappiness = 10"
+  assert_eq "$(strata_swappiness_value)" "10" "strata_swappiness_value returns 10 when low_swappiness is applied"
+
+  bpftune_active=true
+  applicable_low_swappiness && pass "low_swappiness remains visible when applied even if bpftune becomes active" || fail "low_swappiness must stay visible when applied and bpftune is active"
+  assert_contains "$(explain_low_swappiness)" "Reverting this option is recommended" "explain_low_swappiness recommends reverting when bpftune is active"
+  assert_contains "$(check_note_low_swappiness)" "revert recommended" "check_note_low_swappiness flags bpftune conflict"
+
+  revert_low_swappiness >/dev/null
+  status_low_swappiness && fail "status_low_swappiness should be false after revert" || pass "status_low_swappiness false after revert"
+  assert_contains "$(cat "${STRATA_SYSCTL_DIR}/99-strata-swappiness.conf")" "vm.swappiness = 100" "revert_low_swappiness restores zram swappiness to 100"
+  applicable_low_swappiness && fail "low_swappiness should hide after revert while bpftune is active" || pass "low_swappiness hides after revert while bpftune is active"
+)
+
 PASS="$(grep -c '^P$' "$RESULTS_FILE" || true)"
 FAIL="$(grep -c '^F$' "$RESULTS_FILE" || true)"
 echo ""
